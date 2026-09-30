@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use std::io::Cursor;
 
 use crate::doc::{Document, Item, PAGE_H, PAGE_W, Page};
+use crate::geom;
 use crate::render::png::decode_rgba_image;
 
 enum Obj {
@@ -134,11 +135,29 @@ fn page_content(page: &Page, ctx: &Ctx) -> String {
                 s.push(' ');
                 num(&mut s, PAGE_H - first[1]);
                 s.push_str(" m\n");
-                for p in &st.points[1..] {
-                    num(&mut s, p[0]);
-                    s.push(' ');
-                    num(&mut s, PAGE_H - p[1]);
-                    s.push_str(" l\n");
+                for seg in geom::smooth(&st.points, geom::MAX_GAP) {
+                    match seg {
+                        geom::Seg::Line(p) => {
+                            num(&mut s, p[0]);
+                            s.push(' ');
+                            num(&mut s, PAGE_H - p[1]);
+                            s.push_str(" l\n");
+                        }
+                        geom::Seg::Curve(c1, c2, p) => {
+                            num(&mut s, c1[0]);
+                            s.push(' ');
+                            num(&mut s, PAGE_H - c1[1]);
+                            s.push(' ');
+                            num(&mut s, c2[0]);
+                            s.push(' ');
+                            num(&mut s, PAGE_H - c2[1]);
+                            s.push(' ');
+                            num(&mut s, p[0]);
+                            s.push(' ');
+                            num(&mut s, PAGE_H - p[1]);
+                            s.push_str(" c\n");
+                        }
+                    }
                 }
                 s.push_str("S\nQ\n");
             }

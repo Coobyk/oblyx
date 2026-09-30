@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use base64::Engine as _;
 
 use crate::doc::{Document, Item, PAGE_H, PAGE_W, Page};
+use crate::geom;
 use crate::render::image_mime;
 
 fn color_css(rgba: &[f32; 4]) -> String {
@@ -58,8 +59,19 @@ pub fn page_to_svg(page: &Page, doc: &Document) -> String {
                 };
                 s.push_str("<path d=\"M ");
                 let _ = write!(s, "{} {}", st.points[0][0], st.points[0][1]);
-                for p in &st.points[1..] {
-                    let _ = write!(s, " L {} {}", p[0], p[1]);
+                for seg in geom::smooth(&st.points, geom::MAX_GAP) {
+                    match seg {
+                        geom::Seg::Line(p) => {
+                            let _ = write!(s, " L {} {}", p[0], p[1]);
+                        }
+                        geom::Seg::Curve(c1, c2, p) => {
+                            let _ = write!(
+                                s,
+                                " C {} {} {} {} {} {}",
+                                c1[0], c1[1], c2[0], c2[1], p[0], p[1]
+                            );
+                        }
+                    }
                 }
                 let _ = write!(
                     s,

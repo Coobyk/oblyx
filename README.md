@@ -6,7 +6,8 @@ Not affiliated with or endorsed by GoodNotes.
 
 ## Features
 
-- Vector-accurate strokes (width, color, opacity preserved)
+- Vector-accurate strokes (width, color, opacity preserved), smoothed with
+  Catmull-Rom interpolation so curves stay rounded instead of polygonal
 - Embedded images (JPEG/PNG attachments and frames)
 - Sticky notes, text boxes and equations
 - Multi-page PDF with embedded images and text

@@ -6,6 +6,7 @@ use tiny_skia::{LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform
 use crate::doc::{
     Document, ImageEl, Item, PAGE_H, PAGE_W, Page, Sticky, Stroke as StrokeData, TextBox,
 };
+use crate::geom;
 use crate::render::text::draw_text_line;
 
 type RgbaImage = (u32, u32, Vec<u8>);
@@ -173,8 +174,18 @@ fn draw_stroke(pm: &mut Pixmap, st: &StrokeData, scale: f32) {
     let mut pb = PathBuilder::new();
     let first = &st.points[0];
     pb.move_to(first[0] * scale, first[1] * scale);
-    for p in &st.points[1..] {
-        pb.line_to(p[0] * scale, p[1] * scale);
+    for seg in geom::smooth(&st.points, geom::MAX_GAP) {
+        match seg {
+            geom::Seg::Line(p) => pb.line_to(p[0] * scale, p[1] * scale),
+            geom::Seg::Curve(c1, c2, p) => pb.cubic_to(
+                c1[0] * scale,
+                c1[1] * scale,
+                c2[0] * scale,
+                c2[1] * scale,
+                p[0] * scale,
+                p[1] * scale,
+            ),
+        }
     }
     let Some(path) = pb.finish() else {
         return;
