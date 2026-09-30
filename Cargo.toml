@@ -1,0 +1,16 @@
+[package]
+name = "goodnotes-convert"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive"] }
+fontdue = "0.9.4"
+jpeg-decoder = "0.3.2"
+jpeg-encoder = "0.7.1"
+png = "0.18.1"
+rayon = "1.12.0"
+tiny-skia = { version = "0.12.0", features = ["png-format"] }
+zip = "8.6.0"
