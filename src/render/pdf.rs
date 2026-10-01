@@ -473,6 +473,26 @@ fn page_content(page: &Page, ctx: &Ctx) -> String {
                     s.push_str("f\nQ\n");
                 }
             }
+            Item::FillPath(fp) => {
+                if fp.rgba[3] >= 0.004 {
+                    s.push_str("q\n");
+                    gs_emitted(&mut s, fp.rgba[3], ctx);
+                    for c in 0..3 {
+                        num(&mut s, fp.rgba[c].clamp(0.0, 1.0));
+                        s.push(' ');
+                    }
+                    s.push_str("rg\n");
+                    for c in 0..3 {
+                        num(&mut s, fp.rgba[c].clamp(0.0, 1.0));
+                        s.push(' ');
+                    }
+                    s.push_str("RG\n2 w\n1 J\n1 j\n");
+                    for c in &fp.contours {
+                        poly_ops(c, true, &mut s);
+                    }
+                    s.push_str("B\nQ\n");
+                }
+            }
             Item::Connector(_) => {}
         }
     }
@@ -506,6 +526,9 @@ pub fn document_to_pdf(pages: &[Page], doc: &Document) -> Vec<u8> {
                 }
                 Item::Path(p) if p.rgba[3] < 0.95 => {
                     gs_keys.insert(gs_key(p.rgba[3]));
+                }
+                Item::FillPath(fp) if fp.rgba[3] < 0.95 => {
+                    gs_keys.insert(gs_key(fp.rgba[3]));
                 }
                 _ => {}
             }

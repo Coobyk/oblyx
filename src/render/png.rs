@@ -7,8 +7,8 @@ use tiny_skia::{
 };
 
 use crate::doc::{
-    Background, Document, ImageEl, Item, PAGE_H, PAGE_W, Page, PathEl, ShapeEl, ShapeKind, Sticky,
-    Stroke as StrokeData, TextBox,
+    Background, Document, FillPathEl, ImageEl, Item, PAGE_H, PAGE_W, Page, PathEl, ShapeEl,
+    ShapeKind, Sticky, Stroke as StrokeData, TextBox,
 };
 use crate::geom;
 use crate::render::text::draw_text_line;
@@ -461,6 +461,45 @@ fn draw_path(pm: &mut Pixmap, p: &PathEl, scale: f32) {
     }
 }
 
+fn draw_fill_path(pm: &mut Pixmap, fp: &FillPathEl, scale: f32) {
+    if fp.rgba[3] < 0.004 {
+        return;
+    }
+    let mut pb = PathBuilder::new();
+    let mut any = false;
+    for c in &fp.contours {
+        let Some(first) = c.first() else {
+            continue;
+        };
+        pb.move_to(first[0] * scale, first[1] * scale);
+        for p in &c[1..] {
+            pb.line_to(p[0] * scale, p[1] * scale);
+        }
+        pb.close();
+        any = true;
+    }
+    if !any {
+        return;
+    }
+    if let Some(path) = pb.finish() {
+        let paint = color_paint(fp.rgba);
+        pm.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+        let stroke = Stroke {
+            width: 2.0 * scale,
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
+            ..Stroke::default()
+        };
+        pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    }
+}
+
 pub fn page_to_png(page: &Page, doc: &Document, scale: f32) -> Result<Vec<u8>> {
     let w = (PAGE_W * scale).round().max(1.0) as u32;
     let h = (PAGE_H * scale).round().max(1.0) as u32;
@@ -480,6 +519,7 @@ pub fn page_to_png(page: &Page, doc: &Document, scale: f32) -> Result<Vec<u8>> {
             Item::Background(bg) => draw_background(&mut pm, bg, scale),
             Item::Shape(sh) => draw_shape(&mut pm, sh, scale),
             Item::Path(p) => draw_path(&mut pm, p, scale),
+            Item::FillPath(fp) => draw_fill_path(&mut pm, fp, scale),
             Item::Connector(_) => {}
         }
     }

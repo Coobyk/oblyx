@@ -42,6 +42,7 @@ pub enum Item {
     Text(TextBox),
     Shape(ShapeEl),
     Path(PathEl),
+    FillPath(FillPathEl),
     Connector(ConnectorEl),
     Background(Background),
 }
@@ -78,6 +79,12 @@ pub struct PathEl {
     pub points: Vec<[f32; 2]>,
     pub head: Option<[[f32; 2]; 3]>,
     pub width: f32,
+    pub rgba: [f32; 4],
+}
+
+#[derive(Debug, Clone)]
+pub struct FillPathEl {
+    pub contours: Vec<Vec<[f32; 2]>>,
     pub rgba: [f32; 4],
 }
 
@@ -658,14 +665,14 @@ fn decode_stroke(rec: &[u8], items: &mut Vec<Item>) {
             out
         };
         if colored {
-            for c in &contours {
-                let pts: Vec<[f32; 2]> = shift(c).iter().map(|p| [p[0], p[1] + 2.0]).collect();
-                push_fill_shape(items, &pts, [0.0, 0.0, 0.0, 0.3]);
-            }
+            let shadow: Vec<Vec<[f32; 2]>> = contours
+                .iter()
+                .map(|c| shift(c).into_iter().map(|p| [p[0], p[1] + 2.0]).collect())
+                .collect();
+            push_fill_path(items, shadow, [0.0, 0.0, 0.0, 0.3]);
         }
-        for c in &contours {
-            push_fill_shape(items, &shift(c), rgba);
-        }
+        let main: Vec<Vec<[f32; 2]>> = contours.iter().map(|c| shift(c)).collect();
+        push_fill_path(items, main, rgba);
         return;
     }
     let Ok(Some(geom)) = tpl::stroke_geometry(&decomp) else {
@@ -850,35 +857,34 @@ fn smooth_open(pts: &[[f32; 2]]) -> Vec<[f32; 2]> {
     out
 }
 
-fn push_fill_shape(items: &mut Vec<Item>, pts: &[[f32; 2]], fill: [f32; 4]) {
-    if pts.len() < 3 {
+fn signed_area(pts: &[[f32; 2]]) -> f32 {
+    let mut a = 0.0f32;
+    for i in 0..pts.len() {
+        let p = pts[i];
+        let q = pts[(i + 1) % pts.len()];
+        a += p[0] * q[1] - q[0] * p[1];
+    }
+    a * 0.5
+}
+
+fn push_fill_path(items: &mut Vec<Item>, contours: Vec<Vec<[f32; 2]>>, rgba: [f32; 4]) {
+    let mut out: Vec<Vec<[f32; 2]>> = Vec::with_capacity(contours.len());
+    for c in contours {
+        if c.len() < 3 {
+            continue;
+        }
+        let mut c = c;
+        if signed_area(&c) < 0.0 {
+            c.reverse();
+        }
+        out.push(c);
+    }
+    if out.is_empty() {
         return;
     }
-    let mut min_x = f32::MAX;
-    let mut min_y = f32::MAX;
-    let mut max_x = f32::MIN;
-    let mut max_y = f32::MIN;
-    for p in pts {
-        min_x = min_x.min(p[0]);
-        min_y = min_y.min(p[1]);
-        max_x = max_x.max(p[0]);
-        max_y = max_y.max(p[1]);
-    }
-    items.push(Item::Shape(ShapeEl {
-        kind: ShapeKind::Polygon,
-        x: min_x,
-        y: min_y,
-        w: max_x - min_x,
-        h: max_y - min_y,
-        points: pts.to_vec(),
-        rotation: 0.0,
-        fill,
-        stroke: [0.0, 0.0, 0.0, 0.0],
-        width: 0.0,
-        dash: None,
-        radius: 0.0,
-        uuid: None,
-        from_f9: false,
+    items.push(Item::FillPath(FillPathEl {
+        contours: out,
+        rgba,
     }));
 }
 

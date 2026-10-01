@@ -269,6 +269,27 @@ pub fn page_to_svg(page: &Page, doc: &Document) -> String {
                     );
                 }
             }
+            Item::FillPath(fp) => {
+                if fp.rgba[3] >= 0.004 {
+                    s.push_str("<path d=\"");
+                    for c in &fp.contours {
+                        let Some(first) = c.first() else {
+                            continue;
+                        };
+                        let _ = write!(s, "M {} {}", first[0], first[1]);
+                        for p in &c[1..] {
+                            let _ = write!(s, " L {} {}", p[0], p[1]);
+                        }
+                        s.push_str(" Z");
+                    }
+                    let _ = write!(
+                        s,
+                        "\" fill=\"{}\" fill-rule=\"nonzero\" stroke=\"{}\" stroke-width=\"2\"/>",
+                        color_css(&fp.rgba),
+                        color_css(&fp.rgba)
+                    );
+                }
+            }
             Item::Connector(_) => {}
         }
     }
