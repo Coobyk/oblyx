@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 
 use base64::Engine as _;
 
-use crate::doc::{Document, Item, PAGE_H, PAGE_W, Page};
+use crate::doc::{Document, Item, PAGE_H, PAGE_W, Page, ShapeKind};
 use crate::geom;
 use crate::render::image_mime;
 
@@ -73,10 +73,19 @@ pub fn page_to_svg(page: &Page, doc: &Document) -> String {
                         }
                     }
                 }
+                let dash_attr = st
+                    .dash
+                    .map(|d| format!(" stroke-dasharray=\"{} {}\"", d[0], d[1]))
+                    .unwrap_or_default();
+                let blend_attr = if st.rgba[3] < 0.95 {
+                    " style=\"mix-blend-mode:multiply\""
+                } else {
+                    ""
+                };
                 let _ = write!(
                     s,
                     "\" fill=\"none\" stroke=\"{}\" stroke-width=\"{width}\" \
-                     stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+                     stroke-linecap=\"round\" stroke-linejoin=\"round\"{dash_attr}{blend_attr}/>",
                     color_css(&st.rgba)
                 );
             }
@@ -107,21 +116,160 @@ pub fn page_to_svg(page: &Page, doc: &Document) -> String {
                 );
             }
             Item::Text(t) => {
-                let baseline = t.y + t.size * 0.8;
                 let family = t
                     .font
                     .clone()
                     .unwrap_or_else(|| "Helvetica Neue, Helvetica, Arial, sans-serif".to_string());
+                let rgb = rgb_css(&t.rgb);
+                let weight = if t.bold { " font-weight=\"bold\"" } else { "" };
                 let _ = write!(
                     s,
-                    "<text x=\"{}\" y=\"{baseline}\" font-family=\"{}\" font-size=\"{}\" \
-                     fill=\"#1e1b1b\">{}</text>",
+                    "<text x=\"{}\" y=\"{}\" font-family=\"{}\" font-size=\"{}\"{weight} \
+                     fill=\"{rgb}\">{}</text>",
                     t.x,
+                    t.y,
                     escape_xml(&family),
                     t.size,
                     escape_xml(&t.text)
                 );
             }
+            Item::Background(bg) => {
+                for (x, y, w, h, rgb) in &bg.rects {
+                    let _ = write!(
+                        s,
+                        "<rect x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\" fill=\"{}\"/>",
+                        rgb_css(rgb)
+                    );
+                }
+            }
+            Item::Shape(sh) => {
+                let fill = if sh.fill[3] < 0.004 {
+                    "none".to_string()
+                } else {
+                    color_css(&sh.fill)
+                };
+                let stroke = if sh.stroke[3] < 0.004 {
+                    "none".to_string()
+                } else {
+                    color_css(&sh.stroke)
+                };
+                let deg = sh.rotation.to_degrees();
+                let rot = if deg.abs() > 1e-4 {
+                    format!(" transform=\"rotate({deg} {} {})\"", sh.x, sh.y)
+                } else {
+                    String::new()
+                };
+                let dash_attr = sh
+                    .dash
+                    .map(|d| {
+                        format!(
+                            " stroke-dasharray=\"{} {}\" stroke-linecap=\"round\"",
+                            d[0], d[1]
+                        )
+                    })
+                    .unwrap_or_default();
+                match sh.kind {
+                    ShapeKind::Rect => {
+                        let rad = if sh.radius > 0.01 {
+                            format!(" rx=\"{}\" ry=\"{}\"", sh.radius, sh.radius)
+                        } else {
+                            String::new()
+                        };
+                        let _ = write!(
+                            s,
+                            "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" \
+                             fill=\"{fill}\" stroke=\"{stroke}\" stroke-width=\"{}\"{rad}{rot}{dash_attr}/>",
+                            sh.x, sh.y, sh.w, sh.h, sh.width
+                        );
+                    }
+                    ShapeKind::Ellipse => {
+                        let _ = write!(
+                            s,
+                            "<ellipse cx=\"{}\" cy=\"{}\" rx=\"{}\" ry=\"{}\" \
+                             fill=\"{fill}\" stroke=\"{stroke}\" stroke-width=\"{}\"{rot}{dash_attr}/>",
+                            sh.x, sh.y, sh.w, sh.h, sh.width
+                        );
+                    }
+                    ShapeKind::Triangle | ShapeKind::Diamond => {
+                        let pts: Vec<[f32; 2]> = if matches!(sh.kind, ShapeKind::Triangle) {
+                            vec![
+                                [sh.x + sh.w * 0.5, sh.y],
+                                [sh.x + sh.w, sh.y + sh.h],
+                                [sh.x, sh.y + sh.h],
+                            ]
+                        } else {
+                            vec![
+                                [sh.x + sh.w * 0.5, sh.y],
+                                [sh.x + sh.w, sh.y + sh.h * 0.5],
+                                [sh.x + sh.w * 0.5, sh.y + sh.h],
+                                [sh.x, sh.y + sh.h * 0.5],
+                            ]
+                        };
+                        let mut first = true;
+                        s.push_str("<polygon points=\"");
+                        for p in &pts {
+                            if !first {
+                                s.push(' ');
+                            }
+                            first = false;
+                            let _ = write!(s, "{} {}", p[0], p[1]);
+                        }
+                        let _ = write!(
+                            s,
+                            "\" fill=\"{fill}\" stroke=\"{stroke}\" stroke-width=\"{}\"{rot}{dash_attr}/>",
+                            sh.width
+                        );
+                    }
+                    ShapeKind::Polygon => {
+                        if sh.points.len() >= 3 {
+                            let mut first = true;
+                            s.push_str("<polygon points=\"");
+                            for p in &sh.points {
+                                if !first {
+                                    s.push(' ');
+                                }
+                                first = false;
+                                let _ = write!(s, "{} {}", p[0], p[1]);
+                            }
+                            let _ = write!(
+                                s,
+                                "\" fill=\"{fill}\" stroke=\"{stroke}\" stroke-width=\"{}\"{rot}{dash_attr}/>",
+                                sh.width
+                            );
+                        }
+                    }
+                }
+            }
+            Item::Path(p) => {
+                if p.points.len() >= 2 {
+                    s.push_str("<path d=\"M ");
+                    let _ = write!(s, "{} {}", p.points[0][0], p.points[0][1]);
+                    for pt in &p.points[1..] {
+                        let _ = write!(s, " L {} {}", pt[0], pt[1]);
+                    }
+                    let _ = write!(
+                        s,
+                        "\" fill=\"none\" stroke=\"{}\" stroke-width=\"{}\" \
+                         stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+                        color_css(&p.rgba),
+                        p.width
+                    );
+                }
+                if let Some(head) = p.head {
+                    let _ = write!(
+                        s,
+                        "<polygon points=\"{} {},{} {},{} {}\" fill=\"{}\"/>",
+                        head[0][0],
+                        head[0][1],
+                        head[1][0],
+                        head[1][1],
+                        head[2][0],
+                        head[2][1],
+                        color_css(&p.rgba)
+                    );
+                }
+            }
+            Item::Connector(_) => {}
         }
     }
     s.push_str("</svg>");

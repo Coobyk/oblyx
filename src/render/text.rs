@@ -43,9 +43,53 @@ fn load_font() -> Option<Font> {
     None
 }
 
+const BOLD_CANDIDATES: &[&str] = &[
+    "/usr/share/fonts/gsfonts/NimbusSans-Bold.otf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "/Library/Fonts/Arial Bold.ttf",
+    "C:\\Windows\\Fonts\\arialbd.ttf",
+];
+
+fn load_bold_font() -> Option<Font> {
+    for path in BOLD_CANDIDATES {
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+                return Some(font);
+            }
+        }
+    }
+    if let Ok(out) = std::process::Command::new("fc-match")
+        .args(["-f", "%{file}", "sans-serif:bold"])
+        .output()
+    {
+        if out.status.success() {
+            if let Ok(path) = String::from_utf8(out.stdout) {
+                if let Ok(bytes) = std::fs::read(path.trim()) {
+                    if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+                        return Some(font);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn system_font() -> Option<&'static Font> {
     static FONT: OnceLock<Option<Font>> = OnceLock::new();
     FONT.get_or_init(load_font).as_ref()
+}
+
+pub fn system_bold_font() -> Option<&'static Font> {
+    static FONT: OnceLock<Option<Font>> = OnceLock::new();
+    FONT.get_or_init(load_bold_font).as_ref()
 }
 
 pub fn draw_text_line(
@@ -56,8 +100,13 @@ pub fn draw_text_line(
     px: f32,
     rgb: [f32; 3],
     alpha: f32,
+    bold: bool,
 ) {
-    let Some(font) = system_font() else {
+    let Some(font) = (if bold {
+        system_bold_font().or_else(system_font)
+    } else {
+        system_font()
+    }) else {
         return;
     };
     if px <= 1.0 || text.is_empty() {

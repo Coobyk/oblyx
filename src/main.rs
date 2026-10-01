@@ -1,6 +1,7 @@
 mod bv4;
 mod doc;
 mod geom;
+mod paper;
 mod pb;
 mod render;
 mod tpl;

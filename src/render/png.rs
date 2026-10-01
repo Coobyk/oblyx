@@ -1,10 +1,14 @@
 use std::io::Cursor;
 
 use anyhow::{Context, Result};
-use tiny_skia::{LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
+use tiny_skia::{
+    BlendMode, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, StrokeDash,
+    Transform,
+};
 
 use crate::doc::{
-    Document, ImageEl, Item, PAGE_H, PAGE_W, Page, Sticky, Stroke as StrokeData, TextBox,
+    Background, Document, ImageEl, Item, PAGE_H, PAGE_W, Page, PathEl, ShapeEl, ShapeKind, Sticky,
+    Stroke as StrokeData, TextBox,
 };
 use crate::geom;
 use crate::render::text::draw_text_line;
@@ -192,6 +196,9 @@ fn draw_stroke(pm: &mut Pixmap, st: &StrokeData, scale: f32) {
     };
     let mut paint = Paint::default();
     paint.anti_alias = true;
+    if st.rgba[3] < 0.95 {
+        paint.blend_mode = BlendMode::Multiply;
+    }
     paint.set_color_rgba8(
         (st.rgba[0].clamp(0.0, 1.0) * 255.0).round() as u8,
         (st.rgba[1].clamp(0.0, 1.0) * 255.0).round() as u8,
@@ -202,6 +209,9 @@ fn draw_stroke(pm: &mut Pixmap, st: &StrokeData, scale: f32) {
         width: (width * scale).max(0.5),
         line_cap: LineCap::Round,
         line_join: LineJoin::Round,
+        dash: st
+            .dash
+            .and_then(|d| StrokeDash::new(vec![d[0] * scale, d[1] * scale], 0.0)),
         ..Stroke::default()
     };
     pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
@@ -230,16 +240,225 @@ fn draw_sticky(pm: &mut Pixmap, st: &Sticky, scale: f32) {
 }
 
 fn draw_text(pm: &mut Pixmap, t: &TextBox, scale: f32) {
-    let baseline = (t.y + t.size * 0.8) * scale;
     draw_text_line(
         pm,
         &t.text,
         t.x * scale,
-        baseline,
+        t.y * scale,
         t.size * scale,
-        [0.1176, 0.1059, 0.1059],
+        t.rgb,
         1.0,
+        t.bold,
     );
+}
+
+fn color_paint(rgba: [f32; 4]) -> Paint<'static> {
+    let mut paint = Paint::default();
+    paint.anti_alias = true;
+    paint.set_color_rgba8(
+        (rgba[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (rgba[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (rgba[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (rgba[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+    );
+    paint
+}
+
+fn draw_background(pm: &mut Pixmap, bg: &Background, scale: f32) {
+    for (x, y, w, h, rgb) in &bg.rects {
+        let (x, y, w, h) = (x * scale, y * scale, w * scale, h * scale);
+        let Some(rect) = tiny_skia::Rect::from_xywh(x, y, w, h) else {
+            continue;
+        };
+        let paint = color_paint([rgb[0], rgb[1], rgb[2], 1.0]);
+        pm.fill_rect(rect, &paint, Transform::identity(), None);
+    }
+}
+
+fn draw_shape(pm: &mut Pixmap, sh: &ShapeEl, scale: f32) {
+    let mut pb = PathBuilder::new();
+    match sh.kind {
+        ShapeKind::Rect if sh.radius > 0.01 => {
+            let r = sh.radius.min(sh.w * 0.5).min(sh.h * 0.5);
+            let (cs, sn) = (sh.rotation.cos(), sh.rotation.sin());
+            let map = |x: f32, y: f32| {
+                let (dx, dy) = (x - sh.x, y - sh.y);
+                (
+                    (sh.x + dx * cs - dy * sn) * scale,
+                    (sh.y + dx * sn + dy * cs) * scale,
+                )
+            };
+            const K: f32 = 0.552_284_7;
+            let (x, y, w, h) = (sh.x, sh.y, sh.w, sh.h);
+            let (sx, sy) = map(x + r, y);
+            pb.move_to(sx, sy);
+            let (ax, ay) = map(x + w - r, y);
+            pb.line_to(ax, ay);
+            let (a, b) = map(x + w - r + K * r, y);
+            let (d, e) = map(x + w, y + r - K * r);
+            let (g, hh) = map(x + w, y + r);
+            pb.cubic_to(a, b, d, e, g, hh);
+            let (ax, ay) = map(x + w, y + h - r);
+            pb.line_to(ax, ay);
+            let (a, b) = map(x + w, y + h - r + K * r);
+            let (d, e) = map(x + w - r + K * r, y + h);
+            let (g, hh) = map(x + w - r, y + h);
+            pb.cubic_to(a, b, d, e, g, hh);
+            let (ax, ay) = map(x + r, y + h);
+            pb.line_to(ax, ay);
+            let (a, b) = map(x + r - K * r, y + h);
+            let (d, e) = map(x, y + h - r + K * r);
+            let (g, hh) = map(x, y + h - r);
+            pb.cubic_to(a, b, d, e, g, hh);
+            let (ax, ay) = map(x, y + r);
+            pb.line_to(ax, ay);
+            let (a, b) = map(x, y + r - K * r);
+            let (d, e) = map(x + r - K * r, y);
+            let (g, hh) = map(x + r, y);
+            pb.cubic_to(a, b, d, e, g, hh);
+            pb.close();
+        }
+        ShapeKind::Rect | ShapeKind::Triangle | ShapeKind::Diamond => {
+            let base: Vec<[f32; 2]> = match sh.kind {
+                ShapeKind::Triangle => vec![
+                    [sh.x + sh.w * 0.5, sh.y],
+                    [sh.x + sh.w, sh.y + sh.h],
+                    [sh.x, sh.y + sh.h],
+                ],
+                ShapeKind::Diamond => vec![
+                    [sh.x + sh.w * 0.5, sh.y],
+                    [sh.x + sh.w, sh.y + sh.h * 0.5],
+                    [sh.x + sh.w * 0.5, sh.y + sh.h],
+                    [sh.x, sh.y + sh.h * 0.5],
+                ],
+                _ => vec![
+                    [sh.x, sh.y],
+                    [sh.x + sh.w, sh.y],
+                    [sh.x + sh.w, sh.y + sh.h],
+                    [sh.x, sh.y + sh.h],
+                ],
+            };
+            let (cs, sn) = (sh.rotation.cos(), sh.rotation.sin());
+            let mut iter = base.iter().map(|p| {
+                let (dx, dy) = (p[0] - sh.x, p[1] - sh.y);
+                (
+                    (sh.x + dx * cs - dy * sn) * scale,
+                    (sh.y + dx * sn + dy * cs) * scale,
+                )
+            });
+            let Some((x0, y0)) = iter.next() else {
+                return;
+            };
+            pb.move_to(x0, y0);
+            for (x, y) in iter {
+                pb.line_to(x, y);
+            }
+            pb.close();
+        }
+        ShapeKind::Ellipse => {
+            let (cx, cy, rx, ry) = (sh.x, sh.y, sh.w, sh.h);
+            let (cs, sn) = (sh.rotation.cos(), sh.rotation.sin());
+            let map = |x: f32, y: f32| {
+                (
+                    (cx + x * cs - y * sn) * scale,
+                    (cy + x * sn + y * cs) * scale,
+                )
+            };
+            const K: f32 = 0.552_284_7;
+            const Q: f32 = std::f32::consts::FRAC_PI_2;
+            let (sx, sy) = map(rx, 0.0);
+            pb.move_to(sx, sy);
+            let mut a0 = 0.0f32;
+            for _ in 0..4 {
+                let a1 = a0 + Q;
+                let (c0, s0) = (a0.cos(), a0.sin());
+                let (c1, s1) = (a1.cos(), a1.sin());
+                let (x1, y1) = map(rx * c0 - K * rx * s0, ry * s0 + K * ry * c0);
+                let (x2, y2) = map(rx * c1 + K * rx * s1, ry * s1 - K * ry * c1);
+                let (x3, y3) = map(rx * c1, ry * s1);
+                pb.cubic_to(x1, y1, x2, y2, x3, y3);
+                a0 = a1;
+            }
+            pb.close();
+        }
+        ShapeKind::Polygon => {
+            let mut iter = sh.points.iter();
+            let Some(first) = iter.next() else {
+                return;
+            };
+            pb.move_to(first[0] * scale, first[1] * scale);
+            for p in iter {
+                pb.line_to(p[0] * scale, p[1] * scale);
+            }
+            pb.close();
+        }
+    }
+    let Some(path) = pb.finish() else {
+        return;
+    };
+    if sh.fill[3] >= 0.004 {
+        let paint = color_paint(sh.fill);
+        pm.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+    if sh.stroke[3] >= 0.004 && sh.width > 0.0 {
+        let paint = color_paint(sh.stroke);
+        let stroke = Stroke {
+            width: (sh.width * scale).max(0.5),
+            line_cap: if sh.dash.is_some() {
+                LineCap::Round
+            } else {
+                Stroke::default().line_cap
+            },
+            dash: sh
+                .dash
+                .and_then(|d| StrokeDash::new(vec![d[0] * scale, d[1] * scale], 0.0)),
+            ..Stroke::default()
+        };
+        pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    }
+}
+
+fn draw_path(pm: &mut Pixmap, p: &PathEl, scale: f32) {
+    if p.points.len() >= 2 && p.width > 0.0 {
+        let mut pb = PathBuilder::new();
+        pb.move_to(p.points[0][0] * scale, p.points[0][1] * scale);
+        for pt in &p.points[1..] {
+            pb.line_to(pt[0] * scale, pt[1] * scale);
+        }
+        if let Some(path) = pb.finish() {
+            let paint = color_paint(p.rgba);
+            let stroke = Stroke {
+                width: (p.width * scale).max(0.5),
+                line_cap: LineCap::Round,
+                line_join: LineJoin::Round,
+                ..Stroke::default()
+            };
+            pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+        }
+    }
+    if let Some(head) = p.head {
+        let mut pb = PathBuilder::new();
+        pb.move_to(head[0][0] * scale, head[0][1] * scale);
+        pb.line_to(head[1][0] * scale, head[1][1] * scale);
+        pb.line_to(head[2][0] * scale, head[2][1] * scale);
+        pb.close();
+        if let Some(path) = pb.finish() {
+            let paint = color_paint(p.rgba);
+            pm.fill_path(
+                &path,
+                &paint,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+    }
 }
 
 pub fn page_to_png(page: &Page, doc: &Document, scale: f32) -> Result<Vec<u8>> {
@@ -258,6 +477,10 @@ pub fn page_to_png(page: &Page, doc: &Document, scale: f32) -> Result<Vec<u8>> {
             }
             Item::Sticky(st) => draw_sticky(&mut pm, st, scale),
             Item::Text(t) => draw_text(&mut pm, t, scale),
+            Item::Background(bg) => draw_background(&mut pm, bg, scale),
+            Item::Shape(sh) => draw_shape(&mut pm, sh, scale),
+            Item::Path(p) => draw_path(&mut pm, p, scale),
+            Item::Connector(_) => {}
         }
     }
 

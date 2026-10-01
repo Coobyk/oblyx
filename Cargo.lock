@@ -427,6 +427,7 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
+ "flate2",
  "fontdue",
  "jpeg-decoder",
  "jpeg-encoder",
