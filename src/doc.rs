@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use zip::ZipArchive;
@@ -32,6 +32,9 @@ pub struct Document {
     pub pages: Vec<PageSource>,
     pub attachments: HashMap<String, Arc<Vec<u8>>>,
     page_bg: HashMap<String, String>,
+    /// Paper rectangles per background attachment, parsed once and shared
+    /// across every page (backgrounds can be a 300 MB PDF).
+    paper_cache: Mutex<HashMap<String, Arc<Vec<(f32, f32, f32, f32, [f32; 3])>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +237,7 @@ impl Document {
             for (uuid, member) in index_entries(&idx)? {
                 if let Some(data) = read_member(&mut z, &member)? {
                     if !data.is_empty() {
+                        crate::vlog!(1, "asset {uuid}: {} bytes loaded", data.len());
                         attachments.insert(uuid, Arc::new(data));
                     }
                 }
@@ -262,7 +266,32 @@ impl Document {
             pages,
             attachments,
             page_bg,
+            paper_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Paper rectangles for a background attachment, computed once per file.
+    fn cached_paper_rects(&self, attachment: &str) -> Arc<Vec<(f32, f32, f32, f32, [f32; 3])>> {
+        if let Some(hit) = self
+            .paper_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(attachment)
+        {
+            let hit = Arc::clone(hit);
+            crate::vlog!(2, "background {attachment}: cached ({} rects)", hit.len());
+            return hit;
+        }
+        let rects = match self.attachments.get(attachment) {
+            Some(bytes) => Arc::new(paper_rects(bytes)),
+            None => Arc::new(Vec::new()),
+        };
+        crate::vlog!(1, "background {attachment}: parsed {} rects", rects.len());
+        self.paper_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(attachment.to_string(), Arc::clone(&rects));
+        rects
     }
 
     pub fn decode_page(&self, src: &PageSource, include_deleted: bool) -> Result<Page> {
@@ -371,10 +400,45 @@ impl Document {
         }
 
         if let Some(att) = self.page_bg.get(&src.uuid) {
-            if let Some(bytes) = self.attachments.get(att) {
-                let rects = paper_rects(bytes);
-                if !rects.is_empty() {
-                    out.insert(0, Item::Background(Background { rects }));
+            let rects = self.cached_paper_rects(att);
+            if !rects.is_empty() {
+                out.insert(
+                    0,
+                    Item::Background(Background {
+                        rects: (*rects).clone(),
+                    }),
+                );
+            }
+        }
+
+        if crate::verbose::level() >= 1 {
+            let (mut strokes, mut images, mut texts, mut shapes) = (0usize, 0usize, 0usize, 0usize);
+            for it in &out {
+                match it {
+                    Item::Stroke(_) => strokes += 1,
+                    Item::Image(_) => images += 1,
+                    Item::Text(_) => texts += 1,
+                    Item::Shape(_) => shapes += 1,
+                    _ => {}
+                }
+            }
+            crate::vlog!(
+                1,
+                "page {}: {strokes} strokes, {images} images, {texts} texts, {shapes} shapes",
+                src.uuid
+            );
+            if crate::verbose::level() >= 2 {
+                let mut n = 0;
+                for it in &out {
+                    if let Item::Stroke(st) = it {
+                        n += 1;
+                        crate::vlog!(
+                            2,
+                            "  stroke #{n}: {} points, width {:.2}",
+                            st.points.len(),
+                            st.width
+                        );
+                    }
                 }
             }
         }

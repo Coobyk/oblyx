@@ -511,7 +511,10 @@ pub fn page_to_png(page: &Page, doc: &Document, scale: f32) -> Result<Vec<u8>> {
             Item::Stroke(st) => draw_stroke(&mut pm, st, scale),
             Item::Image(im) => {
                 if let Some(bytes) = doc.attachments.get(&im.attachment) {
+                    crate::vlog!(1, "draw asset {}: {} bytes", im.attachment, bytes.len());
                     draw_image(&mut pm, im, bytes, scale);
+                } else {
+                    crate::vlog!(1, "asset {}: attachment missing, skipped", im.attachment);
                 }
             }
             Item::Sticky(st) => draw_sticky(&mut pm, st, scale),

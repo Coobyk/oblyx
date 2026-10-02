@@ -91,12 +91,15 @@ pub fn page_to_svg(page: &Page, doc: &Document) -> String {
             }
             Item::Image(im) => {
                 let Some(bytes) = doc.attachments.get(&im.attachment) else {
+                    crate::vlog!(1, "asset {}: attachment missing, skipped", im.attachment);
                     continue;
                 };
                 let Some(mime) = image_mime(bytes) else {
+                    crate::vlog!(1, "asset {}: unsupported mime, skipped", im.attachment);
                     continue;
                 };
                 let b64 = base64::engine::general_purpose::STANDARD.encode(bytes.as_ref());
+                crate::vlog!(1, "embed asset {}: {} bytes", im.attachment, bytes.len());
                 let _ = write!(
                     s,
                     "<image x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" \

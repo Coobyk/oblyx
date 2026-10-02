@@ -112,8 +112,10 @@ fn inflate(body: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-fn streams(src: &[u8]) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
+/// Calls `f` with each stream's content, one at a time, so at most one
+/// inflated stream is in memory at once (raw streams are passed as slices
+/// into `src`). This matters because page backgrounds can be a 300 MB PDF.
+fn for_each_stream(src: &[u8], mut f: impl FnMut(&[u8])) {
     let mut from = 0;
     while let Some(pos) = find_from(src, from, b"stream") {
         from = pos + 6;
@@ -135,12 +137,11 @@ fn streams(src: &[u8]) -> Vec<Vec<u8>> {
             body = &body[..body.len() - 1];
         }
         match inflate(body) {
-            Some(data) => out.push(data),
-            None => out.push(body.to_vec()),
+            Some(data) => f(&data),
+            None => f(body),
         }
         from = end + 9;
     }
-    out
 }
 
 fn is_delim(b: u8) -> bool {
@@ -300,6 +301,11 @@ fn run(src: &[u8], mw: f32, mh: f32, out: &mut Vec<Rect>) {
         while i < src.len() && !src[i].is_ascii_whitespace() && !is_delim(src[i]) {
             i += 1;
         }
+        if start == i {
+            i += 1;
+            st.nums.clear();
+            continue;
+        }
         match &src[start..i] {
             b"q" => st.stack.push(st.ctm),
             b"Q" => {
@@ -362,16 +368,12 @@ pub fn paper_rects(bytes: &[u8]) -> Vec<Rect> {
     let mut out = Vec::new();
     if bytes.len() > 4 && &bytes[..4] == b"%PDF" {
         let (mw, mh) = media_box(bytes).unwrap_or((595.28, 841.89));
-        for s in streams(bytes) {
-            run(&s, mw, mh, &mut out);
-        }
+        for_each_stream(bytes, |s| run(s, mw, mh, &mut out));
         return out;
     }
     if let Some(data) = inflate(bytes) {
         let (mw, mh) = media_box(&data).unwrap_or((595.28, 841.89));
-        for s in streams(&data) {
-            run(&s, mw, mh, &mut out);
-        }
+        for_each_stream(&data, |s| run(s, mw, mh, &mut out));
     }
     out
 }

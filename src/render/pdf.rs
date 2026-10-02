@@ -501,6 +501,14 @@ fn page_content(page: &Page, ctx: &Ctx) -> String {
 }
 
 pub fn document_to_pdf(pages: &[Page], doc: &Document) -> Vec<u8> {
+    document_to_pdf_with(pages, doc, |_| {})
+}
+
+pub fn document_to_pdf_with(
+    pages: &[Page],
+    doc: &Document,
+    mut on_page: impl FnMut(usize),
+) -> Vec<u8> {
     let mut img_order: Vec<&String> = Vec::new();
     let mut img_seen: BTreeSet<&str> = BTreeSet::new();
     let mut gs_keys: BTreeSet<u16> = BTreeSet::new();
@@ -545,11 +553,18 @@ pub fn document_to_pdf(pages: &[Page], doc: &Document) -> Vec<u8> {
             .and_then(|bytes| prepare_image(bytes));
         match prepared {
             Some((w, h, gray, data)) => {
+                crate::vlog!(
+                    1,
+                    "asset {att}: pdf image {w}x{h} {}, {} bytes",
+                    if gray { "gray" } else { "rgb" },
+                    data.len()
+                );
                 img_obj.insert(att.to_string(), Some(next_obj));
                 img_blobs.push((next_obj, w, h, gray, data));
                 next_obj += 1;
             }
             None => {
+                crate::vlog!(1, "asset {att}: image decode failed, embedding skipped");
                 img_obj.insert(att.to_string(), None);
             }
         }
@@ -568,7 +583,15 @@ pub fn document_to_pdf(pages: &[Page], doc: &Document) -> Vec<u8> {
     let total = base + pages.len() * 2;
 
     let ctx = Ctx { img_obj, gs_obj };
-    let contents: Vec<String> = pages.iter().map(|p| page_content(p, &ctx)).collect();
+    let contents: Vec<String> = pages
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let content = page_content(p, &ctx);
+            on_page(i + 1);
+            content
+        })
+        .collect();
 
     let mut objs: Vec<Obj> = (0..total).map(|_| Obj::Text(String::new())).collect();
     objs[1] = Obj::Text("<< /Type /Catalog /Pages 2 0 R >>".into());
