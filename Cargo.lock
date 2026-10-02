@@ -421,23 +421,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "goodnotes-convert"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "clap",
- "flate2",
- "fontdue",
- "jpeg-decoder",
- "jpeg-encoder",
- "png",
- "rayon",
- "tiny-skia",
- "zip",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -603,6 +586,23 @@ name = "num-conv"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
+
+[[package]]
+name = "oblyx"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "flate2",
+ "fontdue",
+ "jpeg-decoder",
+ "jpeg-encoder",
+ "png",
+ "rayon",
+ "tiny-skia",
+ "zip",
+]
 
 [[package]]
 name = "once_cell"

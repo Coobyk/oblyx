@@ -1,4 +1,4 @@
-# goodnotes-convert
+# oblyx
 
 Convert GoodNotes `.goodnotes` notebook archives to SVG, PDF or PNG from the command line.
 
@@ -20,12 +20,12 @@ Not affiliated with or endorsed by GoodNotes.
 cargo build --release
 ```
 
-The binary is at `target/release/goodnotes-convert`.
+The binary is at `target/release/oblyx`.
 
 ## Usage
 
 ```
-goodnotes-convert [OPTIONS] <INPUT>...
+oblyx [OPTIONS] <INPUT>...
 ```
 
 `INPUT` may be `.goodnotes` files or directories. Directories are scanned recursively for `.goodnotes` files (hidden directories are skipped).
@@ -46,16 +46,16 @@ goodnotes-convert [OPTIONS] <INPUT>...
 
 ```
 # One file to SVG (default)
-goodnotes-convert notebook.goodnotes
+oblyx notebook.goodnotes
 
 # Everything (SVG + PNG + PDF) into ./out
-goodnotes-convert -f all -o out notebook.goodnotes
+oblyx -f all -o out notebook.goodnotes
 
 # Bulk: convert a whole folder tree to PDF at 300 DPI PNG too
-goodnotes-convert -f pdf,png --dpi 300 ~/GoodNotes/
+oblyx -f pdf,png --dpi 300 ~/GoodNotes/
 
 # Single page, higher raster resolution
-goodnotes-convert --page 0547ACEA --dpi 300 -f png notebook.goodnotes
+oblyx --page 0547ACEA --dpi 300 -f png notebook.goodnotes
 ```
 
 ### Output layout

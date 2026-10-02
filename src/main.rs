@@ -19,7 +19,7 @@ use render::{pdf::document_to_pdf, png::page_to_png, svg::page_to_svg};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "goodnotes-convert",
+    name = "oblyx",
     version,
     about = "Convert GoodNotes .goodnotes archives to SVG, PDF and PNG"
 )]
