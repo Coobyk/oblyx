@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -10,6 +11,7 @@ use zip::ZipArchive;
 use crate::bv4::decompress_bv4;
 use crate::paper::paper_rects;
 use crate::pb::*;
+use crate::pdfinput;
 use crate::tpl;
 
 pub const PAGE_W: f32 = 1091.35;
@@ -27,14 +29,45 @@ pub struct PageSource {
     pub data: Vec<u8>,
 }
 
+/// Per-page configuration resolved from the events index: which background
+/// attachment the page uses and (for PDF-imported notebooks) which page of
+/// that PDF to show.
+#[derive(Debug, Clone)]
+pub struct PageCfg {
+    pub attachment: String,
+    /// 1-based page number inside the PDF attachment.
+    pub pdf_page: Option<u64>,
+}
+
 pub struct Document {
     pub schema: u64,
     pub pages: Vec<PageSource>,
     pub attachments: HashMap<String, Arc<Vec<u8>>>,
-    page_bg: HashMap<String, String>,
+    page_cfg: HashMap<String, PageCfg>,
     /// Paper rectangles per background attachment, parsed once and shared
     /// across every page (backgrounds can be a 300 MB PDF).
-    paper_cache: Mutex<HashMap<String, Arc<Vec<(f32, f32, f32, f32, [f32; 3])>>>>,
+    paper_cache: Mutex<HashMap<usize, Arc<PaperRects>>>,
+    /// Temp copies of PDF attachments for pdftoppm, keyed by attachment
+    /// pointer so aliased attachment uuids share one file.
+    pdf_temps: Mutex<HashMap<usize, PathBuf>>,
+    /// Single-flight raster results keyed by (attachment ptr, pdf page, dpi).
+    /// Several notebook pages can share one PDF page (copied pages); without
+    /// this they race on the same pdftoppm output file and corrupt/lose it.
+    raster_cache: Mutex<HashMap<(usize, u64, u32), RasterCell>>,
+    /// Per-document nonce so temp names never collide across processes.
+    temp_tag: u64,
+}
+
+static DOC_TAG: AtomicU64 = AtomicU64::new(0);
+
+impl Drop for Document {
+    fn drop(&mut self) {
+        if let Ok(temps) = self.pdf_temps.lock() {
+            for path in temps.values() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +155,9 @@ pub struct ImageEl {
     pub w: f32,
     pub h: f32,
     pub from_frame: bool,
+    /// Inline image data (rasterized PDF page) when the bytes are not part of
+    /// the shared document attachment map.
+    pub bytes: Option<Arc<Vec<u8>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +186,15 @@ pub struct Page {
 }
 
 type Zip = ZipArchive<BufReader<File>>;
+/// `(x, y, w, h, rgb)` per paper rectangle.
+type PaperRects = Vec<(f32, f32, f32, f32, [f32; 3])>;
+/// Single-flight result of rasterizing one PDF page.
+type RasterCell = Arc<Mutex<Option<Arc<Vec<u8>>>>>;
+/// `(configs, page_cfgs)` as returned by [`parse_events`].
+type EventsIndex = (
+    HashMap<String, (String, Option<u64>)>,
+    HashMap<String, String>,
+);
 
 fn read_member(z: &mut Zip, name: &str) -> Result<Option<Vec<u8>>> {
     let mut file = match z.by_name(name) {
@@ -177,12 +222,22 @@ fn index_entries(raw: &[u8]) -> Result<Vec<(String, String)>> {
 
 fn uuid_prev(u: &str) -> Option<String> {
     let (head, last) = u.rsplit_once('-')?;
-    let n = u128::from_str_radix(last, 16).ok()?.checked_sub(1)?;
-    Some(format!("{head}-{:01$X}", n, last.len()))
+    if last.len() < 2 {
+        return None;
+    }
+    // GoodNotes decrements only the final byte with wraparound
+    // (…-5E00 → …-5EFF), not the whole 48-bit tail (…-5DFF).
+    let (prefix, byte) = last.split_at(last.len() - 2);
+    let b = u8::from_str_radix(byte, 16).ok()?.wrapping_sub(1);
+    Some(format!("{head}-{prefix}{b:02X}"))
 }
 
-fn parse_events(raw: &[u8]) -> Result<(HashMap<String, String>, HashMap<String, String>)> {
-    let mut configs: HashMap<String, String> = HashMap::new();
+/// Returns `(configs, page_cfgs)`:
+/// - `configs`: config uuid -> (attachment uuid, 1-based page index in that
+///   attachment for PDF-imported notebooks)
+/// - `page_cfgs`: page uuid (minus one) -> config uuid
+fn parse_events(raw: &[u8]) -> Result<EventsIndex> {
+    let mut configs: HashMap<String, (String, Option<u64>)> = HashMap::new();
     let mut page_cfgs: HashMap<String, String> = HashMap::new();
     for rec in records(raw)? {
         let f = parse(rec)?;
@@ -192,7 +247,7 @@ fn parse_events(raw: &[u8]) -> Result<(HashMap<String, String>, HashMap<String, 
                     bytes_of(&f, 1).and_then(as_uuid),
                     bytes_of(&pf, 4).and_then(as_uuid),
                 ) {
-                    configs.insert(ev.to_string(), att.to_string());
+                    configs.insert(ev.to_string(), (att.to_string(), varint_of(&pf, 5)));
                 }
             }
         }
@@ -233,18 +288,29 @@ impl Document {
         }
 
         let mut attachments = HashMap::new();
+        let mut member_cache: HashMap<String, Arc<Vec<u8>>> = HashMap::new();
         if let Some(idx) = read_member(&mut z, "index.attachments.pb")? {
             for (uuid, member) in index_entries(&idx)? {
-                if let Some(data) = read_member(&mut z, &member)? {
-                    if !data.is_empty() {
+                let data = match member_cache.get(&member) {
+                    Some(cached) => Arc::clone(cached),
+                    None => {
+                        let Some(data) = read_member(&mut z, &member)? else {
+                            continue;
+                        };
+                        if data.is_empty() {
+                            continue;
+                        }
                         crate::vlog!(1, "asset {uuid}: {} bytes loaded", data.len());
-                        attachments.insert(uuid, Arc::new(data));
+                        let data = Arc::new(data);
+                        member_cache.insert(member, Arc::clone(&data));
+                        data
                     }
-                }
+                };
+                attachments.insert(uuid, data);
             }
         }
 
-        let mut page_bg: HashMap<String, String> = HashMap::new();
+        let mut page_cfg: HashMap<String, PageCfg> = HashMap::new();
         if let Some(raw) = read_member(&mut z, "index.events.pb")? {
             if let Ok((configs, page_cfgs)) = parse_events(&raw) {
                 for page in &pages {
@@ -254,8 +320,14 @@ impl Document {
                     let Some(cfg) = page_cfgs.get(&prev) else {
                         continue;
                     };
-                    if let Some(att) = configs.get(cfg) {
-                        page_bg.insert(page.uuid.clone(), att.clone());
+                    if let Some((att, pdf_page)) = configs.get(cfg) {
+                        page_cfg.insert(
+                            page.uuid.clone(),
+                            PageCfg {
+                                attachment: att.clone(),
+                                pdf_page: *pdf_page,
+                            },
+                        );
                     }
                 }
             }
@@ -265,36 +337,83 @@ impl Document {
             schema,
             pages,
             attachments,
-            page_bg,
+            page_cfg,
             paper_cache: Mutex::new(HashMap::new()),
+            pdf_temps: Mutex::new(HashMap::new()),
+            raster_cache: Mutex::new(HashMap::new()),
+            temp_tag: DOC_TAG.fetch_add(1, Ordering::Relaxed),
         })
     }
 
+    /// Temp copy of a PDF attachment for pdftoppm, created once per document
+    /// (aliased attachment uuids share the same bytes and thus one file).
+    fn temp_pdf(&self, att: &Arc<Vec<u8>>) -> Option<PathBuf> {
+        let key = Arc::as_ptr(att) as usize;
+        let mut temps = self.pdf_temps.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(path) = temps.get(&key) {
+            return Some(path.clone());
+        }
+        let dir = pdfinput::pdf_cache_dir();
+        pdfinput::sweep_stale(&dir);
+        let path = dir.join(format!(
+            "oblyx-{}-{}-{:x}.pdf",
+            std::process::id(),
+            self.temp_tag,
+            key
+        ));
+        if let Err(e) = pdfinput::write_temp_pdf(&path, att) {
+            crate::vlog!(1, "temp pdf write failed: {e:#}");
+            return None;
+        }
+        temps.insert(key, path.clone());
+        Some(path)
+    }
+
+    /// Single-flight rasterization of a PDF page: concurrent decode threads
+    /// requesting the same (attachment, page, dpi) share one pdftoppm run
+    /// instead of racing on its output file.
+    fn raster_page(&self, att: &Arc<Vec<u8>>, pdf_page: u64, dpi: f32) -> Option<Arc<Vec<u8>>> {
+        let key = (Arc::as_ptr(att) as usize, pdf_page, dpi.to_bits());
+        let cell = {
+            let mut cache = self.raster_cache.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(cache.entry(key).or_default())
+        };
+        let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = guard.as_ref() {
+            return Some(Arc::clone(hit));
+        }
+        let bytes = self
+            .temp_pdf(att)
+            .and_then(|temp| pdfinput::rasterize_pdf_page(&temp, pdf_page, dpi).map(Arc::new))?;
+        *guard = Some(Arc::clone(&bytes));
+        Some(bytes)
+    }
+
     /// Paper rectangles for a background attachment, computed once per file.
-    fn cached_paper_rects(&self, attachment: &str) -> Arc<Vec<(f32, f32, f32, f32, [f32; 3])>> {
+    /// Keyed by the shared bytes pointer so aliased attachment uuids (several
+    /// uuids can point at one member) parse the PDF only once.
+    fn cached_paper_rects(&self, attachment: &str, att: &Arc<Vec<u8>>) -> Arc<PaperRects> {
+        let key = Arc::as_ptr(att) as usize;
         if let Some(hit) = self
             .paper_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(attachment)
+            .get(&key)
         {
             let hit = Arc::clone(hit);
             crate::vlog!(2, "background {attachment}: cached ({} rects)", hit.len());
             return hit;
         }
-        let rects = match self.attachments.get(attachment) {
-            Some(bytes) => Arc::new(paper_rects(bytes)),
-            None => Arc::new(Vec::new()),
-        };
+        let rects = Arc::new(paper_rects(att));
         crate::vlog!(1, "background {attachment}: parsed {} rects", rects.len());
         self.paper_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(attachment.to_string(), Arc::clone(&rects));
+            .insert(key, Arc::clone(&rects));
         rects
     }
 
-    pub fn decode_page(&self, src: &PageSource, include_deleted: bool) -> Result<Page> {
+    pub fn decode_page(&self, src: &PageSource, include_deleted: bool, dpi: f32) -> Result<Page> {
         let recs = records(&src.data)?;
         let parsed: Vec<Vec<Field<'_>>> = recs.iter().map(|r| parse(r)).collect::<Result<_>>()?;
 
@@ -399,8 +518,43 @@ impl Document {
             }
         }
 
-        if let Some(att) = self.page_bg.get(&src.uuid) {
-            let rects = self.cached_paper_rects(att);
+        if let Some(cfg) = self.page_cfg.get(&src.uuid)
+            && let Some(att) = self.attachments.get(&cfg.attachment)
+            && let Some(pdf_page) = cfg.pdf_page
+            && att.starts_with(b"%PDF-")
+            && let Some(bytes) = self.raster_page(att, pdf_page, dpi)
+        {
+            match pdfinput::jpeg_size(&bytes) {
+                Some((pw, ph)) => {
+                    let (pw, ph) = (pw as f32, ph as f32);
+                    let s = (PAGE_W / pw).min(PAGE_H / ph);
+                    let (w, h) = (pw * s, ph * s);
+                    out.insert(
+                        0,
+                        Item::Image(ImageEl {
+                            attachment: format!("pdf:{}:{pdf_page}", cfg.attachment),
+                            x: (PAGE_W - w) / 2.0,
+                            y: (PAGE_H - h) / 2.0,
+                            w,
+                            h,
+                            from_frame: false,
+                            bytes: Some(bytes),
+                        }),
+                    );
+                }
+                None => {
+                    crate::vlog!(
+                        1,
+                        "page {}: raster of pdf page {pdf_page} unreadable",
+                        src.uuid
+                    );
+                }
+            }
+        }
+        if let Some(cfg) = self.page_cfg.get(&src.uuid)
+            && let Some(att) = self.attachments.get(&cfg.attachment)
+        {
+            let rects = self.cached_paper_rects(&cfg.attachment, att);
             if !rects.is_empty() {
                 out.insert(
                     0,
@@ -1085,6 +1239,7 @@ fn decode_placement(f: &[Field<'_>], items: &mut Vec<Item>) {
         w,
         h,
         from_frame: false,
+        bytes: None,
     }));
 }
 
@@ -1140,6 +1295,7 @@ fn decode_frame(f: &[Field<'_>], items: &mut Vec<Item>) {
         w,
         h,
         from_frame: true,
+        bytes: None,
     }));
 }
 

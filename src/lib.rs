@@ -7,6 +7,7 @@ pub mod gui;
 pub mod mem;
 pub mod paper;
 pub mod pb;
+mod pdfinput;
 pub mod render;
 pub mod tpl;
 pub mod verbose;

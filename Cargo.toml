@@ -27,9 +27,11 @@ name = "oblyx-gui"
 path = "src/bin/oblyx_gui.rs"
 required-features = ["gui"]
 
-# Optimize framework dependencies while application code stays in debug mode.
-# See GPUI Kit installation docs; only applies when the gui feature pulls them in.
+# Optimize framework and conversion-hot dependencies while the rest of the
+# debug build stays unoptimized. Keeps `cargo run`/debug GUI usable on
+# 100 MB+ notebooks (inflate, path/text rendering and our own code dominate).
 [profile.dev.package]
+oblyx = { opt-level = 3 }
 gpui-pre = { opt-level = 3 }
 gpui-component = { opt-level = 3 }
 gpui-kit = { opt-level = 3 }
@@ -39,3 +41,14 @@ gpui-pre-platform = { opt-level = 3 }
 rustybuzz = { opt-level = 3 }
 taffy = { opt-level = 3 }
 ttf-parser = { opt-level = 3 }
+miniz_oxide = { opt-level = 3 }
+flate2 = { opt-level = 3 }
+tiny-skia = { opt-level = 3 }
+fontdue = { opt-level = 3 }
+png = { opt-level = 3 }
+jpeg-decoder = { opt-level = 3 }
+jpeg-encoder = { opt-level = 3 }
+zip = { opt-level = 3 }
+rayon = { opt-level = 3 }
+rayon-core = { opt-level = 3 }
+base64 = { opt-level = 3 }

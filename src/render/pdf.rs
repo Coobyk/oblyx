@@ -510,6 +510,7 @@ pub fn document_to_pdf_with(
     mut on_page: impl FnMut(usize),
 ) -> Vec<u8> {
     let mut img_order: Vec<&String> = Vec::new();
+    let mut inline: HashMap<&str, &[u8]> = HashMap::new();
     let mut img_seen: BTreeSet<&str> = BTreeSet::new();
     let mut gs_keys: BTreeSet<u16> = BTreeSet::new();
 
@@ -518,6 +519,9 @@ pub fn document_to_pdf_with(
             match item {
                 Item::Image(im) => {
                     if img_seen.insert(im.attachment.as_str()) {
+                        if let Some(b) = &im.bytes {
+                            inline.insert(im.attachment.as_str(), b.as_slice());
+                        }
                         img_order.push(&im.attachment);
                     }
                 }
@@ -547,10 +551,11 @@ pub fn document_to_pdf_with(
     let mut img_blobs: Vec<(usize, u32, u32, bool, Vec<u8>)> = Vec::new();
     let mut next_obj = 5usize;
     for att in &img_order {
-        let prepared = doc
-            .attachments
+        let prepared = inline
             .get(att.as_str())
-            .and_then(|bytes| prepare_image(bytes));
+            .copied()
+            .or_else(|| doc.attachments.get(att.as_str()).map(|b| b.as_slice()))
+            .and_then(prepare_image);
         match prepared {
             Some((w, h, gray, data)) => {
                 crate::vlog!(

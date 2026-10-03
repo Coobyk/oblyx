@@ -1127,8 +1127,16 @@ fn open_path(path: &Path) {
     let _ = std::process::Command::new("explorer").arg(path).spawn();
 }
 
-pub fn run() {
-    application().with_assets(assets::Assets).run(|cx| {
+/// Files and settings passed to the GUI on startup (`oblyx-gui` arguments).
+#[derive(Clone, Debug, Default)]
+pub struct Launch {
+    pub files: Vec<PathBuf>,
+    pub output: Option<PathBuf>,
+    pub start: bool,
+}
+
+pub fn run(launch: Launch) {
+    application().with_assets(assets::Assets).run(move |cx| {
         init(cx);
 
         let options = WindowOptions {
@@ -1141,9 +1149,38 @@ pub fn run() {
             ..WindowOptions::default()
         };
 
-        open_window(options, cx, |window, cx| {
+        open_window(options, cx, move |window, cx| {
             window.set_window_title("oblyx");
-            cx.new(|cx| ConverterView::new(window, cx))
+            // Follow the OS light/dark setting: macOS effectiveAppearance,
+            // Windows registry (WM_SETTINGCHANGE), XDG desktop portal on Linux.
+            // The observer covers the async portal fetch and later OS changes;
+            // forgetting the subscription keeps it alive for the window's life.
+            component::Theme::sync_system_appearance(Some(window), cx);
+            std::mem::forget(window.observe_window_appearance(|window, cx| {
+                component::Theme::sync_system_appearance(Some(window), cx);
+            }));
+            let view = cx.new(|cx| ConverterView::new(window, cx));
+            let files = launch.files;
+            let output = launch.output;
+            let start = launch.start;
+            view.update(cx, |view, _cx| {
+                for path in files {
+                    let is_dir = path.is_dir();
+                    view.add_sources(vec![path], is_dir);
+                }
+            });
+            if let Some(dir) = output {
+                let raw = dir.to_string_lossy().into_owned();
+                view.update(cx, |view, cx| {
+                    view.output_mode = 1;
+                    view.output_dir
+                        .update(cx, |state, cx| state.set_value(raw, window, cx));
+                });
+            }
+            if start {
+                view.update(cx, |view, cx| view.start_run(window, cx));
+            }
+            view
         })
         .expect("failed to open window");
     });

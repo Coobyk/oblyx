@@ -226,14 +226,16 @@ pub fn decode_pages(
     doc: &Document,
     filter: Option<&str>,
     include_deleted: bool,
+    dpi: f32,
 ) -> Result<Vec<Page>> {
-    decode_pages_with(doc, filter, include_deleted, &|_| {})
+    decode_pages_with(doc, filter, include_deleted, dpi, &|_| {})
 }
 
 pub fn decode_pages_with(
     doc: &Document,
     filter: Option<&str>,
     include_deleted: bool,
+    dpi: f32,
     progress: &(dyn Fn(JobProgress) + Sync),
 ) -> Result<Vec<Page>> {
     let filter_upper = filter.map(|f| f.to_ascii_uppercase());
@@ -251,7 +253,7 @@ pub fn decode_pages_with(
         .par_iter()
         .map(|src| {
             let page = doc
-                .decode_page(src, include_deleted)
+                .decode_page(src, include_deleted, dpi)
                 .with_context(|| format!("decode page {}", src.uuid))?;
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             progress(JobProgress::Decode { done: n, total });
@@ -299,6 +301,7 @@ pub fn convert_job_with(
         &doc,
         options.page.as_deref(),
         options.include_deleted,
+        options.dpi,
         &progress,
     )?;
     crate::vlog!(1, "{}: decoded {} page(s)", job.file.display(), pages.len());

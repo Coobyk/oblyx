@@ -90,11 +90,15 @@ pub fn page_to_svg(page: &Page, doc: &Document) -> String {
                 );
             }
             Item::Image(im) => {
-                let Some(bytes) = doc.attachments.get(&im.attachment) else {
+                let bytes = im
+                    .bytes
+                    .clone()
+                    .or_else(|| doc.attachments.get(&im.attachment).cloned());
+                let Some(bytes) = bytes else {
                     crate::vlog!(1, "asset {}: attachment missing, skipped", im.attachment);
                     continue;
                 };
-                let Some(mime) = image_mime(bytes) else {
+                let Some(mime) = image_mime(&bytes) else {
                     crate::vlog!(1, "asset {}: unsupported mime, skipped", im.attachment);
                     continue;
                 };

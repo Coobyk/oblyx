@@ -23,12 +23,12 @@ fn main() {
         }) {
             eprintln!("decoding {} alone...", p.uuid);
             let t = Instant::now();
-            let page = doc.decode_page(p, false).expect("decode");
+            let page = doc.decode_page(p, false, 144.0).expect("decode");
             eprintln!("  decoded in {:?} items={}", t.elapsed(), page.items.len());
         }
     } else {
         let t = Instant::now();
-        let pages = decode_pages(&doc, filter, false).expect("decode");
+        let pages = decode_pages(&doc, filter, false, 144.0).expect("decode");
         eprintln!("decode {} pages in {:?}", pages.len(), t.elapsed());
         for p in &pages {
             let t = Instant::now();

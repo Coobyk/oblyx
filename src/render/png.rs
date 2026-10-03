@@ -510,9 +510,13 @@ pub fn page_to_png(page: &Page, doc: &Document, scale: f32) -> Result<Vec<u8>> {
         match item {
             Item::Stroke(st) => draw_stroke(&mut pm, st, scale),
             Item::Image(im) => {
-                if let Some(bytes) = doc.attachments.get(&im.attachment) {
+                let bytes = im
+                    .bytes
+                    .clone()
+                    .or_else(|| doc.attachments.get(&im.attachment).cloned());
+                if let Some(bytes) = bytes {
                     crate::vlog!(1, "draw asset {}: {} bytes", im.attachment, bytes.len());
-                    draw_image(&mut pm, im, bytes, scale);
+                    draw_image(&mut pm, im, &bytes, scale);
                 } else {
                     crate::vlog!(1, "asset {}: attachment missing, skipped", im.attachment);
                 }
