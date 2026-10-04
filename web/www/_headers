@@ -1,0 +1,21 @@
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  X-Frame-Options: DENY
+  Permissions-Policy: camera=(), microphone=(), geolocation=()
+
+/pdfjs/*
+  Cache-Control: public, max-age=604800
+
+/oblyx_web.wasm
+  Content-Type: application/wasm
+  Cache-Control: public, max-age=3600
+
+/index.html
+  Cache-Control: public, max-age=0, must-revalidate
+
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/worker.js
+  Cache-Control: public, max-age=0, must-revalidate

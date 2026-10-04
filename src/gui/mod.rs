@@ -25,7 +25,8 @@ use gpui_kit::*;
 use rayon::prelude::*;
 
 use crate::convert::{
-    ConvertOptions, Fmt, JobOutcome, JobProgress, collect_inputs, convert_job_with, plan_jobs,
+    ConvertOptions, Fmt, InputFile, JobOutcome, JobProgress, ZipSink, collect_inputs,
+    convert_job_sink, convert_job_with, plan_jobs,
 };
 use crate::mem::{JobLimiter, MemBudget};
 
@@ -55,7 +56,7 @@ enum Status {
 
 #[derive(Clone, Debug)]
 struct Entry {
-    file: PathBuf,
+    name: String,
     status: Status,
 }
 
@@ -68,6 +69,7 @@ struct Summary {
     written: usize,
     secs: f32,
     root: Option<PathBuf>,
+    archive: Option<PathBuf>,
 }
 
 enum RunEvent {
@@ -78,7 +80,7 @@ enum RunEvent {
 
 pub struct ConverterView {
     sources: Vec<Source>,
-    files: Vec<PathBuf>,
+    files: Vec<InputFile>,
     scan_error: Option<String>,
 
     fmt_svg: bool,
@@ -177,7 +179,7 @@ impl ConverterView {
                 .files
                 .iter()
                 .map(|file| Entry {
-                    file: file.clone(),
+                    name: file.display_name(),
                     status: Status::Ready,
                 })
                 .collect();
@@ -190,8 +192,8 @@ impl ConverterView {
     fn pick_files(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let picked = cx.background_spawn(async move {
             rfd::FileDialog::new()
-                .set_title("Add GoodNotes notebooks")
-                .add_filter("GoodNotes notebooks", &["goodnotes"])
+                .set_title("Add GoodNotes notebooks or zip archives")
+                .add_filter("GoodNotes notebooks", &["goodnotes", "zip"])
                 .pick_files()
         });
         self.picker = Some(cx.spawn(async move |this, cx| {
@@ -219,19 +221,28 @@ impl ConverterView {
     fn pick_output(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let entity_id = cx.entity().entity_id();
         let view = cx.entity();
+        let archive = self.output_mode == 2;
         let picked = cx.background_spawn(async move {
-            rfd::FileDialog::new()
-                .set_title("Choose output folder")
-                .pick_folder()
+            if archive {
+                rfd::FileDialog::new()
+                    .set_title("Save zip archive as")
+                    .set_file_name("converted.zip")
+                    .add_filter("Zip archive", &["zip"])
+                    .save_file()
+            } else {
+                rfd::FileDialog::new()
+                    .set_title("Choose output folder")
+                    .pick_folder()
+            }
         });
         self.picker = Some(cx.spawn(async move |_this, cx| {
-            let Some(dir) = picked.await else {
+            let Some(path) = picked.await else {
                 return;
             };
-            let raw = dir.to_string_lossy().into_owned();
+            let raw = path.to_string_lossy().into_owned();
             let _ = cx.with_window(entity_id, |window, cx| {
                 view.update(cx, |view, cx| {
-                    view.output_mode = 1;
+                    view.output_mode = if archive { 2 } else { 1 };
                     view.output_dir
                         .update(cx, |state, cx| state.set_value(raw.clone(), window, cx));
                     cx.notify();
@@ -313,6 +324,37 @@ impl ConverterView {
             Self::toast(window, cx, format!("{err:#}"));
             return;
         }
+        let archive = if self.output_mode == 2 {
+            let raw = self.output_dir.read(cx).value().to_string();
+            match archive_path(&raw) {
+                Some(path) => Some(path),
+                None => {
+                    Self::toast(window, cx, "Choose where to save the zip archive first.");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let sink = match &archive {
+            Some(path) => {
+                if let Some(parent) = path.parent()
+                    && !parent.as_os_str().is_empty()
+                    && let Err(err) = std::fs::create_dir_all(parent)
+                {
+                    Self::toast(window, cx, format!("{}: {err}", parent.display()));
+                    return;
+                }
+                match std::fs::File::create(path) {
+                    Ok(file) => Some(ZipSink::new(std::io::BufWriter::new(file))),
+                    Err(err) => {
+                        Self::toast(window, cx, format!("{}: {err}", path.display()));
+                        return;
+                    }
+                }
+            }
+            None => None,
+        };
         let files = match collect_inputs(
             &self
                 .sources
@@ -322,7 +364,11 @@ impl ConverterView {
         ) {
             Ok(files) if !files.is_empty() => files,
             Ok(_) => {
-                Self::toast(window, cx, "Add .goodnotes files to convert.");
+                Self::toast(
+                    window,
+                    cx,
+                    "Add .goodnotes files or a zip archive to convert.",
+                );
                 return;
             }
             Err(err) => {
@@ -337,10 +383,11 @@ impl ConverterView {
             return;
         }
 
-        self.entries = jobs
+        self.entries = self
+            .files
             .iter()
-            .map(|job| Entry {
-                file: job.file.clone(),
+            .map(|file| Entry {
+                name: file.display_name(),
                 status: Status::Ready,
             })
             .collect();
@@ -354,27 +401,48 @@ impl ConverterView {
         let (tx, rx) = mpsc::channel::<RunEvent>();
         let tx = Mutex::new(tx);
         let bg = cx.background_spawn(async move {
-            let limiter = JobLimiter::new(
-                MemBudget::from_env(),
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4),
-            );
-            jobs.par_iter().enumerate().for_each(|(index, job)| {
-                if cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                limiter.run(|| {
-                    if cancel.load(Ordering::Relaxed) {
-                        return;
+            match sink {
+                // One shared zip writer: convert sequentially so entries
+                // interleave safely.
+                Some(sink) => {
+                    for (index, job) in jobs.iter().enumerate() {
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let _ = tx.lock().unwrap().send(RunEvent::Start(index));
+                        let result = convert_job_sink(job, &options, &sink, |update| {
+                            let _ = tx.lock().unwrap().send(RunEvent::Progress(index, update));
+                        });
+                        let _ = tx.lock().unwrap().send(RunEvent::Done(index, result));
                     }
-                    let _ = tx.lock().unwrap().send(RunEvent::Start(index));
-                    let result = convert_job_with(job, &options, |update| {
-                        let _ = tx.lock().unwrap().send(RunEvent::Progress(index, update));
+                    if let Err(err) = sink.finish() {
+                        eprintln!("finish archive: {err:#}");
+                    }
+                }
+                None => {
+                    let limiter = JobLimiter::new(
+                        MemBudget::from_env(),
+                        std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(4),
+                    );
+                    jobs.par_iter().enumerate().for_each(|(index, job)| {
+                        if cancel.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        limiter.run(|| {
+                            if cancel.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            let _ = tx.lock().unwrap().send(RunEvent::Start(index));
+                            let result = convert_job_with(job, &options, |update| {
+                                let _ = tx.lock().unwrap().send(RunEvent::Progress(index, update));
+                            });
+                            let _ = tx.lock().unwrap().send(RunEvent::Done(index, result));
+                        });
                     });
-                    let _ = tx.lock().unwrap().send(RunEvent::Done(index, result));
-                });
-            });
+                }
+            }
         });
 
         let task = cx.spawn(async move |this, cx| {
@@ -490,7 +558,15 @@ impl ConverterView {
             .started
             .map(|t| t.elapsed().as_secs_f32())
             .unwrap_or(0.);
-        let root = if self.output_mode == 1 {
+        let archive = if self.output_mode == 2 {
+            let raw = self.output_dir.read(cx).value().to_string();
+            archive_path(&raw)
+        } else {
+            None
+        };
+        let root = if let Some(archive) = &archive {
+            archive.parent().map(Path::to_path_buf)
+        } else if self.output_mode == 1 {
             let raw = self.output_dir.read(cx).value().to_string();
             let trimmed = raw.trim();
             if trimmed.is_empty() {
@@ -501,7 +577,7 @@ impl ConverterView {
         } else {
             self.files
                 .first()
-                .and_then(|file| file.parent())
+                .and_then(|file| file.path.parent())
                 .map(Path::to_path_buf)
         };
         self.summary = Some(Summary {
@@ -512,6 +588,7 @@ impl ConverterView {
             written,
             secs,
             root,
+            archive,
         });
         self.started = None;
     }
@@ -575,21 +652,21 @@ impl ConverterView {
             });
 
         if sources.is_empty() {
-            list = list.child(
-                Empty::new().min_h(px(170.)).header(
-                    EmptyHeader::new()
-                        .media(
-                            EmptyMedia::new()
-                                .with_variant(EmptyMediaVariant::Icon)
-                                .child(Icon::new(IconName::FileText)),
-                        )
-                        .title(EmptyTitle::new().child("No notebooks added"))
-                        .description(
-                            EmptyDescription::new()
-                                .child("Add .goodnotes files or a folder to begin."),
-                        ),
-                ),
-            );
+            list =
+                list.child(
+                    Empty::new().min_h(px(170.)).header(
+                        EmptyHeader::new()
+                            .media(
+                                EmptyMedia::new()
+                                    .with_variant(EmptyMediaVariant::Icon)
+                                    .child(Icon::new(IconName::FileText)),
+                            )
+                            .title(EmptyTitle::new().child("No notebooks added"))
+                            .description(EmptyDescription::new().child(
+                                "Add .goodnotes files, a zip archive, or a folder to begin.",
+                            )),
+                    ),
+                );
         } else {
             for (index, source) in sources.iter().enumerate() {
                 let name = source
@@ -660,7 +737,8 @@ impl ConverterView {
     }
 
     fn render_options(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let output_custom = self.output_mode == 1;
+        let output_custom = self.output_mode == 1 || self.output_mode == 2;
+        let archive_out = self.output_mode == 2;
 
         let formats = h_flex()
             .gap_5()
@@ -697,7 +775,11 @@ impl ConverterView {
             .w_full()
             .child(
                 RadioGroup::horizontal("output-mode")
-                    .children(["Next to each input file", "Choose a folder…"])
+                    .children([
+                        "Next to each input file",
+                        "Choose a folder…",
+                        "Single ZIP archive…",
+                    ])
                     .selected_index(Some(self.output_mode))
                     .on_change(cx.listener(|view, value, _, cx| {
                         view.output_mode = *value;
@@ -713,7 +795,11 @@ impl ConverterView {
                         .child(
                             Button::new("browse-output")
                                 .outline()
-                                .icon(IconName::FolderOpen)
+                                .icon(if archive_out {
+                                    gpui_kit::assets::IconName::FileArchive
+                                } else {
+                                    gpui_kit::assets::IconName::FolderOpen
+                                })
                                 .label("Browse…")
                                 .disabled(self.running)
                                 .on_click(
@@ -755,11 +841,7 @@ impl ConverterView {
     }
 
     fn render_entry_row(index: usize, entry: &Entry, cx: &Context<Self>) -> AnyElement {
-        let name = entry
-            .file
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| entry.file.display().to_string());
+        let name = entry.name.clone();
 
         let (status_element, meta_element): (AnyElement, AnyElement) = match &entry.status {
             Status::Ready => (
@@ -928,10 +1010,16 @@ impl ConverterView {
                 )
                 .into_any_element()
         } else if let Some(summary) = &self.summary {
+            let note = summary
+                .archive
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .map(|name| format!("Wrote {} · ", name.to_string_lossy()))
+                .unwrap_or_default();
             let (text, color) = if summary.failed > 0 {
                 (
                     format!(
-                        "{} failed · {} converted · {} page(s) · {:.2}s",
+                        "{note}{} failed · {} converted · {} page(s) · {:.2}s",
                         summary.failed, summary.ok, summary.pages, summary.secs
                     ),
                     cx.theme().danger,
@@ -939,7 +1027,7 @@ impl ConverterView {
             } else if summary.cancelled > 0 {
                 (
                     format!(
-                        "Cancelled · {} converted · {} page(s) · {:.2}s",
+                        "{note}Cancelled · {} converted · {} page(s) · {:.2}s",
                         summary.ok, summary.pages, summary.secs
                     ),
                     cx.theme().muted_foreground,
@@ -947,7 +1035,7 @@ impl ConverterView {
             } else {
                 (
                     format!(
-                        "Converted {} file(s) · {} page(s) · {} output(s) · {:.2}s",
+                        "{note}Converted {} file(s) · {} page(s) · {} output(s) · {:.2}s",
                         summary.ok, summary.pages, summary.written, summary.secs
                     ),
                     cx.theme().success,
@@ -962,7 +1050,7 @@ impl ConverterView {
             div()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child("Add .goodnotes files to begin")
+                .child("Add .goodnotes files or a zip archive to begin")
                 .into_any_element()
         } else {
             div()
@@ -1116,6 +1204,20 @@ impl Render for ConverterView {
             )
             .child(self.render_footer(cx))
     }
+}
+
+/// Normalize the typed archive destination: empty means unset, a name
+/// without an extension gets `.zip` appended.
+fn archive_path(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut path = PathBuf::from(trimmed);
+    if path.extension().is_none() {
+        path.set_extension("zip");
+    }
+    Some(path)
 }
 
 fn open_path(path: &Path) {

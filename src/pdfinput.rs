@@ -2,30 +2,42 @@
 //! `pdftoppm`. Pages in these notebooks reference a shared PDF attachment plus
 //! a page index instead of storing strokes or images directly.
 
+#[cfg(not(target_arch = "wasm32"))]
 use anyhow::Result;
 use std::io::Cursor;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::process::{Command, Stdio};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Condvar, LazyLock, Mutex};
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::vlog;
 
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_RASTERIZERS: usize = 6;
+#[cfg(not(target_arch = "wasm32"))]
 static TOOL_WARNED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(not(target_arch = "wasm32"))]
 struct Slots {
     free: Mutex<usize>,
     ready: Condvar,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 static SLOTS: LazyLock<Slots> = LazyLock::new(|| Slots {
     free: Mutex::new(MAX_RASTERIZERS),
     ready: Condvar::new(),
 });
 
+#[cfg(not(target_arch = "wasm32"))]
 struct SlotGuard;
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         let mut free = SLOTS.free.lock().unwrap_or_else(|e| e.into_inner());
@@ -34,6 +46,7 @@ impl Drop for SlotGuard {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn acquire_slot() -> SlotGuard {
     let mut free = SLOTS.free.lock().unwrap_or_else(|e| e.into_inner());
     while *free == 0 {
@@ -52,6 +65,7 @@ pub(crate) fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
 
 /// Render one PDF page to JPEG bytes. Returns `None` (with a one-time hint if
 /// `pdftoppm` is missing) so callers can fall back to an empty page.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn rasterize_pdf_page(pdf_path: &Path, page: u64, dpi: f32) -> Option<Vec<u8>> {
     let _slot = acquire_slot();
     let dpi = dpi.round().clamp(36.0, 600.0) as u32;
@@ -126,6 +140,7 @@ pub(crate) fn rasterize_pdf_page(pdf_path: &Path, page: u64, dpi: f32) -> Option
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn pdf_cache_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -136,6 +151,7 @@ pub(crate) fn pdf_cache_dir() -> PathBuf {
 }
 
 /// Best-effort removal of temp PDFs left behind by crashed runs (>7 days old).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn sweep_stale(dir: &Path) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -159,6 +175,7 @@ pub(crate) fn sweep_stale(dir: &Path) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn write_temp_pdf(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;

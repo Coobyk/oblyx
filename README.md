@@ -1,6 +1,6 @@
 # oblyx
 
-Convert GoodNotes `.goodnotes` notebook archives to SVG, PDF or PNG from the command line.
+Convert GoodNotes `.goodnotes` notebook archives to SVG, PDF or PNG from the command line. Convert one notebook or batch convert folders and ZIP archives.
 
 Not affiliated with or endorsed by GoodNotes.
 
@@ -28,7 +28,7 @@ The binary is at `target/release/oblyx`.
 oblyx [OPTIONS] <INPUT>...
 ```
 
-`INPUT` may be `.goodnotes` files or directories. Directories are scanned recursively for `.goodnotes` files (hidden directories are skipped).
+`INPUT` may be `.goodnotes` files, `.zip` files containing notebooks, or directories. Directories are scanned recursively for `.goodnotes` files (hidden directories are skipped). Nested ZIP folders are preserved in output paths.
 
 ### Options
 
@@ -41,6 +41,7 @@ oblyx [OPTIONS] <INPUT>...
 | `-j, --jobs` | Number of parallel jobs | all cores |
 | `-q, --quiet` | Suppress per-file progress output | off |
 | `--include-deleted` | Also render deleted (tombstoned) objects | off |
+| `--archive[=FILE]` | Pack all output into one ZIP; without a path, choose a name automatically | off |
 
 ### Examples
 
@@ -56,12 +57,19 @@ oblyx -f pdf,png --dpi 300 ~/GoodNotes/
 
 # Single page, higher raster resolution
 oblyx --page 0547ACEA --dpi 300 -f png notebook.goodnotes
+
+# Convert every notebook inside an archive
+oblyx -f pdf notebooks.zip
+
+# Put all results into one archive
+oblyx -f pdf --archive=converted.zip ~/GoodNotes/
 ```
 
 ### Output layout
 
 - **PDF**: `<output>/<stem>.pdf` — one multi-page file per notebook
 - **SVG / PNG**: `<output>/<stem>/<page-uuid>.svg|png` — one file per page
+- With `--archive`, those paths are stored as entries in the selected ZIP file.
 
 ## Format notes
 
@@ -73,4 +81,9 @@ See `FORMAT.md` in the original reverse-engineering notes for details.
 
 ## License
 
-Private / all rights reserved unless stated otherwise.
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
+Bundled fonts and PDF.js retain their own licenses; see [web/THIRD_PARTY_NOTICES.md](web/THIRD_PARTY_NOTICES.md).
+
+## Browser version
+
+The browser app is in `web/` and runs conversions locally in your browser. See [web/ui/README.md](web/ui/README.md) for the build steps; deploy `web/www/` as a Cloudflare Pages static site.

@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#17191c" media="(prefers-color-scheme: dark)" />
+    <meta name="description" content="Convert Goodnotes notebooks to PDF or SVG in your browser." />
+    <title>oblyx</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main class="page">
+      <h1 class="wordmark">oblyx</h1>
+
+      <section class="converter" aria-label="Goodnotes converter">
+        <label class="dropzone" id="dropzone" for="notebook-file" tabindex="0">
+          <input id="notebook-file" type="file" accept=".goodnotes,.zip,application/zip" />
+          <span class="upload-icon" aria-hidden="true">↑</span>
+          <span class="drop-title" id="drop-title">Choose a notebook</span>
+          <span class="drop-hint" id="drop-hint">.goodnotes or .zip</span>
+        </label>
+
+        <div class="file-row" id="file-row" hidden>
+          <span class="file-symbol" aria-hidden="true">▤</span>
+          <span class="file-details">
+            <span class="file-name" id="file-name"></span>
+            <span class="file-size" id="file-size"></span>
+          </span>
+          <button class="button button-ghost button-small" id="change-file" type="button">Change</button>
+        </div>
+
+        <div class="options" id="options" hidden>
+          <div class="option" role="group" aria-label="Format">
+            <span>Format</span>
+            <div class="segmented" id="format-options">
+              <button class="segment is-active" type="button" data-value="pdf" aria-pressed="true">PDF</button>
+              <button class="segment" type="button" data-value="svg" aria-pressed="false">SVG</button>
+            </div>
+          </div>
+          <div class="option" id="package-option" role="group" aria-label="Output" hidden>
+            <span>Output</span>
+            <div class="segmented" id="package-options">
+              <button class="segment is-active" type="button" data-value="zip" aria-pressed="true">One ZIP</button>
+              <button class="segment" type="button" data-value="files" aria-pressed="false">Separate files</button>
+            </div>
+          </div>
+
+          <div class="progress-area" id="progress-area" hidden>
+            <div class="progress-copy"><span id="progress-label">Starting</span><span id="progress-percent">0%</span></div>
+            <div class="progress-track" role="progressbar" aria-label="Conversion progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <span class="progress-value" id="progress-value"></span>
+            </div>
+          </div>
+
+          <button class="button button-primary" id="convert" type="button">Convert</button>
+        </div>
+
+        <p class="error" id="error" role="alert" hidden></p>
+        <div class="results" id="results" hidden></div>
+        <p class="privacy">Files stay on your device.</p>
+        <a class="repository-link" href="https://github.com/Coobyk/oblyx" target="_blank" rel="noreferrer">GitHub repository <span aria-hidden="true">↗</span></a>
+      </section>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

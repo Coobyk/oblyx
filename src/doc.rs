@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -55,6 +55,8 @@ pub struct Document {
     /// this they race on the same pdftoppm output file and corrupt/lose it.
     raster_cache: Mutex<HashMap<(usize, u64, u32), RasterCell>>,
     /// Per-document nonce so temp names never collide across processes.
+    /// Unused on wasm, where `temp_pdf`/pdftoppm do not exist.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     temp_tag: u64,
 }
 
@@ -196,7 +198,7 @@ type EventsIndex = (
     HashMap<String, String>,
 );
 
-fn read_member(z: &mut Zip, name: &str) -> Result<Option<Vec<u8>>> {
+fn read_member<R: Read + Seek>(z: &mut ZipArchive<R>, name: &str) -> Result<Option<Vec<u8>>> {
     let mut file = match z.by_name(name) {
         Ok(f) => f,
         Err(zip::result::ZipError::FileNotFound) => return Ok(None),
@@ -269,9 +271,18 @@ fn parse_events(raw: &[u8]) -> Result<EventsIndex> {
 impl Document {
     pub fn open(path: &Path) -> Result<Document> {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let mut z = Zip::new(BufReader::new(file))
+        let z = Zip::new(BufReader::new(file))
             .with_context(|| format!("{} is not a readable zip archive", path.display()))?;
+        Self::load(z)
+    }
 
+    /// Open a notebook from an in-memory archive (the WASM/web entry point).
+    pub fn from_bytes(data: Vec<u8>) -> Result<Document> {
+        let z = ZipArchive::new(Cursor::new(data)).context("not a readable zip archive")?;
+        Self::load(z)
+    }
+
+    fn load<R: Read + Seek>(mut z: ZipArchive<R>) -> Result<Document> {
         let schema = match read_member(&mut z, "schema.pb")? {
             Some(raw) => parse(&raw).ok().and_then(|f| varint_of(&f, 1)).unwrap_or(0),
             None => 0,
@@ -347,6 +358,8 @@ impl Document {
 
     /// Temp copy of a PDF attachment for pdftoppm, created once per document
     /// (aliased attachment uuids share the same bytes and thus one file).
+    /// Not available on wasm — rasterizations are injected from JavaScript.
+    #[cfg(not(target_arch = "wasm32"))]
     fn temp_pdf(&self, att: &Arc<Vec<u8>>) -> Option<PathBuf> {
         let key = Arc::as_ptr(att) as usize;
         let mut temps = self.pdf_temps.lock().unwrap_or_else(|e| e.into_inner());
@@ -382,11 +395,59 @@ impl Document {
         if let Some(hit) = guard.as_ref() {
             return Some(Arc::clone(hit));
         }
+        #[cfg(not(target_arch = "wasm32"))]
         let bytes = self
             .temp_pdf(att)
-            .and_then(|temp| pdfinput::rasterize_pdf_page(&temp, pdf_page, dpi).map(Arc::new))?;
+            .and_then(|temp| pdfinput::rasterize_pdf_page(&temp, pdf_page, dpi).map(Arc::new));
+        #[cfg(target_arch = "wasm32")]
+        let bytes: Option<Arc<Vec<u8>>> = None;
+        let bytes = bytes?;
         *guard = Some(Arc::clone(&bytes));
         Some(bytes)
+    }
+
+    /// Unique `(attachment uuid, 1-based PDF page)` pairs whose pages show a
+    /// PDF background — the work list a caller must rasterize before decoding
+    /// (pdftoppm on native, pdf.js in the browser).
+    pub fn pdf_raster_jobs(&self) -> Vec<(String, u64)> {
+        let mut seen: HashSet<(String, u64)> = HashSet::new();
+        let mut jobs = Vec::new();
+        for page in &self.pages {
+            let Some(cfg) = self.page_cfg.get(&page.uuid) else {
+                continue;
+            };
+            let Some(att) = self.attachments.get(&cfg.attachment) else {
+                continue;
+            };
+            let (Some(pdf_page), true) = (cfg.pdf_page, att.starts_with(b"%PDF-")) else {
+                continue;
+            };
+            if seen.insert((cfg.attachment.clone(), pdf_page)) {
+                jobs.push((cfg.attachment.clone(), pdf_page));
+            }
+        }
+        jobs
+    }
+
+    /// Store a caller-rendered JPEG for a PDF background page (keyed like
+    /// `raster_page`), so `decode_page` picks it up without pdftoppm.
+    pub fn set_page_raster(
+        &self,
+        attachment: &str,
+        pdf_page: u64,
+        dpi: f32,
+        jpeg: Vec<u8>,
+    ) -> Result<()> {
+        let att = self
+            .attachments
+            .get(attachment)
+            .with_context(|| format!("unknown attachment {attachment}"))?;
+        let key = (Arc::as_ptr(att) as usize, pdf_page, dpi.to_bits());
+        let mut cache = self.raster_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let cell = RasterCell::default();
+        *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(jpeg));
+        cache.insert(key, cell);
+        Ok(())
     }
 
     /// Paper rectangles for a background attachment, computed once per file.

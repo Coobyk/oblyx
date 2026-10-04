@@ -1,0 +1,14 @@
+[package]
+name = "oblyx-web"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+# Raw-WASM cdylib: exports are hand-written C ABI functions driven by the
+# Web Worker in web/www/worker.js (no wasm-bindgen toolchain needed).
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+oblyx = { path = ".." }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
