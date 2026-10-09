@@ -121,13 +121,44 @@ container and does not apply to `noteBundle`, but it confirms the domain model
 Notability uses for ink: per-curve point counts, widths, RGBA colours and a
 per-curve style index, where alpha `< 255` marks highlighter strokes.
 
-## 5. `index/ios/*.fb` — NOT STARTED
+## 5. `index/ios/*.fb` — PARTIALLY REVERSE-ENGINEERED
 
-FlatBuffers. Filenames indicate content (`HandwritingIndex`, `ImageIndex`,
-`PDFIndex`) and one file exists per page in at least some notebooks. No schema
-has been recovered; these are almost certainly the page directory and the
-OCR/text index, and decoding them is likely the cheapest route to the
-`noteBundle` page structure.
+Filenames track content: `HandwritingIndex` is present in every notebook,
+`PDFIndex` when the notebook has PDF pages, `ImageIndex` when it has raster
+images. Sizes are highly variable (256 B to 119 KB).
+
+### 5.1 These are the OCR / recognized-text indexes — VERIFIED
+
+`index/ios/ImageIndex.fb` in one sample contains **UTF-8 recognized text** as a
+`u32`-length-prefixed blob: a length of `1184` at offset `9500`, followed by
+1184 bytes of German prose running to within 4 bytes of EOF. The text is real
+OCR output of the page content, not metadata.
+
+Consequence: these indexes are a *derived, lossy* side-car (handwriting
+recognition plus page geometry), not the document itself. A converter must not
+treat them as the source of truth for page content — but they are a cheap,
+readable oracle for what text the page contains, and their geometry floats are a
+useful cross-check on a stroke decoder.
+
+### 5.2 Buffer layout — FLATBUFFERS-LIKE, NOT CONFIRMED
+
+Every `.fb` buffer, and `noteBundle` as well, begins with the same
+`u32 ‖ u16…` tag run, e.g. `10 00 00 00 0c 00 14 00 13 00 12 00 0c 00 04 00`.
+That shape is exactly a FlatBuffers vtable (`u16 vtable_len`, `u16 table_len`,
+then `u16` field offsets), and the first `u32` appears to be the position of the
+root table rather than the trailing root offset that stock FlatBuffers uses.
+
+However, walking the buffer as FlatBuffers does **not** validate: field offsets
+read from these pseudo-vtables overlap and point at positions with no coherent
+owner, and the table that appears to reference the OCR blob is not itself
+referenced by anything. So the buffers are *similar to* FlatBuffers but are not
+stock FlatBuffers, or use a variant layout that has not been identified.
+
+This remains the most promising lead for the page model, and it is cheap to keep
+pushing, but it is not solved.
+
+`tools/fb_explore.py` is a schema-less walker for these buffers and is where
+that work continues.
 
 ## 6. Conversion implications
 
