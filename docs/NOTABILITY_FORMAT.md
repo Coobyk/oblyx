@@ -60,158 +60,209 @@ archive.
 
 A single byte containing the ASCII character `1`.
 
-## 4. `noteBundle` — PARTIALLY REVERSE-ENGINEERED
+## 4. `noteBundle` — FlatBuffer, PARTIALLY DECODED
 
-This is the bulk of the notebook. Its framing is **not yet solved**.
+`noteBundle` **is a standard FlatBuffer** (an earlier claim that it was ruled
+out was wrong — the walker simply used a broken discriminator order). The root
+`u32` uoffset sits at byte 0 and points to the root table.
 
-### 4.1 What is known
+### 4.1 Root table — VERIFIED (all 9 samples)
 
-`noteBundle` is **not**:
+| field | type | meaning |
+| --- | --- | --- |
+| f0 @56 | 16 B inline | note GUID (raw bytes, not a FlatBuffer string) |
+| f3 @120 | string | uppercase device UUID, e.g. `"798E2A39-…"` |
+| f4 @40 | u64 | note create/modify timestamp, ms since Unix epoch |
+| f5 @76 | string | lowercase device UUID |
+| f6 | vector | list of element tables (see 4.2) |
+| f7 @30 | u32 | version-like; `8650770` in one sample, `8388626` in another |
 
-- a ZIP,
-- a single top-level protobuf message (parses fail on every sample),
-- a flat stream of `varint length ‖ protobuf` records,
-- a flat stream of `u32 length ‖ payload` records,
-- a sequence of `u16`-length-prefixed records.
+Element counts in `root.f6` (full walk, no cap):
 
-It is a raw binary container. Protobuf-style *sub-records* appear to be present
-inside it, but the outer framing rule has not been identified.
+| sample | elements |
+| --- | --- |
+| B1 | 802 |
+| Cambridge | 19 |
+| D1 | 1882 |
+| E1 | 2265 |
+| Eth1 | 282 |
+| F1 | 1556 |
+| G1 | 2802 |
+| M1 | 24 |
+| P1 | 1235 |
 
-Framings tried and ruled out for the whole file:
+### 4.2 Element taxonomy — VERIFIED
 
-- a ZIP, or a single top-level protobuf message (parses fail on every sample);
-- a flat stream of `varint length ‖ protobuf`, `u32 length ‖ payload`, or
-  `u16 length ‖ payload` records;
-- a FlatBuffers buffer read the standard way. The leading
-  `u32 ‖ u16, u16, u16…` run *is* shaped exactly like a FlatBuffers vtable, and
-  in the `.fb` files the leading `u32` does equal the position of a table-like
-  object, with `vtable_len`/`table_len` and field offsets reading sensibly. It
-  nevertheless fails to validate: field offsets overlap, and the object that
-  appears to own the OCR blob is referenced by nothing. Something in this
-  variant is still unidentified.
+Each `root.f6[i]` is a **wrapper table** with `nf=6` vtable fields. The wrapper
+holds u64 timestamps and a `f5` uoffset pointing at the **inner object** table.
 
-### 4.2 Rejected hypothesis: record-offset table
+The inner table's field count (`nf`) determines the element type:
 
-A `u32 count` followed by `count-1` strictly-descending `u32` values (offsets
-measured backwards from EOF) reproduces the layout of the two smallest sample
-notebooks (`8456 B` and `4064 B`) exactly. It does **not** generalise: it
-matches 3 of 9 sample notebooks, and in one of those the detected table sits in
-the middle of the file. Treated as coincidental structure, not the container
-rule.
+| inner nf | count (Eth1) | type |
+| --- | --- | --- |
+| 16 | 220 | **handwriting stroke** (see 4.3) |
+| 12 | 19 | unknown (text? image?) |
+| 4 | 16 | unknown |
+| 1 | 13 | unknown |
+| 15 | 7 | unknown |
+| 7 | 3 | unknown |
+| 8 | 1 | unknown |
+| 2 | 1 | unknown |
+| 13 | 1 | unknown |
+| 11 | 1 | unknown |
 
-### 4.3 Stroke point encoding — VERIFIED
+Only `nf=16` has been decoded so far.
 
-This is the one part of `noteBundle` that is nailed down, and it is the part
-that matters most for rendering.
+### 4.3 Stroke table — VERIFIED (two subtypes)
 
-Ink strokes are stored as a run of fixed-size **19-byte** units:
+Handwriting strokes are inner tables with `nf=16`. Two subtypes exist,
+distinguished by table size and vtable layout:
+
+| | Type A | Type B |
+| --- | --- | --- |
+| tsize | 44 | 40 |
+| vtable fields | `[32,24,0,0,0,23,0,19,12,8,0,0,0,0,0,4]` | `[28,20,0,0,0,0,0,16,12,8,0,0,0,0,0,4]` |
+| f9 uoffset | 36 | 32 |
+| u16 in points | constant `15360` (`0x3c00`) | varies (~14681–15401) |
+
+Observed distribution (B1): 55 Type A, 506 Type B out of 561 strokes.
+
+Decoded fields (offsets differ per subtype; shown for Type A → Type B):
+
+| field | Type A off | Type B off | type | meaning |
+| --- | --- | --- | --- | --- |
+| f1 | 24 | 20 | struct 2×f32 | **stroke anchor (Y, X)** — absolute page coords, Y increases downward |
+| f8 | 12 | 12 | f32 | **stroke width** in points |
+| f9 | 8 | 8 | uoffset | points to the point-data blob at `tp + tsize` |
+| f15 | 4 | 4 | u32 | id-like, varies per stroke |
+
+The f1 struct covers 8 bytes (two f32s). For Type A the second f32 sits at
+offset 28 (not listed in the vtable — it is part of the struct, not a separate
+field). Verified: anchor `(Y=48.97, X=69.18)` for one Cambridge stroke,
+`(Y=109.44, X=65.15)` for one Type B stroke. Across Eth1, anchors range
+Y 27.8–229.9, X 23.7–153.7 — page-plausible.
+
+**Widths are integer multiples of a base pen width.** Base is `0.7751` (one
+notebook uses `0.725`); observed multipliers `1, 2, 4, 5, 10, 15, 30` — matching
+Notability's pen/highlighter size presets.
+
+### 4.4 Point-data blob — structure VERIFIED, coordinates UNSOLVED
+
+Each stroke's `f9` points at a blob at `tp + tsize` (verified for 561/568 B1
+strokes). The blob layout:
+
+```
+offset 0   u32    = 19*n − 5   (also serves as pt0's x, denormal ≈ 0)
+offset 4   u8     = 0
+offset 5   u8     = n          (point count)
+offset 6   u8     = 0
+offset 7   u8     = 3          (constant)
+offset 8+  n × 19-byte point records
+```
+
+Each 19-byte point record:
 
 ```
 offset  size  meaning
 0       4     f32 LE   x
 4       4     f32 LE   y
 8       4     f32 LE   z
-12      7     trailer, always 00 3c 00 3c ff 00 00
+12      2     u16 LE   (Type A: constant 15360 = f16 1.0; Type B: varies)
+14      5     trailer, always 00 3c ff 00 00
 ```
 
-Evidence (smallest sample notebook, 8456 B): the 7-byte trailer occurs 321
-times; of the 333 byte-runs between consecutive trailers, **290 are exactly
-19 bytes**, and those decode to plausible page coordinates. Records begin with a
-short metadata header before the first unit and end with a partial unit.
+The earlier "7-byte trailer `00 3c 00 3c ff 00 00`" is the u16 (which for Type
+A is always `00 3c`) concatenated with the 5-byte trailer. Using the 5-byte
+trailer at offset 14 works for **both** subtypes and recovers the full stroke
+counts.
 
-Open questions on strokes:
+Corrected stroke/point totals (all 9 samples, 5-byte-trailer model):
 
-- the meaning of the third `f32` (a third coordinate, pressure, or a time
-  value) is not established;
-- the per-stroke header (colour, width, style/pen, transform) is not decoded;
-- whether strokes are bezier-sampled or polyline is not established.
+| sample | strokes | total pts | Type A | Type B |
+| --- | --- | --- | --- | --- |
+| B1 | 561 | 16744 | 55 | 506 |
+| Eth1 | 220 | 4035 | 220 | 0 |
+| D1 | 1102 | 21229 | 438 | 664 |
+| E1 | 1485 | 31430 | 1208 | 277 |
+| F1 | 1301 | 20790 | 1301 | 0 |
+| G1 | 1790 | 46343 | 1752 | 38 |
+| P1 | 631 | 18059 | 631 | 0 |
+| Cambridge | 13 | 321 | 13 | 0 |
+| M1 | 1 | 54 | 1 | 0 |
 
-The older, pre-cloud `.note` format is documented separately (Julia Evans,
-2018) and uses an Apple `NSKeyedArchiver` `Session.plist` with `curvespoints`,
-`curvesnumpoints`, `curveswidth`, `curvescolors`, `curvesstyles`,
-`curvesforces`, `curvesfractionalwidths` arrays. That is a **different**
-container and does not apply to `noteBundle`, but it confirms the domain model
-Notability uses for ink: per-curve point counts, widths, RGBA colours and a
-per-curve style index, where alpha `< 255` marks highlighter strokes.
+#### Coordinate encoding — UNSOLVED
 
-### 4.4 Stroke headers — PARTIALLY VERIFIED
+The three f32 values per point are **not** page coordinates and **not** simple
+deltas. Observed behaviour:
 
-Every run of point units is preceded by a header of **variable length**, roughly
-90–140 bytes. Measured across 6 165 stroke runs in 8 sample notebooks, the
-header contains:
+- Values start near zero, grow to a peak (up to ~10⁶ in long strokes), then
+  decay back toward zero — a velocity-envelope / two-envelope pattern.
+- `cumsum(x, y)` does **not** reproduce the PDF vector path shape (monotonic
+  growth vs. the PDF's back-and-forth letterforms).
+- No constant scale factor relates cumsum extents to PDF extents across
+  strokes.
+- Raw values are not absolute positions (they jump from ~0 to ~10⁶ and back).
+- The u16 field is constant 15360 (f16 = 1.0) for Type A and varies ~14681–15401
+  for Type B — possibly pressure or a timestamp delta, but unconfirmed.
 
-| offset | type | observation |
-| --- | --- | --- |
-| +0 | u32 | flags; only `0` and `416` (`0x1A0`) are common |
-| +8 | u32 | an id that decreases by 2 between consecutive strokes in one sample |
-| +12 | i32 | negative; magnitude varies per stroke |
-| +16 | u32 | varies; **not** the record length or point count |
-| +20 | u32 | constant `36` within a notebook |
-| +24 | f32 | **stroke width** |
-| +28 | u32 | usually `0` |
-| +32 | 4 B | `00 ff 01 XX`: the `00 ff 01` prefix is constant and `XX` varies per stroke, so this is almost certainly the **colour** |
-| +44 | u32 | usually `0`, occasionally `1` |
+Hypotheses tried and rejected: fixed-point reinterpretation, log-encoding,
+sqrt-encoding, velocity × constant-dt integration, bfloat16 pairs.
 
-**Widths are integer multiples of a base pen width.** Across samples the base is
-`0.7751` (one notebook uses `0.725`) and the observed multipliers are
-`1, 2, 4, 5, 10, 15, 30` — which line up with Notability's pen and highlighter
-size presets. Reading these as `base × preset` is therefore safe even though the
-exact header field layout is not.
+The stroke **anchor** (f1 = Y, X) is confirmed absolute page position; only the
+intra-stroke path geometry is unsolved.
 
-Caveat that limits all of the above: these offsets were read at a fixed window
-before each run, which aligns for the dominant case but not universally. The
-header length is genuinely variable, so the field table should be treated as a
-strong hypothesis to be confirmed once the record framing is solved.
+### 4.5 PDF comparison — anchors confirmed, paths not
 
-The 90–140 byte gaps between point runs are **not** a pure header: their longest
-common suffix across runs is 0–13 bytes. Other record types therefore interleave
-with strokes, which is the main obstacle to isolating headers reliably.
+Matching PDFs were used as an oracle. Findings:
 
-## 5. `index/ios/*.fb` — PARTIALLY REVERSE-ENGINEERED
+- PDF handwriting is **rasterized** (`/Im1 Do`, 0 vector paths) in Cambridge and
+  M1; the other 7 PDFs contain **vector** paths using both `l` (lineto) and `c`
+  (cubic Bezier) operators.
+- PDF segment counts roughly match .ntb stroke counts (Eth1: 220 strokes vs 230
+  PDF paths; B1: 561 vs 3791 after Bezier subdivision).
+- PDF paths are drawn with the **identity transform** (page coordinates
+  directly); a `cm` scale/flip appears only for embedded images.
+- PDF y-axis is bottom-up; .ntb anchor Y is top-down. `pdf_y = pageH − ntb_Y`
+  matches (Eth1 pageH = 841.89).
+- Matching .ntb anchors to PDF path bbox centers (y-flipped) succeeds for
+  ~42% of Eth1 strokes at a 15-point threshold, with residuals of a few points —
+  confirming the anchor is the stroke's page position.
+- Point-count and bbox-extent comparisons between .ntb and PDF do **not**
+  correlate, because the point coordinates themselves are undecoded.
+
+## 5. `index/ios/*.fb` — FlatBuffers, OCR side-car
 
 Filenames track content: `HandwritingIndex` is present in every notebook,
 `PDFIndex` when the notebook has PDF pages, `ImageIndex` when it has raster
 images. Sizes are highly variable (256 B to 119 KB).
 
-### 5.1 These are the OCR / recognized-text indexes — VERIFIED
+These buffers hold **UTF-8 recognized text** (OCR output) plus page geometry.
+They are a derived, lossy side-car — not the source of truth for page content —
+but a cheap oracle for what text a page contains.
 
-`index/ios/ImageIndex.fb` in one sample contains **UTF-8 recognized text** as a
-`u32`-length-prefixed blob: a length of `1184` at offset `9500`, followed by
-1184 bytes of German prose running to within 4 bytes of EOF. The text is real
-OCR output of the page content, not metadata.
-
-Consequence: these indexes are a *derived, lossy* side-car (handwriting
-recognition plus page geometry), not the document itself. A converter must not
-treat them as the source of truth for page content — but they are a cheap,
-readable oracle for what text the page contains, and their geometry floats are a
-useful cross-check on a stroke decoder.
-
-### 5.2 Buffer layout — FLATBUFFERS-LIKE, NOT CONFIRMED
-
-Every `.fb` buffer, and `noteBundle` as well, begins with the same
-`u32 ‖ u16…` tag run, e.g. `10 00 00 00 0c 00 14 00 13 00 12 00 0c 00 04 00`.
-That shape is exactly a FlatBuffers vtable (`u16 vtable_len`, `u16 table_len`,
-then `u16` field offsets), and the first `u32` appears to be the position of the
-root table rather than the trailing root offset that stock FlatBuffers uses.
-
-However, walking the buffer as FlatBuffers does **not** validate: field offsets
-read from these pseudo-vtables overlap and point at positions with no coherent
-owner, and the table that appears to reference the OCR blob is not itself
-referenced by anything. So the buffers are *similar to* FlatBuffers but are not
-stock FlatBuffers, or use a variant layout that has not been identified.
-
-This remains the most promising lead for the page model, and it is cheap to keep
-pushing, but it is not solved.
-
-`tools/fb_explore.py` is a schema-less walker for these buffers and is where
-that work continues.
+The buffers are standard FlatBuffers (same walker as noteBundle). Per-field
+schemas are not yet decoded.
 
 ## 6. Conversion implications
 
-For rendering (`→` SVG/PDF/PNG) the format is tractable: assets are
-self-describing and content-addressed, and ink is decoded.
+For rendering (`→` SVG/PDF/PNG) the format is tractable **once the point
+coordinate encoding is solved**: stroke anchors, widths, and counts are decoded;
+only the intra-stroke path geometry is missing.
 
 For **editable** export (`→` `.ntb` or `→` `.goodnotes`) the format must be
 *understood*, not merely read, and additionally must be validated by round-tripping
 through the real applications. No writer should be considered correct until it
 has been opened and re-saved by Notability / GoodNotes on a device.
+
+## 7. Open problems
+
+1. **Point coordinate encoding** (4.4) — the blocker for rendering. The three
+   f32s per point have a velocity-envelope pattern but do not integrate to the
+   PDF path. May require inspecting the Notability app binary or SDK.
+2. **Non-stroke element types** (4.2, nf ≠ 16) — text, images, shapes, PDF-page
+   references are all undecoded.
+3. **Colour field** — the `00 ff 01` byte-run appears in stroke headers but its
+   exact encoding (RGBA? palette index?) is unconfirmed.
+4. **f15 u32** — matches neither point count nor byte length; purpose unknown.
+5. **u16 in points** — constant f16 1.0 for Type A, varying for Type B; likely
+   pressure or timestamp, unconfirmed.
