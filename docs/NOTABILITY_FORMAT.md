@@ -77,6 +77,19 @@ This is the bulk of the notebook. Its framing is **not yet solved**.
 It is a raw binary container. Protobuf-style *sub-records* appear to be present
 inside it, but the outer framing rule has not been identified.
 
+Framings tried and ruled out for the whole file:
+
+- a ZIP, or a single top-level protobuf message (parses fail on every sample);
+- a flat stream of `varint length ‖ protobuf`, `u32 length ‖ payload`, or
+  `u16 length ‖ payload` records;
+- a FlatBuffers buffer read the standard way. The leading
+  `u32 ‖ u16, u16, u16…` run *is* shaped exactly like a FlatBuffers vtable, and
+  in the `.fb` files the leading `u32` does equal the position of a table-like
+  object, with `vtable_len`/`table_len` and field offsets reading sensibly. It
+  nevertheless fails to validate: field offsets overlap, and the object that
+  appears to own the OCR blob is referenced by nothing. Something in this
+  variant is still unidentified.
+
 ### 4.2 Rejected hypothesis: record-offset table
 
 A `u32 count` followed by `count-1` strictly-descending `u32` values (offsets
@@ -120,6 +133,39 @@ The older, pre-cloud `.note` format is documented separately (Julia Evans,
 container and does not apply to `noteBundle`, but it confirms the domain model
 Notability uses for ink: per-curve point counts, widths, RGBA colours and a
 per-curve style index, where alpha `< 255` marks highlighter strokes.
+
+### 4.4 Stroke headers — PARTIALLY VERIFIED
+
+Every run of point units is preceded by a header of **variable length**, roughly
+90–140 bytes. Measured across 6 165 stroke runs in 8 sample notebooks, the
+header contains:
+
+| offset | type | observation |
+| --- | --- | --- |
+| +0 | u32 | flags; only `0` and `416` (`0x1A0`) are common |
+| +8 | u32 | an id that decreases by 2 between consecutive strokes in one sample |
+| +12 | i32 | negative; magnitude varies per stroke |
+| +16 | u32 | varies; **not** the record length or point count |
+| +20 | u32 | constant `36` within a notebook |
+| +24 | f32 | **stroke width** |
+| +28 | u32 | usually `0` |
+| +32 | 4 B | `00 ff 01 XX`: the `00 ff 01` prefix is constant and `XX` varies per stroke, so this is almost certainly the **colour** |
+| +44 | u32 | usually `0`, occasionally `1` |
+
+**Widths are integer multiples of a base pen width.** Across samples the base is
+`0.7751` (one notebook uses `0.725`) and the observed multipliers are
+`1, 2, 4, 5, 10, 15, 30` — which line up with Notability's pen and highlighter
+size presets. Reading these as `base × preset` is therefore safe even though the
+exact header field layout is not.
+
+Caveat that limits all of the above: these offsets were read at a fixed window
+before each run, which aligns for the dominant case but not universally. The
+header length is genuinely variable, so the field table should be treated as a
+strong hypothesis to be confirmed once the record framing is solved.
+
+The 90–140 byte gaps between point runs are **not** a pure header: their longest
+common suffix across runs is 0–13 bytes. Other record types therefore interleave
+with strokes, which is the main obstacle to isolating headers reliably.
 
 ## 5. `index/ios/*.fb` — PARTIALLY REVERSE-ENGINEERED
 
