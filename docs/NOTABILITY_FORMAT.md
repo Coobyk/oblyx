@@ -381,12 +381,22 @@ then `writeInt32(index)`, `writeInt32(timestamp)`, `pad(2)`,
 and 2 bytes of padding before the timestamp. Reading as packed
 `(u16, u32, u32)` is wrong; the correct read is aligned as above.
 
-**Pagination** groups live strokes/shapes by their final page SeqId
-(first-appearance order across the op log). Dimensions come from the
-matching CreatePage background (by location SeqId), defaulting to A4
-(595.28 × 841.89). This replaces the old Y-slice approximation, which
-collapsed multi-page notebooks onto one page because pages share a local
-coordinate space (each page's Y restarts near 0).
+**Pagination** groups live strokes/shapes by their final page SeqId.
+Page sequence follows the CreatePage defs in first-appearance order; only
+pages that carry live ink are emitted (bare CreatePage ops often mark
+scratch/deleted pages whose content was removed later). Dimensions come
+from the matching CreatePage background (by location SeqId), defaulting
+to A4 (595.28 × 841.89). This replaces the old Y-slice approximation,
+which collapsed multi-page notebooks onto one page because pages share a
+local coordinate space (each page's Y restarts near 0).
+
+CreatePage ops come in two shapes: *full* (f0 location SeqId + f1
+background with f3 size) and *bare* (f0 SeqId only, no background). Bare
+creates still register the page id — later full creates for the same id
+merge in the dimensions (first-appearance order preserved; a later bare
+re-create never clears recorded dims). D1/Eth1 consist only of bare
+creates, so their defs carry unknown dims and fall back to A4 (which
+matches their PDF exports).
 
 `ModifyPositions` (payloadType 24) entries carry f1 = page SeqId and f2 =
 origin; the fold applies both, so strokes moved between pages after
@@ -394,13 +404,13 @@ creation land on the correct page.
 
 Observed live page groups (aligned SeqId layout, after deletes):
 
-| sample | page groups | CreatePage defs | notes |
+| sample | ink page groups | CreatePage defs | notes |
 | --- | --- | --- | --- |
-| G1 | 10 | 8 | A4 pages; some groups share CreatePage |
-| B1 | 6 | 3 | mixed sizes |
-| E1 | 9 | 4 | A4 pages |
-| D1 | 5 | 0 | no CreatePage (A4 fallback) |
-| P1 | 3 | 4 | includes landscape 842×595 |
+| G1 | 10 | 13 | A4 pages; bare+full creates merge |
+| B1 | 6 | 8 | mixed sizes (651×407, 768×1024, A4) |
+| E1 | 9 | 6 | A4 pages |
+| D1 | 5 | 3 | bare creates only (A4 fallback) |
+| P1 | 3 | 5 | includes landscape 842×595 |
 
 PDF exports of the same notebooks report different page counts (stale
 exports from earlier notebook states); the thumbnail (embedded in the
@@ -476,8 +486,9 @@ Public API:
   only live entities are emitted.
 - `ntb::parse_bundle_public(bytes)` → same, from an in-memory `noteBundle`
 - `ntb::paginate(doc, page_h)` → `Vec<NtbPage>` (groups by page SeqId when
-  every entity carries one — dimensions from CreatePage defs; falls back to
-  Y-slicing at `page_h` otherwise)
+  every entity carries one — sequence from CreatePage defs, ink-bearing
+  pages only, dimensions from CreatePage defs with A4 fallback; falls back
+  to Y-slicing at `page_h` otherwise)
 - `ntb::to_pages(doc, page_h)` → `Vec<Page>` (portable IR items with true
   per-page dimensions; strokes emitted as decoded Bézier polylines — a lone
   moveto degenerates to a 2-point zero-length segment; shapes →
@@ -513,8 +524,10 @@ loaded into the document attachment map. Example: `cargo run --bin oblyx
    (multiplies the table f8 base width) but unused by the renderer today.
 7. **Non-standard trailers** — 2 G1 strokes have a non-standard header;
    the decoder falls back to shifted-alignment trailer scans (§4.4).
-8. **P1 live count** — Rust reports 514 live strokes vs 505 from the
-   Python fold (minor discrepancy, unresolved).
+8. ~~**P1 live count**~~ — resolved: the old "505" came from a buggy Python
+   fold (missed undeletes). A corrected mirror gives 515; the 1-stroke gap
+   vs Rust's 514 is the `point_count > 0` filter dropping a path-less
+   CreateInk. Rust count is correct.
 9. **No device validation** — no Notability/GoodNotes round-trip has been
    performed; any future writer must be validated on a real device.
 

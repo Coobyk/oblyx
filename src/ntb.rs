@@ -227,9 +227,10 @@ pub struct NtbStroke {
     pub audio_duration_ms: Option<i32>,
 }
 
-/// A page definition from a CreatePage op's background size.
-/// Dimensions are in points. `id` is the CreatePage f0 location SeqId
-/// matching ink/shape page ids.
+/// A page definition from a CreatePage op. `id` is the CreatePage f0 location
+/// SeqId matching ink/shape page ids. `width`/`height` are the background size
+/// in points when present; `0×0` means the page was created bare (no
+/// background recorded) and pagination falls back to A4.
 #[derive(Debug, Clone, Copy)]
 pub struct NtbPageDef {
     pub id: PageId,
@@ -570,7 +571,7 @@ fn fold_op(
         }
         PT_CREATE_PAGE => {
             if let Some(pd) = parse_create_page(b, payload_pos, &pf)? {
-                pages.push(pd);
+                upsert_page(pages, pd);
             }
         }
         _ => {
@@ -788,30 +789,48 @@ fn apply_deletes(b: &Buf, tp: usize, fields: &[u16], fold: &mut Fold) -> Result<
     Ok(())
 }
 
-/// Parse a CreatePage op: f0 location SeqId + f1 → PageBackground → f3 size.
+/// Parse a CreatePage op: f0 location SeqId + optional f1 → PageBackground →
+/// f3 size. A bare CreatePage (f0 present, f1/size absent) registers the page
+/// with unknown dims (`0×0`); a later CreatePage with a background updates the
+/// dims (see [`upsert_page`]).
 fn parse_create_page(b: &Buf, tp: usize, fields: &[u16]) -> Result<Option<NtbPageDef>> {
     let f0 = Buf::field_off(fields, PAGE_F0_LOCATION);
     let Some(id) = read_page_id(b, tp, f0) else {
         return Ok(None);
     };
+    let unknown = NtbPageDef { id, width: 0.0, height: 0.0 };
     let f1 = Buf::field_off(fields, PAGE_F1_BACKGROUND);
     if f1 == 0 {
-        return Ok(None);
+        return Ok(Some(unknown));
     }
     let bg = b.follow(tp + f1)?;
     let (_bs, _bt, bf) = b.table(bg)?;
     let f3 = Buf::field_off(&bf, BG_F3_SIZE);
     if f3 == 0 {
-        return Ok(None);
+        return Ok(Some(unknown));
     }
     let width = b.f32(bg + f3)?;
     let height = b.f32(bg + f3 + 4)?;
     if !width.is_finite() || !height.is_finite() || width < 50.0 || height < 50.0
         || width > 10_000.0 || height > 10_000.0
     {
-        return Ok(None);
+        return Ok(Some(unknown));
     }
     Ok(Some(NtbPageDef { id, width, height }))
+}
+
+/// Insert or merge a page def: one entry per id, first-appearance order.
+/// A later def with valid dims (`>0`) updates the existing entry's size;
+/// a bare def (`0×0`) never clears dims already recorded.
+fn upsert_page(pages: &mut Vec<NtbPageDef>, def: NtbPageDef) {
+    if let Some(existing) = pages.iter_mut().find(|p| p.id == def.id) {
+        if def.width > 0.0 && def.height > 0.0 {
+            existing.width = def.width;
+            existing.height = def.height;
+        }
+    } else {
+        pages.push(def);
+    }
 }
 
 /// Read a df SeqId struct (12 bytes, aligned) at `tp + off`:
@@ -1279,58 +1298,85 @@ pub fn paginate(doc: &NtbDocument, page_h: f32) -> Vec<NtbPage> {
     pages
 }
 
-/// Group by page SeqId in first-appearance order (stroke/shape creation
-/// order). Dimensions from matching CreatePage defs; default A4.
+/// Group by page SeqId. Page sequence follows the CreatePage defs
+/// (`doc.pages`, one entry per id in first-appearance order; `0×0` dims mean
+/// unknown → A4 fallback). Only pages that carry live ink (strokes or shapes)
+/// are emitted — bare CreatePage ops often mark scratch/deleted pages whose
+/// content was removed later. Entities whose page id has no CreatePage def are
+/// appended after the def pages (A4 fallback).
 fn paginate_by_page_id(doc: &NtbDocument, fallback_h: f32) -> Vec<NtbPage> {
     use std::collections::HashMap as Map;
 
     let default_h = if fallback_h > 0.0 { fallback_h } else { NTB_PAGE_H };
-    let def_by_id: Map<PageId, (f32, f32)> = doc
-        .pages
-        .iter()
-        .map(|p| (p.id, (p.width, p.height)))
-        .collect();
+    let a4_dims = (NTB_PAGE_W, default_h);
 
     let mut order: Vec<PageId> = Vec::new();
     let mut groups: Map<PageId, NtbPage> = Map::new();
+    for def in &doc.pages {
+        if groups.contains_key(&def.id) {
+            continue;
+        }
+        order.push(def.id);
+        let (w, h) = if def.width > 0.0 && def.height > 0.0 {
+            (def.width, def.height)
+        } else {
+            a4_dims
+        };
+        groups.insert(
+            def.id,
+            NtbPage {
+                strokes: Vec::new(),
+                shapes: Vec::new(),
+                width: w,
+                height: h,
+            },
+        );
+    }
+
     for s in &doc.strokes {
-        if let Some(id) = s.page {
-            groups.entry(id).or_insert_with(|| {
-                order.push(id);
-                let (w, h) = def_by_id.get(&id).copied().unwrap_or((NTB_PAGE_W, default_h));
-                NtbPage {
-                    strokes: Vec::new(),
-                    shapes: Vec::new(),
-                    width: w,
-                    height: h,
-                }
-            });
-            if let Some(p) = groups.get_mut(&id) {
-                p.strokes.push(s.clone());
+        let Some(id) = s.page else { continue };
+        groups.entry(id).or_insert_with(|| {
+            order.push(id);
+            NtbPage {
+                strokes: Vec::new(),
+                shapes: Vec::new(),
+                width: a4_dims.0,
+                height: a4_dims.1,
             }
+        });
+        if let Some(p) = groups.get_mut(&id) {
+            p.strokes.push(s.clone());
         }
     }
     for s in &doc.shapes {
-        if let Some(id) = s.page {
-            groups.entry(id).or_insert_with(|| {
-                order.push(id);
-                let (w, h) = def_by_id.get(&id).copied().unwrap_or((NTB_PAGE_W, default_h));
-                NtbPage {
-                    strokes: Vec::new(),
-                    shapes: Vec::new(),
-                    width: w,
-                    height: h,
-                }
-            });
-            if let Some(p) = groups.get_mut(&id) {
-                p.shapes.push(s.clone());
+        let Some(id) = s.page else { continue };
+        groups.entry(id).or_insert_with(|| {
+            order.push(id);
+            NtbPage {
+                strokes: Vec::new(),
+                shapes: Vec::new(),
+                width: a4_dims.0,
+                height: a4_dims.1,
             }
+        });
+        if let Some(p) = groups.get_mut(&id) {
+            p.shapes.push(s.clone());
         }
     }
-    order
+    let mut out: Vec<NtbPage> = order
         .into_iter()
         .filter_map(|id| groups.remove(&id))
-        .collect()
+        .filter(|p| !p.strokes.is_empty() || !p.shapes.is_empty())
+        .collect();
+    if out.is_empty() {
+        out.push(NtbPage {
+            strokes: Vec::new(),
+            shapes: Vec::new(),
+            width: a4_dims.0,
+            height: a4_dims.1,
+        });
+    }
+    out
 }
 
 /// Y anchor of a shape for pagination (top of the bounding box).
@@ -1700,5 +1746,65 @@ mod tests {
         assert_eq!(pages[0].height, 841.89);
         assert_eq!(pages[1].width, 100.0);
         assert_eq!(pages[1].height, 200.0);
+    }
+
+    #[test]
+    fn upsert_page_merges_bare_and_dims() {
+        let mut pages = Vec::new();
+        let p0: PageId = (0, 1, 0);
+        let p1: PageId = (0, 2, 0);
+        // Bare create first, then dims update; another page stays bare.
+        upsert_page(&mut pages, NtbPageDef { id: p0, width: 0.0, height: 0.0 });
+        upsert_page(&mut pages, NtbPageDef { id: p1, width: 0.0, height: 0.0 });
+        upsert_page(&mut pages, NtbPageDef { id: p0, width: 842.0, height: 595.0 });
+        // A later bare re-create must not clear recorded dims.
+        upsert_page(&mut pages, NtbPageDef { id: p0, width: 0.0, height: 0.0 });
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].id, p0);
+        assert_eq!(pages[0].width, 842.0);
+        assert_eq!(pages[0].height, 595.0);
+        assert_eq!(pages[1].id, p1);
+        assert_eq!(pages[1].width, 0.0);
+    }
+
+    #[test]
+    fn paginate_filters_empty_pages_keeps_ink_order() {
+        let mk = |page: PageId| NtbStroke {
+            page: Some(page),
+            anchor_x: 0.0,
+            anchor_y: 10.0,
+            width: 1.0,
+            point_count: 1,
+            points: vec![],
+            color: None,
+            tool: None,
+            style: None,
+            audio_duration_ms: None,
+        };
+        let p0: PageId = (0, 1, 0);
+        let p1: PageId = (0, 2, 0); // bare page, no ink — filtered out
+        let p2: PageId = (0, 3, 0);
+        let doc = NtbDocument {
+            meta: NtbMeta::default(),
+            strokes: vec![mk(p0), mk(p2)],
+            pages: vec![
+                NtbPageDef { id: p0, width: 595.28, height: 841.89 },
+                NtbPageDef { id: p1, width: 0.0, height: 0.0 },
+                NtbPageDef { id: p2, width: 842.0, height: 595.0 },
+            ],
+            texts: vec![],
+            shapes: vec![],
+            manifest: vec![],
+            thumbnail: None,
+            assets: vec![],
+        };
+        let pages = paginate(&doc, 841.89);
+        // Empty p1 filtered; CreatePage order preserved for ink pages.
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].strokes.len(), 1);
+        assert_eq!(pages[0].width, 595.28);
+        assert_eq!(pages[1].strokes.len(), 1);
+        assert_eq!(pages[1].width, 842.0);
+        assert_eq!(pages[1].height, 595.0);
     }
 }
