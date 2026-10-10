@@ -23,13 +23,16 @@ fn main() -> anyhow::Result<()> {
         "  device_upper={} device_lower={}",
         m.device_uuid_upper, m.device_uuid_lower
     );
-    println!("  strokes={} pages={} texts={} assets={} thumbnail={} manifest={}B",
+    println!(
+        "  strokes={} shapes={} pages={} texts={} assets={} thumbnail={} manifest={}B",
         doc.strokes.len(),
+        doc.shapes.len(),
         doc.pages.len(),
         doc.texts.len(),
         doc.assets.len(),
         doc.thumbnail.is_some(),
-        doc.manifest.len());
+        doc.manifest.len()
+    );
     for (i, p) in doc.pages.iter().enumerate() {
         println!("    page[{i}]: {:.0}×{:.0} pt", p.width, p.height);
     }
@@ -71,5 +74,62 @@ fn main() -> anyhow::Result<()> {
             );
         }
     }
+    // Stroke colour histogram (raw 0xAABBGGRR).
+    let mut stroke_cols: std::collections::HashMap<u32, usize> = Default::default();
+    for s in &doc.strokes {
+        *stroke_cols.entry(s.color.unwrap_or(0xff000000)).or_insert(0) += 1;
+    }
+    if stroke_cols.len() > 1 {
+        println!("  stroke colours:");
+        let mut sc: Vec<_> = stroke_cols.into_iter().collect();
+        sc.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+        for (v, count) in sc.into_iter().take(8) {
+            let [r, g, b, a] = oblyx::ntb::rgba_from_u32(v);
+            println!(
+                "    {v:#010x} = #{:02x}{:02x}{:02x} a={a:.2} × {count}",
+                (r * 255.0) as u8,
+                (g * 255.0) as u8,
+                (b * 255.0) as u8
+            );
+        }
+    }
+
+    // Shape stats
+    if !doc.shapes.is_empty() {
+        let mut kinds: std::collections::HashMap<(&str, u8), usize> = Default::default();
+        for s in &doc.shapes {
+            let kind = match s.vector_len {
+                8 => {
+                    if (s.dx - s.dy).abs() <= 0.05 * s.dx.abs().max(s.dy.abs()).max(1.0) {
+                        "ellipse"
+                    } else {
+                        "rect"
+                    }
+                }
+                _ => "line",
+            };
+            *kinds.entry((kind, s.subtype)).or_insert(0) += 1;
+        }
+        println!("  shapes:");
+        let mut ks: Vec<_> = kinds.into_iter().collect();
+        ks.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+        for ((kind, subtype), count) in ks {
+            println!("    {kind} subtype={subtype} × {count}");
+        }
+        for s in doc.shapes.iter().take(8) {
+            println!(
+                "    anchor=({:6.1},{:6.1}) d=({:6.1},{:6.1}) n={} w={:.3} sub={} colour={:?}",
+                s.anchor_x,
+                s.anchor_y,
+                s.dx,
+                s.dy,
+                s.vector_len,
+                s.width,
+                s.subtype,
+                s.color.map(|v| format!("{v:#010x}"))
+            );
+        }
+    }
+
     Ok(())
 }

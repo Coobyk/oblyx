@@ -16,7 +16,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use zip::ZipArchive;
 
-use crate::doc::{Item, Page, Stroke};
+use crate::doc::{Item, Page, ShapeEl, ShapeKind, Stroke};
 
 // ---------------------------------------------------------------------------
 // FlatBuffer walker (minimal, schema-less)
@@ -112,6 +112,9 @@ pub struct NtbStroke {
     pub point_count: usize,
     /// Decoded path points. Currently always empty — see module docs.
     pub points: Vec<[f32; 2]>,
+    /// Raw colour u32 (`0xAABBGGRR`, i.e. LE bytes are R,G,B,A) when the
+    /// stroke table carries one (fields f5/f7); `None` → default black.
+    pub color: Option<u32>,
 }
 
 /// A page definition (inner nf=2). Dimensions are in points.
@@ -121,12 +124,45 @@ pub struct NtbPageDef {
     pub height: f32,
 }
 
-/// A text box (inner nf=8). The actual text characters are stored elsewhere;
-/// only font metadata is decoded here.
+/// A text style record (inner nf=8 with font metadata). In all 9 samples the
+/// only such element is a document-level style record at element index 0
+/// (font `Inter`, size 14, locale `en_US`); no positioned text boxes with
+/// content were found, so no position/text is decoded here. Other nf=8
+/// elements without font metadata are pen-style records and are filtered out.
 #[derive(Debug, Clone)]
 pub struct NtbText {
     pub font: String,
     pub size: f32,
+}
+
+/// A shape (inner nf=11/12/15 with an f5 geometry vector).
+///
+/// Geometry comes from the f5 vector's first values: for vectors of length 8
+/// or 12 they are `(v0, v1)`; for length 14 the first slot is a header
+/// (`0x01000000`) and the dims are `(v1, v2)`.
+///
+/// Classification (best-effort, see `docs/NOTABILITY_FORMAT.md` §4.3):
+/// - length 8 with near-equal dims → ellipse (dims are the bbox size);
+/// - length 8 with unequal dims → rectangle;
+/// - length 12 or 14 → straight line from the anchor by `(dx, dy)`.
+#[derive(Debug, Clone)]
+pub struct NtbShape {
+    /// Absolute page X (left-right), points.
+    pub anchor_x: f32,
+    /// Absolute page Y (top-down), points.
+    pub anchor_y: f32,
+    /// X extent of the geometry (line delta or bbox width), points.
+    pub dx: f32,
+    /// Y extent of the geometry (line delta or bbox height), points.
+    pub dy: f32,
+    /// Number of f32 slots in the f5 vector (8, 12 or 14).
+    pub vector_len: usize,
+    /// Raw colour u32 (`0xAABBGGRR`); `None` → default black.
+    pub color: Option<u32>,
+    /// Outline width in points; 0 when the field was missing.
+    pub width: f32,
+    /// Shape subtype (inner f4, u8): 1 and 3 observed in samples.
+    pub subtype: u8,
 }
 
 /// Metadata extracted from the noteBundle root table.
@@ -154,8 +190,10 @@ pub struct NtbDocument {
     pub strokes: Vec<NtbStroke>,
     /// Page definitions (inner nf=2). Empty for continuous-scroll notebooks.
     pub pages: Vec<NtbPageDef>,
-    /// Text boxes (inner nf=8).
+    /// Text style records (inner nf=8 with font metadata).
     pub texts: Vec<NtbText>,
+    /// Shapes (inner nf=11/12/15 with an f5 geometry vector).
+    pub shapes: Vec<NtbShape>,
     /// Raw `manifest.json` bytes.
     pub manifest: Vec<u8>,
     /// Raw `thumbnail.png` bytes, if present.
@@ -203,12 +241,13 @@ fn parse_zip<R: std::io::Read + std::io::Seek>(
         }
     }
 
-    let (meta, strokes, pages, texts) = parse_bundle(&bundle)?;
+    let (meta, strokes, pages, texts, shapes) = parse_bundle(&bundle)?;
     Ok(NtbDocument {
         meta,
         strokes,
         pages,
         texts,
+        shapes,
         manifest,
         thumbnail,
         assets,
@@ -234,7 +273,15 @@ fn read_member<R: std::io::Read + std::io::Seek>(
 // ---------------------------------------------------------------------------
 
 /// Parsed contents of a noteBundle: metadata, strokes, pages, texts.
-pub type BundleParts = (NtbMeta, Vec<NtbStroke>, Vec<NtbPageDef>, Vec<NtbText>);
+/// `(meta, strokes, pages, texts, shapes)` — the decoded contents of a
+/// `noteBundle`, for callers that parse from memory.
+pub type BundleParts = (
+    NtbMeta,
+    Vec<NtbStroke>,
+    Vec<NtbPageDef>,
+    Vec<NtbText>,
+    Vec<NtbShape>,
+);
 
 fn parse_bundle(d: &[u8]) -> Result<BundleParts> {
     let b = Buf { d };
@@ -286,6 +333,7 @@ fn parse_bundle(d: &[u8]) -> Result<BundleParts> {
     let mut strokes = Vec::new();
     let mut pages = Vec::new();
     let mut texts = Vec::new();
+    let mut shapes = Vec::new();
     if field(ROOT_F6_ELEMENTS) != 0 {
         let vec_pos = b.follow(root_pos + field(ROOT_F6_ELEMENTS))?;
         let n = b.u32(vec_pos)? as usize;
@@ -300,11 +348,12 @@ fn parse_bundle(d: &[u8]) -> Result<BundleParts> {
                 ParsedElement::Stroke(s) => strokes.push(s),
                 ParsedElement::PageDef(p) => pages.push(p),
                 ParsedElement::Text(t) => texts.push(t),
+                ParsedElement::Shape(s) => shapes.push(s),
             }
         }
     }
 
-    Ok((meta, strokes, pages, texts))
+    Ok((meta, strokes, pages, texts, shapes))
 }
 
 fn read_string(b: &Buf, table: usize, field_off: usize) -> Result<Option<String>> {
@@ -326,6 +375,7 @@ enum ParsedElement {
     Stroke(NtbStroke),
     PageDef(NtbPageDef),
     Text(NtbText),
+    Shape(NtbShape),
 }
 
 /// Parse one element: wrapper (nf=6) → inner table. Dispatches on the inner
@@ -353,6 +403,7 @@ fn parse_element(b: &Buf, el_pos: usize) -> Result<Option<ParsedElement>> {
         }
         2 => Ok(parse_page_def(b, inner, &inf)?.map(ParsedElement::PageDef)),
         8 => Ok(parse_text(b, inner, &inf)?.map(ParsedElement::Text)),
+        11 | 12 | 15 => Ok(parse_shape(b, inner, &inf)?.map(ParsedElement::Shape)),
         _ => Ok(None), // other types undecoded
     }
 }
@@ -380,8 +431,8 @@ fn parse_page_def(b: &Buf, tp: usize, fields: &[u16]) -> Result<Option<NtbPageDe
     Ok(Some(NtbPageDef { width, height }))
 }
 
-/// Parse a text box (inner nf=8). f4 is a string (font family), f5 is an f32
-/// font size. The actual text characters are stored elsewhere.
+/// Parse a text style record (inner nf=8). f4 is a string (font family), f5
+/// is an f32 font size. The actual text characters are stored elsewhere.
 fn parse_text(b: &Buf, tp: usize, fields: &[u16]) -> Result<Option<NtbText>> {
     let f4 = *fields.get(4).unwrap_or(&0) as usize;
     let f5 = *fields.get(5).unwrap_or(&0) as usize;
@@ -399,6 +450,125 @@ fn parse_text(b: &Buf, tp: usize, fields: &[u16]) -> Result<Option<NtbText>> {
         return Ok(None);
     }
     Ok(Some(NtbText { font, size }))
+}
+
+/// Read a colour u32 at `tp + off`. The alpha byte is `0xFF` for opaque
+/// ink/highlighter and `0x6B` (~42%) for highlighter strokes — both are
+/// PDF-confirmed (e.g. `0x6bff6f00` → `#006fff`). The raw u32 reads as
+/// `0xAABBGGRR` because the on-disk byte order is R,G,B,A; use
+/// [`rgba_from_u32`] to convert.
+fn read_color(b: &Buf, tp: usize, off: usize) -> Option<u32> {
+    if off == 0 {
+        return None;
+    }
+    let v = b.u32(tp + off).ok()?;
+    matches!(v >> 24, 0xFF | 0x6B).then_some(v)
+}
+
+/// Convert a raw colour u32 (`0xAABBGGRR`; LE bytes R,G,B,A) to
+/// `[r, g, b, a]` floats in 0..1.
+pub fn rgba_from_u32(v: u32) -> [f32; 4] {
+    [
+        (v & 0xFF) as f32 / 255.0,
+        ((v >> 8) & 0xFF) as f32 / 255.0,
+        ((v >> 16) & 0xFF) as f32 / 255.0,
+        ((v >> 24) & 0xFF) as f32 / 255.0,
+    ]
+}
+
+/// Parse a shape (inner nf=11/12/15 with an f5 geometry vector).
+///
+/// - f1: struct 2×f32 `(Y, X)` — absolute anchor, same layout as strokes.
+/// - f5: vector of f32s. Length 8/12 → dims are `(v0, v1)`; length 14 →
+///   first slot is a header and dims are `(v1, v2)`.
+/// - colour: layout-driven at f7/f9/f10 depending on nf (see below);
+///   width: first plausible f32 among f8/f9/f10 that is not the colour.
+/// - f4: u8 subtype (1 and 3 observed).
+fn parse_shape(b: &Buf, tp: usize, fields: &[u16]) -> Result<Option<NtbShape>> {
+    let field = |i: usize| -> usize { *fields.get(i).unwrap_or(&0) as usize };
+    let f1 = field(1);
+    let f5 = field(5);
+    if f1 == 0 || f5 == 0 {
+        return Ok(None);
+    }
+
+    // Anchor (Y, X), same struct as strokes.
+    let anchor_y = b.f32(tp + f1).unwrap_or(f32::NAN);
+    let anchor_x = b.f32(tp + f1 + 4).unwrap_or(f32::NAN);
+    if !anchor_x.is_finite() || !anchor_y.is_finite() {
+        return Ok(None);
+    }
+
+    // Geometry vector.
+    let vec_pos = b.follow(tp + f5)?;
+    let n = b.u32(vec_pos)? as usize;
+    let (dx, dy) = match n {
+        8 | 12 => (b.f32(vec_pos + 4)?, b.f32(vec_pos + 8)?),
+        14 => (b.f32(vec_pos + 8)?, b.f32(vec_pos + 12)?),
+        _ => return Ok(None),
+    };
+    if !dx.is_finite() || !dy.is_finite() || dx.abs() > 10_000.0 || dy.abs() > 10_000.0 {
+        return Ok(None);
+    }
+    if dx == 0.0 && dy == 0.0 {
+        return Ok(None);
+    }
+
+    // Colour: layout-driven, never a scan — scanning false-positives on
+    // noise fields (f0/f4 hold values like `0xfffedc01` whose low byte is
+    // `0x01`, mirroring the stroke f5 noise). Observed: nf=15 → f7;
+    // nf=11 → f9 or f10; nf=12 → f7 or f9 (f11 may be a fill colour and
+    // is left unused — fill stays transparent).
+    let mut color = None;
+    let mut color_idx = 0;
+    for i in [7usize, 9, 10] {
+        let o = field(i);
+        if o == 0 {
+            continue;
+        }
+        if let Some(c) = read_color(b, tp, o) {
+            color = Some(c);
+            color_idx = i;
+            break;
+        }
+    }
+
+    // Width: an f32 in 0.01..=100 among the neighbouring fields
+    // (f8/f9/f10 in samples); whichever of them is not the colour.
+    let mut width = 0.0;
+    for i in [8usize, 9, 10] {
+        if i == color_idx {
+            continue;
+        }
+        let o = field(i);
+        if o == 0 {
+            continue;
+        }
+        if let Ok(v) = b.f32(tp + o)
+            && v.is_finite()
+            && (0.01..=100.0).contains(&v)
+        {
+            width = v;
+            break;
+        }
+    }
+
+    let subtype = if field(4) != 0 {
+        b.d.get(tp + field(4)).copied().unwrap_or(0)
+    } else {
+        0
+    };
+
+    Ok(Some(NtbShape {
+        anchor_x,
+        anchor_y,
+        dx,
+        dy,
+        vector_len: n,
+        color,
+        width,
+        subtype,
+    }))
 }
 
 fn parse_stroke(b: &Buf, tp: usize, fields: &[u16]) -> Result<NtbStroke> {
@@ -428,12 +598,21 @@ fn parse_stroke(b: &Buf, tp: usize, fields: &[u16]) -> Result<NtbStroke> {
         (0, Vec::new())
     };
 
+    // Colour is always at f7 (PDF-verified: `0xff1515b5` ↔ `#b51515`).
+    // f5 looks similar but is noise — its low byte is always `0x01`.
+    let color = fields
+        .get(7)
+        .copied()
+        .filter(|&o| o != 0)
+        .and_then(|o| read_color(b, tp, o as usize));
+
     Ok(NtbStroke {
         anchor_x,
         anchor_y,
         width,
         point_count,
         points,
+        color,
     })
 }
 
@@ -476,35 +655,45 @@ fn count_points(d: &[u8], blob: usize) -> (usize, Vec<[f32; 2]>) {
 // ---------------------------------------------------------------------------
 
 /// One renderable page. `.ntb` notebooks are continuous-scroll, so strokes
-/// are assigned to pages by their Y coordinate using the given page height.
+/// and shapes are assigned to pages by their Y coordinate using the given
+/// page height.
 #[derive(Debug)]
 pub struct NtbPage {
     pub strokes: Vec<NtbStroke>,
+    pub shapes: Vec<NtbShape>,
 }
 
-/// Split strokes into pages of `page_h` points each (top-down Y).
+/// Split strokes and shapes into pages of `page_h` points each (top-down Y).
 ///
 /// Notability's cloud notebooks are continuous-scroll; the matching PDF export
 /// paginates at A4 height (841.89 pt) or a multiple thereof. Callers pick the
 /// height that matches the target output.
 pub fn paginate(doc: &NtbDocument, page_h: f32) -> Vec<NtbPage> {
-    if page_h <= 0.0 || doc.strokes.is_empty() {
+    let empty = || NtbPage {
+        strokes: Vec::new(),
+        shapes: Vec::new(),
+    };
+    if page_h <= 0.0 || (doc.strokes.is_empty() && doc.shapes.is_empty()) {
         return vec![NtbPage {
             strokes: doc.strokes.clone(),
+            shapes: doc.shapes.clone(),
         }];
     }
     let max_y = doc
         .strokes
         .iter()
         .map(|s| s.anchor_y)
+        .chain(doc.shapes.iter().map(|s| s.anchor_y))
         .fold(0.0f32, f32::max);
     let n_pages = ((max_y / page_h).ceil() as usize).max(1);
-    let mut pages: Vec<NtbPage> = (0..n_pages)
-        .map(|_| NtbPage { strokes: Vec::new() })
-        .collect();
+    let mut pages: Vec<NtbPage> = (0..n_pages).map(|_| empty()).collect();
     for s in &doc.strokes {
         let idx = ((s.anchor_y / page_h).floor() as usize).min(n_pages - 1);
         pages[idx].strokes.push(s.clone());
+    }
+    for s in &doc.shapes {
+        let idx = ((s.anchor_y / page_h).floor() as usize).min(n_pages - 1);
+        pages[idx].shapes.push(s.clone());
     }
     pages
 }
@@ -535,14 +724,20 @@ pub fn parse_bundle_public(bundle: &[u8]) -> Result<BundleParts> {
 /// Strokes are emitted as 2-point horizontal dashes at their anchor position,
 /// because the intra-stroke path geometry is not yet decoded (see module
 /// docs). The dash length equals the stroke width, so the page layout is
-/// preserved as a field of position-weighted marks.
+/// preserved as a field of position-weighted marks. Stroke colours come from
+/// the element colour field (`0xAABBGGRR`) and default to opaque black.
+///
+/// Shapes are emitted as [`ShapeEl`] rectangles/ellipses sized from the f5
+/// geometry vector, or as 2-point [`Item::Stroke`] lines when the vector
+/// encodes a line delta (see [`NtbShape`]). Shape outlines are stroked, not
+/// filled, because no fill colour was found in the samples.
 pub fn to_pages(doc: &NtbDocument, page_h: f32) -> Vec<Page> {
     let effective_h = doc.pages.first().map(|p| p.height).unwrap_or(page_h);
     paginate(doc, effective_h)
         .into_iter()
         .enumerate()
         .map(|(i, np)| {
-            let items: Vec<Item> = np
+            let mut items: Vec<Item> = np
                 .strokes
                 .iter()
                 .map(|s| {
@@ -554,16 +749,62 @@ pub fn to_pages(doc: &NtbDocument, page_h: f32) -> Vec<Page> {
                     Item::Stroke(Stroke {
                         points: vec![[s.anchor_x, s.anchor_y], [s.anchor_x + w, s.anchor_y]],
                         width: w,
-                        rgba: [0.0, 0.0, 0.0, 1.0],
+                        rgba: s.color.map(rgba_from_u32).unwrap_or(BLACK),
                         dash: None,
                         parented: false,
                     })
                 })
                 .collect();
+            items.extend(np.shapes.iter().map(shape_to_item));
             Page {
                 uuid: format!("ntb-p{i:04}"),
                 items,
             }
         })
         .collect()
+}
+
+const BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+
+/// Map an [`NtbShape`] onto the portable IR. Lines become a 2-point stroke
+/// (same dash convention as handwriting); closed shapes become a [`ShapeEl`]
+/// whose bbox starts at the anchor with the vector's dims as w/h.
+fn shape_to_item(s: &NtbShape) -> Item {
+    let rgba = s.color.map(rgba_from_u32).unwrap_or(BLACK);
+    let width = if s.width.is_finite() && s.width > 0.0 {
+        s.width
+    } else {
+        1.0
+    };
+    if s.vector_len == 12 || s.vector_len == 14 {
+        return Item::Stroke(Stroke {
+            points: vec![[s.anchor_x, s.anchor_y], [s.anchor_x + s.dx, s.anchor_y + s.dy]],
+            width,
+            rgba,
+            dash: None,
+            parented: false,
+        });
+    }
+    // n = 8: ellipse when the two dims are near-equal, otherwise rectangle.
+    let kind = if (s.dx - s.dy).abs() <= 0.05 * s.dx.abs().max(s.dy.abs()).max(1.0) {
+        ShapeKind::Ellipse
+    } else {
+        ShapeKind::Rect
+    };
+    Item::Shape(ShapeEl {
+        kind,
+        x: s.anchor_x,
+        y: s.anchor_y,
+        w: s.dx.abs(),
+        h: s.dy.abs(),
+        points: Vec::new(),
+        rotation: 0.0,
+        fill: [0.0, 0.0, 0.0, 0.0],
+        stroke: rgba,
+        width,
+        dash: None,
+        radius: 0.0,
+        uuid: None,
+        from_f9: false,
+    })
 }

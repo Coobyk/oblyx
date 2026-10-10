@@ -657,8 +657,9 @@ fn load_ntb_pages(
     };
     crate::vlog!(
         1,
-        "{label}: ntb has {} stroke(s), {} page def(s), {} text(s), {} asset(s), version {}",
+        "{label}: ntb has {} stroke(s), {} shape(s), {} page def(s), {} text(s), {} asset(s), version {}",
         ntb_doc.strokes.len(),
+        ntb_doc.shapes.len(),
         ntb_doc.pages.len(),
         ntb_doc.texts.len(),
         ntb_doc.assets.len(),
@@ -707,12 +708,13 @@ fn parse_ntb_bytes(bytes: &[u8]) -> Result<crate::ntb::NtbDocument> {
             assets.push((name, buf));
         }
     }
-    let (meta, strokes, pages, texts) = crate::ntb::parse_bundle_public(&bundle)?;
+    let (meta, strokes, pages, texts, shapes) = crate::ntb::parse_bundle_public(&bundle)?;
     Ok(crate::ntb::NtbDocument {
         meta,
         strokes,
         pages,
         texts,
+        shapes,
         manifest,
         thumbnail,
         assets,
