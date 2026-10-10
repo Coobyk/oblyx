@@ -175,7 +175,14 @@ const PAGE_F0_LOCATION: usize = 0; // df SeqId (matches ink/shape f0 page ids)
 const PAGE_F1_BACKGROUND: usize = 1; // uoffset to PageBackground table
 
 // PageBackground table field indices.
+const BG_F1_NESTED: usize = 1; // uoffset to nested asset-ref table
 const BG_F3_SIZE: usize = 3; // vf struct 2×f32 (width, height), inline
+
+// Nested asset-ref table field indices (inside PageBackground.f1).
+const NESTED_F0_INNER: usize = 0; // uoffset to inner table holding the hash
+
+// CreatePage payload field indices (beyond f0 location / f1 background).
+const PAGE_F2_PDF_PAGE: usize = 2; // u32, 1-based page index within the PDF asset
 
 /// Constant 5-byte trailer ending each 19-byte point record.
 const POINT_TRAILER: [u8; 5] = [0x00, 0x3c, 0xff, 0x00, 0x00];
@@ -230,12 +237,31 @@ pub struct NtbStroke {
 /// A page definition from a CreatePage op. `id` is the CreatePage f0 location
 /// SeqId matching ink/shape page ids. `width`/`height` are the background size
 /// in points when present; `0×0` means the page was created bare (no
-/// background recorded) and pagination falls back to A4.
-#[derive(Debug, Clone, Copy)]
+/// background recorded) and pagination falls back to A4. `asset_hash` is the
+/// 64-byte content hash of the background PDF/image (from the PageBackground
+/// nested table) when a background is present; `pdf_page` is the 1-based page
+/// index within that asset (CreatePage payload f2, defaulting to 1).
+#[derive(Debug, Clone)]
 pub struct NtbPageDef {
     pub id: PageId,
     pub width: f32,
     pub height: f32,
+    /// 64-byte content hash of the background asset, when present.
+    pub asset_hash: Option<[u8; 64]>,
+    /// 1-based page index within the background asset PDF.
+    pub pdf_page: u64,
+}
+
+impl Default for NtbPageDef {
+    fn default() -> Self {
+        Self {
+            id: (0, 0, 0),
+            width: 0.0,
+            height: 0.0,
+            asset_hash: None,
+            pdf_page: 1,
+        }
+    }
 }
 
 /// A text style record (best-effort). In all 9 samples the only such element
@@ -790,15 +816,29 @@ fn apply_deletes(b: &Buf, tp: usize, fields: &[u16], fold: &mut Fold) -> Result<
 }
 
 /// Parse a CreatePage op: f0 location SeqId + optional f1 → PageBackground →
-/// f3 size. A bare CreatePage (f0 present, f1/size absent) registers the page
-/// with unknown dims (`0×0`); a later CreatePage with a background updates the
-/// dims (see [`upsert_page`]).
+/// nested asset-ref (64-byte hash) + f3 size. A bare CreatePage (f0 present,
+/// f1/size absent) registers the page with unknown dims (`0×0`); a later
+/// CreatePage with a background updates the dims (see [`upsert_page`]).
+/// Payload f2, when present, is the 1-based PDF page index within the asset.
 fn parse_create_page(b: &Buf, tp: usize, fields: &[u16]) -> Result<Option<NtbPageDef>> {
     let f0 = Buf::field_off(fields, PAGE_F0_LOCATION);
     let Some(id) = read_page_id(b, tp, f0) else {
         return Ok(None);
     };
-    let unknown = NtbPageDef { id, width: 0.0, height: 0.0 };
+    let unknown = NtbPageDef {
+        id,
+        width: 0.0,
+        height: 0.0,
+        asset_hash: None,
+        pdf_page: 1,
+    };
+    let f2 = Buf::field_off(fields, PAGE_F2_PDF_PAGE);
+    let pdf_page = if f2 != 0 {
+        let v = b.u32(tp + f2).unwrap_or(1);
+        if (1..=100_000).contains(&v) { v as u64 } else { 1 }
+    } else {
+        1
+    };
     let f1 = Buf::field_off(fields, PAGE_F1_BACKGROUND);
     if f1 == 0 {
         return Ok(Some(unknown));
@@ -816,17 +856,66 @@ fn parse_create_page(b: &Buf, tp: usize, fields: &[u16]) -> Result<Option<NtbPag
     {
         return Ok(Some(unknown));
     }
-    Ok(Some(NtbPageDef { id, width, height }))
+    // Asset hash: PageBackground.f1 → nested table.f0 → inner table with the
+    // 64-byte content hash stored inline at the field's absolute position.
+    let asset_hash = read_asset_hash(b, bg, &bf);
+    Ok(Some(NtbPageDef {
+        id,
+        width,
+        height,
+        asset_hash,
+        pdf_page,
+    }))
+}
+
+/// Read the 64-byte background asset hash from a PageBackground table.
+///
+/// Layout: `PageBackground.f1` → nested table; nested `.f0` → inner table;
+/// the inner table's first present field's absolute position holds the hash
+/// inline (not a vector). Verified against E1/B1/D1/F1/G1/P1/Eth1 samples.
+fn read_asset_hash(b: &Buf, bg: usize, bf: &[u16]) -> Option<[u8; 64]> {
+    let f1 = Buf::field_off(bf, BG_F1_NESTED);
+    if f1 == 0 {
+        return None;
+    }
+    let nested = b.follow(bg + f1).ok()?;
+    let (_ns, _nt, nf) = b.table(nested).ok()?;
+    let f0 = Buf::field_off(&nf, NESTED_F0_INNER);
+    if f0 == 0 {
+        return None;
+    }
+    let inner = b.follow(nested + f0).ok()?;
+    let (_is, _it, inf) = b.table(inner).ok()?;
+    // The hash is inline at the position of the inner table's first present
+    // field that is large enough (≥64 bytes of following data). In all
+    // samples the first present field (index 0) points at the hash start.
+    for &fo in inf.iter() {
+        if fo == 0 {
+            continue;
+        }
+        let abs = inner + fo as usize;
+        if abs + 64 <= b.d.len() {
+            let mut hash = [0u8; 64];
+            hash.copy_from_slice(&b.d[abs..abs + 64]);
+            return Some(hash);
+        }
+    }
+    None
 }
 
 /// Insert or merge a page def: one entry per id, first-appearance order.
-/// A later def with valid dims (`>0`) updates the existing entry's size;
-/// a bare def (`0×0`) never clears dims already recorded.
+/// A later def with valid dims (`>0`) updates the existing entry's size and
+/// asset hash; a bare def (`0×0`) never clears dims or an asset already
+/// recorded.
 fn upsert_page(pages: &mut Vec<NtbPageDef>, def: NtbPageDef) {
     if let Some(existing) = pages.iter_mut().find(|p| p.id == def.id) {
         if def.width > 0.0 && def.height > 0.0 {
             existing.width = def.width;
             existing.height = def.height;
+        }
+        if def.asset_hash.is_some() {
+            existing.asset_hash = def.asset_hash;
+            existing.pdf_page = def.pdf_page;
         }
     } else {
         pages.push(def);
@@ -1236,6 +1325,11 @@ pub struct NtbPage {
     pub shapes: Vec<NtbShape>,
     pub width: f32,
     pub height: f32,
+    /// 64-byte content hash of the background asset, when the page def
+    /// recorded one. Used by [`to_pages`] callers to wire PDF backgrounds.
+    pub asset_hash: Option<[u8; 64]>,
+    /// 1-based page index within the background asset PDF.
+    pub pdf_page: u64,
 }
 
 /// Split strokes and shapes into pages.
@@ -1253,6 +1347,8 @@ pub fn paginate(doc: &NtbDocument, page_h: f32) -> Vec<NtbPage> {
         shapes: Vec::new(),
         width: NTB_PAGE_W,
         height: if page_h > 0.0 { page_h } else { NTB_PAGE_H },
+        asset_hash: None,
+        pdf_page: 1,
     };
     if doc.strokes.is_empty() && doc.shapes.is_empty() {
         return vec![NtbPage {
@@ -1260,6 +1356,8 @@ pub fn paginate(doc: &NtbDocument, page_h: f32) -> Vec<NtbPage> {
             shapes: Vec::new(),
             width: NTB_PAGE_W,
             height: if page_h > 0.0 { page_h } else { NTB_PAGE_H },
+            asset_hash: None,
+            pdf_page: 1,
         }];
     }
 
@@ -1277,6 +1375,8 @@ pub fn paginate(doc: &NtbDocument, page_h: f32) -> Vec<NtbPage> {
             shapes: doc.shapes.clone(),
             width: NTB_PAGE_W,
             height: NTB_PAGE_H,
+            asset_hash: None,
+            pdf_page: 1,
         }];
     }
     let max_y = doc
@@ -1329,6 +1429,8 @@ fn paginate_by_page_id(doc: &NtbDocument, fallback_h: f32) -> Vec<NtbPage> {
                 shapes: Vec::new(),
                 width: w,
                 height: h,
+                asset_hash: def.asset_hash,
+                pdf_page: def.pdf_page,
             },
         );
     }
@@ -1342,6 +1444,8 @@ fn paginate_by_page_id(doc: &NtbDocument, fallback_h: f32) -> Vec<NtbPage> {
                 shapes: Vec::new(),
                 width: a4_dims.0,
                 height: a4_dims.1,
+                asset_hash: None,
+                pdf_page: 1,
             }
         });
         if let Some(p) = groups.get_mut(&id) {
@@ -1357,6 +1461,8 @@ fn paginate_by_page_id(doc: &NtbDocument, fallback_h: f32) -> Vec<NtbPage> {
                 shapes: Vec::new(),
                 width: a4_dims.0,
                 height: a4_dims.1,
+                asset_hash: None,
+                pdf_page: 1,
             }
         });
         if let Some(p) = groups.get_mut(&id) {
@@ -1374,6 +1480,8 @@ fn paginate_by_page_id(doc: &NtbDocument, fallback_h: f32) -> Vec<NtbPage> {
             shapes: Vec::new(),
             width: a4_dims.0,
             height: a4_dims.1,
+            asset_hash: None,
+            pdf_page: 1,
         });
     }
     out
@@ -1452,12 +1560,21 @@ pub fn to_pages(doc: &NtbDocument, page_h: f32) -> Vec<Page> {
                 })
                 .collect();
             items.extend(np.shapes.iter().map(shape_to_item));
-            Page {
+            let mut page = Page {
                 uuid: format!("ntb-p{i:04}"),
                 items,
                 width: np.width,
                 height: np.height,
+            };
+            // Tag the page UUID with the asset hash so `load_ntb_pages` can
+            // wire `page_cfg` without re-paginating. Format:
+            // `ntb-p{i:04}` normally; when a background PDF is present,
+            // `ntb-p{i:04}#<hexhash>:<pdf_page>`.
+            if let Some(hash) = np.asset_hash {
+                let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+                page.uuid = format!("ntb-p{i:04}#{hex}:{}", np.pdf_page);
             }
+            page
         })
         .collect()
 }
@@ -1739,8 +1856,8 @@ mod tests {
             meta: NtbMeta::default(),
             strokes: vec![mk(p0, 10.0), mk(p1, 20.0), mk(p0, 30.0)],
             pages: vec![
-                NtbPageDef { id: p0, width: 595.28, height: 841.89 },
-                NtbPageDef { id: p1, width: 100.0, height: 200.0 },
+                NtbPageDef { id: p0, width: 595.28, height: 841.89, ..Default::default() },
+                NtbPageDef { id: p1, width: 100.0, height: 200.0, ..Default::default() },
             ],
             texts: vec![],
             shapes: vec![],
@@ -1765,11 +1882,11 @@ mod tests {
         let p0: PageId = (0, 1, 0);
         let p1: PageId = (0, 2, 0);
         // Bare create first, then dims update; another page stays bare.
-        upsert_page(&mut pages, NtbPageDef { id: p0, width: 0.0, height: 0.0 });
-        upsert_page(&mut pages, NtbPageDef { id: p1, width: 0.0, height: 0.0 });
-        upsert_page(&mut pages, NtbPageDef { id: p0, width: 842.0, height: 595.0 });
+        upsert_page(&mut pages, NtbPageDef { id: p0, ..Default::default() });
+        upsert_page(&mut pages, NtbPageDef { id: p1, ..Default::default() });
+        upsert_page(&mut pages, NtbPageDef { id: p0, width: 842.0, height: 595.0, ..Default::default() });
         // A later bare re-create must not clear recorded dims.
-        upsert_page(&mut pages, NtbPageDef { id: p0, width: 0.0, height: 0.0 });
+        upsert_page(&mut pages, NtbPageDef { id: p0, ..Default::default() });
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0].id, p0);
         assert_eq!(pages[0].width, 842.0);
@@ -1799,9 +1916,9 @@ mod tests {
             meta: NtbMeta::default(),
             strokes: vec![mk(p0), mk(p2)],
             pages: vec![
-                NtbPageDef { id: p0, width: 595.28, height: 841.89 },
-                NtbPageDef { id: p1, width: 0.0, height: 0.0 },
-                NtbPageDef { id: p2, width: 842.0, height: 595.0 },
+                NtbPageDef { id: p0, width: 595.28, height: 841.89, ..Default::default() },
+                NtbPageDef { id: p1, ..Default::default() },
+                NtbPageDef { id: p2, width: 842.0, height: 595.0, ..Default::default() },
             ],
             texts: vec![],
             shapes: vec![],

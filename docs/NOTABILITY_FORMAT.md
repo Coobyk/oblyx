@@ -113,7 +113,9 @@ The inner table's field count (`nf`) determines the element type:
 | 11 | 1 | **shape / drawing** (§4.2) | f1 anchor, f5 vector, f9/f10 colour |
 
 **nf=2 (page definition):** The f1 vector's first two f32s are the page width
-and height in points. Verified across samples:
+and height in points. The CreatePage **payload f2** is a u32 holding the
+**1-based PDF page index** within the bound asset (default 1 when absent).
+Verified across samples:
 
 | sample | pages | dimensions (pt) | orientation |
 | --- | --- | --- | --- |
@@ -417,6 +419,52 @@ PDF exports of the same notebooks report different page counts (stale
 exports from earlier notebook states); the thumbnail (embedded in the
 `.ntb`) is the ground truth for page 1 and matches the grouped render.
 
+### 4.9 PageBackground asset binding — VERIFIED
+
+Full CreatePage payloads (payloadType 3) carry **f1 = PageBackground**,
+a nested table that links the page to an imported PDF (or other asset)
+inside the zip container.
+
+**Nested layout:**
+
+```
+PageBackground.f1          → nested table (nf=6)
+  nested.f0                → inner table (nf=4)
+    inner.f0               → 64-byte content hash, INLINE at the field
+                              position (matches assets/<128hex>.pdf)
+    inner.s1, inner.s2     → small ints (88/92, 72/76 — semantics unknown)
+    inner.s3               → asset file size in bytes
+                              (matches zip member sizes exactly)
+  nested other fields      → unknown / unused by the reader
+```
+
+**CreatePage payload f2** is a u32: the **1-based PDF page index**
+within that asset (default 1 when absent). Together with the hash this
+yields the full background binding: `assets/<hash hex>.pdf`, page N.
+
+Verified counts of CreatePage defs carrying an asset hash:
+
+| sample | defs with hash | notes |
+| --- | --- | --- |
+| B1 | 3 / 8 | pdf_page 1 and 6 |
+| E1 | 4 / 6 | pdf_page 1, 2 |
+| F1 | 4 / 7 | pdf_page 2, 3 |
+| G1 | 5 / 13 | multi-page worksheet |
+| P1 | 4 / 5 | pdf_page 4 |
+| D1, Eth1, M1, Cambridge | 0 | no nested background tables (bare creates / no import) |
+
+The reader encodes the binding as `ntb-pNNNN#<128 hex hash>:<pdf_page>`
+in the page UUID; the convert pipeline resolves the hex against the
+attachment map, calls `Document::set_page_cfg`, and
+`Document::inject_pdf_backgrounds` rasterizes the PDF page (at the
+chosen `--dpi`) and inserts it as `items[0]` so renderers draw it
+behind the ink.
+
+**Open:** the inner table's s1/s2 small ints and the full semantics of
+the outer nf=6 table are not decoded; only the hash (f0) and file size
+(s3) are used. D1/Eth1 have `assets/` members but zero nested background
+tables — their background structure (if any) differs and is unexamined.
+
 ## 5. `index/ios/*.fb` — FlatBuffers, OCR side-car
 
 Filenames track content: `HandwritingIndex` is present in every notebook,
@@ -454,6 +502,14 @@ use it for the canvas; the PDF renderer scales page width onto a fixed A4
 MediaBox (`595.28/page.width` — 0.5455 for GoodNotes, ≈1.0 for `.ntb`), which
 fixes the old bug where `.ntb` coordinates were double-shrunk into the upper
 quarter of the A4 page.
+
+**PDF backgrounds.** Pages whose CreatePage carries a PageBackground
+(§4.9) are bound to an `assets/<hash>.pdf` member at a 1-based page
+index. `to_pages` encodes the binding in the page UUID; the convert
+pipeline resolves it against the attachment map, rasterizes the PDF
+page at the chosen `--dpi` (default 144), and inserts it as the
+bottom-most `Item::Image` so SVG/PNG/PDF renderers draw the worksheet
+behind the ink. Verified visually on B1/E1/F1/P1/G1.
 
 ### 6.2 Editable export (`→` `.ntb` or `→` `.goodnotes`)
 
@@ -548,6 +604,13 @@ loaded into the document attachment map. Example: `cargo run --bin oblyx
    CreateInk. Rust count is correct.
 9. **No device validation** — no Notability/GoodNotes round-trip has been
    performed; any future writer must be validated on a real device.
+10. **PageBackground inner-table extras** (§4.9) — s1/s2 small ints
+    (88/92, 72/76) and the outer nf=6 fields beyond the hash/size are
+    undecoded; only the content hash and file size are used.
+11. **D1/Eth1 background structure** — both have `assets/` members but
+    zero CreatePage defs with a nested PageBackground; their binding
+    mechanism (if any) is unexamined.
 
 Point coordinate encoding, shape schema, fill colour, CRDT delete/modify
-folding, and page-id pagination are **solved** — see §4.4, §4.2, §4.8.
+folding, page-id pagination, and PDF background asset binding are
+**solved** — see §4.4, §4.2, §4.8, §4.9.

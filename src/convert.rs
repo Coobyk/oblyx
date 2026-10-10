@@ -650,7 +650,7 @@ fn load_goodnotes_pages(
 /// document's attachment map.
 fn load_ntb_pages(
     job: &Job,
-    _options: &ConvertOptions,
+    options: &ConvertOptions,
 ) -> Result<(Document, Vec<Page>)> {
     let label = job.label();
     let ntb_doc = match &job.member {
@@ -674,12 +674,45 @@ fn load_ntb_pages(
     if let Some(pd) = ntb_doc.pages.first() {
         crate::vlog!(1, "{label}: page size {:.0}×{:.0} pt", pd.width, pd.height);
     }
-    let pages = crate::ntb::to_pages(&ntb_doc, crate::ntb::NTB_PAGE_H);
+    let mut pages = crate::ntb::to_pages(&ntb_doc, crate::ntb::NTB_PAGE_H);
     crate::vlog!(1, "{label}: paginated into {} page(s)", pages.len());
     let mut doc = Document::empty();
+    // Map asset hash (hex of the 64-byte content hash) -> attachment key.
+    let mut hash_to_key: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for (name, bytes) in &ntb_doc.assets {
         let key = name.rsplit('/').next().unwrap_or(name).to_string();
+        // The zip member name is `assets/<hex>.pdf`; the hex (before the
+        // extension) is the 64-byte content hash used in page UUIDs.
+        if let Some(hex) = name
+            .rsplit('/')
+            .next()
+            .and_then(|f| f.split('.').next())
+            .filter(|h| h.len() == 128 && h.chars().all(|c| c.is_ascii_hexdigit()))
+        {
+            hash_to_key.insert(hex.to_ascii_lowercase(), key.clone());
+        }
         doc.insert_attachment(key, bytes.clone());
+    }
+    // Wire PDF backgrounds: page UUIDs from `to_pages` encode
+    // `ntb-pNNNN#<hexhash>:<pdf_page>` when a background was recorded.
+    let mut bg_bound = 0usize;
+    for page in &pages {
+        let bg = page.uuid.split_once('#').and_then(|(_, rest)| {
+            let (h, p) = rest.split_once(':')?;
+            let n: u64 = p.parse().ok()?;
+            Some((h.to_string(), n))
+        });
+        if let Some((hash_hex, pdf_page)) = bg
+            && let Some(key) = hash_to_key.get(&hash_hex)
+        {
+            doc.set_page_cfg(&page.uuid, key.clone(), Some(pdf_page));
+            bg_bound += 1;
+        }
+    }
+    if bg_bound > 0 {
+        crate::vlog!(1, "{label}: bound {bg_bound} page(s) to PDF backgrounds");
+        doc.inject_pdf_backgrounds(&mut pages, options.dpi);
     }
     Ok((doc, pages))
 }

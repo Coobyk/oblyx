@@ -303,6 +303,66 @@ impl Document {
         self.attachments.insert(key.into(), Arc::new(bytes));
     }
 
+    /// Bind a page to a background attachment (and optional 1-based PDF page
+    /// within it). Used by the `.ntb` loader to attach worksheet PDFs.
+    pub fn set_page_cfg(&mut self, page_uuid: &str, attachment: String, pdf_page: Option<u64>) {
+        self.page_cfg.insert(
+            page_uuid.to_string(),
+            PageCfg {
+                attachment,
+                pdf_page,
+            },
+        );
+    }
+
+    /// Inject PDF background rasters into already-built pages (the `.ntb`
+    /// path, where pages come from `ntb::to_pages` rather than `decode_page`).
+    /// For each page whose UUID is bound via [`set_page_cfg`], rasterizes the
+    /// attachment's PDF page and inserts it as a background [`Item::Image`].
+    /// Returns the number of pages that received a background.
+    pub fn inject_pdf_backgrounds(&self, pages: &mut [Page], dpi: f32) -> usize {
+        let mut n = 0;
+        for page in pages.iter_mut() {
+            let Some(cfg) = self.page_cfg.get(&page.uuid) else {
+                continue;
+            };
+            let Some(att) = self.attachments.get(&cfg.attachment) else {
+                continue;
+            };
+            let Some(pdf_page) = cfg.pdf_page else {
+                continue;
+            };
+            if !att.starts_with(b"%PDF-") {
+                continue;
+            }
+            let Some(bytes) = self.raster_page(att, pdf_page, dpi) else {
+                continue;
+            };
+            let (pw, ph) = match pdfinput::jpeg_size(&bytes) {
+                Some((pw, ph)) => (pw as f32, ph as f32),
+                None => continue,
+            };
+            // Scale the PDF page to fit the notebook page, centred.
+            let (page_w, page_h) = (page.width, page.height);
+            let s = (page_w / pw).min(page_h / ph);
+            let (w, h) = (pw * s, ph * s);
+            page.items.insert(
+                0,
+                Item::Image(ImageEl {
+                    attachment: format!("pdf:{}:{pdf_page}", cfg.attachment),
+                    x: (page_w - w) / 2.0,
+                    y: (page_h - h) / 2.0,
+                    w,
+                    h,
+                    from_frame: false,
+                    bytes: Some(bytes),
+                }),
+            );
+            n += 1;
+        }
+        n
+    }
+
     pub fn open(path: &Path) -> Result<Document> {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let z = Zip::new(BufReader::new(file))
