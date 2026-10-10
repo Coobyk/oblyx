@@ -502,6 +502,23 @@ Line / Polygon / NormalShape with top-left origin and optional fill
 (thumbnail-overlay verified). Point paths are f16 cubic-Béziers offset by
 the anchor and sampled at 12 steps per cubic (§4.4);
 `decode_stroke_points()` in `src/ntb.rs` is the reference implementation.
+
+Two render-pipeline pitfalls fixed during shape verification:
+
+- **2-point shape lines must not be gap-split.** `geom::smooth()` splits
+  multi-point strokes into runs at gaps > `MAX_GAP` (15 pt) to model
+  pen-up/pen-down. A 2-point path (shape Lines, straight strokes) whose
+  endpoints exceed that distance was split into two 1-point runs, both
+  discarded, leaving an empty path (`PathBuilder::finish()` → `None`).
+  This silently dropped every long highlight underline and shape line
+  (78 across the 9 samples). A 2-point path is now emitted as a single
+  segment unconditionally.
+- **Ellipse IR convention is centre + radii.** The portable `ShapeEl`
+  treats `ShapeKind::Ellipse` `x/y` as the centre and `w/h` as radii
+  (matches the GoodNotes decoder). Notability `Box` geometry is top-left
+  + full size, so `shape_to_item` converts (`c = origin + size/2`,
+  `r = size/2`) rather than passing top-left through.
+
 The convert pipeline dispatches `.ntb` files via `is_ntb()`; assets are
 loaded into the document attachment map. Example: `cargo run --bin oblyx
 -- -f svg,pdf ntb/Eth1.ntb`.

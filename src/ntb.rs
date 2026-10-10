@@ -1489,22 +1489,32 @@ fn shape_to_item(s: &NtbShape) -> Item {
                 parented: false,
             })
         }
-        NtbShapeGeom::Box { x, y, w, h, ellipse } => Item::Shape(ShapeEl {
-            kind: if *ellipse { ShapeKind::Ellipse } else { ShapeKind::Rect },
-            x: *x,
-            y: *y,
-            w: w.abs(),
-            h: h.abs(),
-            points: Vec::new(),
-            rotation: s.rotation,
-            fill: fill_rgba,
-            stroke: stroke_rgba,
-            width,
-            dash: None,
-            radius: 0.0,
-            uuid: None,
-            from_f9: false,
-        }),
+        NtbShapeGeom::Box { x, y, w, h, ellipse } => {
+            let (w, h) = (w.abs(), h.abs());
+            // IR Ellipse convention is centre + radii (matches GoodNotes
+            // decoder); Box geometry is top-left + full size.
+            let (sx, sy, sw, sh) = if *ellipse {
+                (x + w * 0.5, y + h * 0.5, w * 0.5, h * 0.5)
+            } else {
+                (*x, *y, w, h)
+            };
+            Item::Shape(ShapeEl {
+                kind: if *ellipse { ShapeKind::Ellipse } else { ShapeKind::Rect },
+                x: sx,
+                y: sy,
+                w: sw,
+                h: sh,
+                points: Vec::new(),
+                rotation: s.rotation,
+                fill: fill_rgba,
+                stroke: stroke_rgba,
+                width,
+                dash: None,
+                radius: 0.0,
+                uuid: None,
+                from_f9: false,
+            })
+        }
         NtbShapeGeom::Polygon { points } => Item::Shape(ShapeEl {
             kind: ShapeKind::Polygon,
             x: points.first().map(|p| p[0]).unwrap_or(0.0),
@@ -1651,10 +1661,11 @@ mod tests {
         match item {
             Item::Shape(sh) => {
                 assert_eq!(sh.kind, ShapeKind::Ellipse);
-                assert_eq!(sh.x, 10.0);
-                assert_eq!(sh.y, 20.0);
-                assert_eq!(sh.w, 30.0);
-                assert_eq!(sh.h, 40.0);
+                // IR Ellipse is centre + radii: box (10,20,30x40) → c=(25,40) r=(15,20).
+                assert_eq!(sh.x, 25.0);
+                assert_eq!(sh.y, 40.0);
+                assert_eq!(sh.w, 15.0);
+                assert_eq!(sh.h, 20.0);
                 let [r, _g, _b, a] = sh.fill;
                 assert_eq!((r * 255.0) as u8, 0xFF);
                 assert_eq!((a * 255.0) as u8, 0xFF);
