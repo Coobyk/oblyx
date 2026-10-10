@@ -29,7 +29,8 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             name: macos-arm64
-          - os: macos-13
+          # macos-13 is retired; macos-15-intel is the current x86_64 hosted runner.
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             name: macos-x64
           - os: windows-latest
