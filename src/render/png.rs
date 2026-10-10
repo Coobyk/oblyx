@@ -7,8 +7,8 @@ use tiny_skia::{
 };
 
 use crate::doc::{
-    Background, Document, FillPathEl, ImageEl, Item, PAGE_H, PAGE_W, Page, PathEl, ShapeEl,
-    ShapeKind, Sticky, Stroke as StrokeData, TextBox,
+    Background, Document, FillPathEl, ImageEl, Item, Page, PathEl, ShapeEl, ShapeKind, Sticky,
+    Stroke as StrokeData, TextBox,
 };
 use crate::geom;
 use crate::render::text::draw_text_line;
@@ -507,8 +507,8 @@ fn draw_fill_path(pm: &mut Pixmap, fp: &FillPathEl, scale: f32) {
 }
 
 pub fn page_to_png(page: &Page, doc: &Document, scale: f32) -> Result<Vec<u8>> {
-    let w = (PAGE_W * scale).round().max(1.0) as u32;
-    let h = (PAGE_H * scale).round().max(1.0) as u32;
+    let w = (page.width * scale).round().max(1.0) as u32;
+    let h = (page.height * scale).round().max(1.0) as u32;
     let mut pm = Pixmap::new(w, h).context("create pixmap")?;
     pm.fill(tiny_skia::Color::WHITE);
 

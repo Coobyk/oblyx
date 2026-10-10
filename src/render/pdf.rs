@@ -2,7 +2,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::io::Cursor;
 
-use crate::doc::{Document, Item, PAGE_H, PAGE_W, Page, ShapeEl, ShapeKind};
+use crate::doc::{Document, Item, Page, ShapeEl, ShapeKind};
+
+/// A4 portrait width in points — the fixed PDF MediaBox width.
+const A4_W: f32 = 595.28;
 use crate::geom;
 use crate::render::png::decode_rgba_image;
 
@@ -103,18 +106,18 @@ struct Ctx {
     gs_obj: HashMap<u16, usize>,
 }
 
-fn poly_ops(pts: &[[f32; 2]], close: bool, out: &mut String) {
+fn poly_ops(pts: &[[f32; 2]], close: bool, ph: f32, out: &mut String) {
     let Some(first) = pts.first() else {
         return;
     };
     num(out, first[0]);
     out.push(' ');
-    num(out, PAGE_H - first[1]);
+    num(out, ph - first[1]);
     out.push_str(" m\n");
     for p in &pts[1..] {
         num(out, p[0]);
         out.push(' ');
-        num(out, PAGE_H - p[1]);
+        num(out, ph - p[1]);
         out.push_str(" l\n");
     }
     if close {
@@ -122,7 +125,7 @@ fn poly_ops(pts: &[[f32; 2]], close: bool, out: &mut String) {
     }
 }
 
-fn ellipse_ops(sh: &ShapeEl, out: &mut String) {
+fn ellipse_ops(sh: &ShapeEl, ph: f32, out: &mut String) {
     let (cx, cy, rx, ry) = (sh.x, sh.y, sh.w, sh.h);
     let (cs, sn) = (sh.rotation.cos(), sh.rotation.sin());
     let map = |x: f32, y: f32| -> [f32; 2] { [cx + x * cs - y * sn, cy + x * sn + y * cs] };
@@ -131,7 +134,7 @@ fn ellipse_ops(sh: &ShapeEl, out: &mut String) {
     let start = map(rx, 0.0);
     num(out, start[0]);
     out.push(' ');
-    num(out, PAGE_H - start[1]);
+    num(out, ph - start[1]);
     out.push_str(" m\n");
     let mut a0 = 0.0f32;
     for _ in 0..4 {
@@ -143,22 +146,22 @@ fn ellipse_ops(sh: &ShapeEl, out: &mut String) {
         let p1 = map(rx * c1, ry * s1);
         num(out, c1p[0]);
         out.push(' ');
-        num(out, PAGE_H - c1p[1]);
+        num(out, ph - c1p[1]);
         out.push(' ');
         num(out, c2p[0]);
         out.push(' ');
-        num(out, PAGE_H - c2p[1]);
+        num(out, ph - c2p[1]);
         out.push(' ');
         num(out, p1[0]);
         out.push(' ');
-        num(out, PAGE_H - p1[1]);
+        num(out, ph - p1[1]);
         out.push_str(" c\n");
         a0 = a1;
     }
     out.push_str("h\n");
 }
 
-fn round_rect_ops(sh: &ShapeEl, out: &mut String) {
+fn round_rect_ops(sh: &ShapeEl, ph: f32, out: &mut String) {
     let r = sh.radius.min(sh.w * 0.5).min(sh.h * 0.5);
     let (cs, sn) = (sh.rotation.cos(), sh.rotation.sin());
     let map = |x: f32, y: f32| -> [f32; 2] {
@@ -170,13 +173,13 @@ fn round_rect_ops(sh: &ShapeEl, out: &mut String) {
     let pt = map(x + r, y);
     num(out, pt[0]);
     out.push(' ');
-    num(out, PAGE_H - pt[1]);
+    num(out, ph - pt[1]);
     out.push_str(" m\n");
     let line = |ax: f32, ay: f32, out: &mut String| {
         let p = map(ax, ay);
         num(out, p[0]);
         out.push(' ');
-        num(out, PAGE_H - p[1]);
+        num(out, ph - p[1]);
         out.push_str(" l\n");
     };
     let curve = |p1: [f32; 2], p2: [f32; 2], p3: [f32; 2], out: &mut String| {
@@ -186,7 +189,7 @@ fn round_rect_ops(sh: &ShapeEl, out: &mut String) {
         for q in [a, b, c] {
             num(out, q[0]);
             out.push(' ');
-            num(out, PAGE_H - q[1]);
+            num(out, ph - q[1]);
             out.push(' ');
         }
         out.push_str("c\n");
@@ -217,12 +220,12 @@ fn round_rect_ops(sh: &ShapeEl, out: &mut String) {
     out.push_str("h\n");
 }
 
-fn shape_ops(sh: &ShapeEl) -> String {
+fn shape_ops(sh: &ShapeEl, ph: f32) -> String {
     let mut s = String::new();
     match sh.kind {
         ShapeKind::Rect => {
             if sh.radius > 0.01 {
-                round_rect_ops(sh, &mut s);
+                round_rect_ops(sh, ph, &mut s);
             } else {
                 let (cs, sn) = (sh.rotation.cos(), sh.rotation.sin());
                 let corners = [
@@ -238,11 +241,11 @@ fn shape_ops(sh: &ShapeEl) -> String {
                         [sh.x + dx * cs - dy * sn, sh.y + dx * sn + dy * cs]
                     })
                     .collect();
-                poly_ops(&pts, true, &mut s);
+                poly_ops(&pts, true, ph, &mut s);
             }
         }
-        ShapeKind::Ellipse => ellipse_ops(sh, &mut s),
-        ShapeKind::Polygon => poly_ops(&sh.points, true, &mut s),
+        ShapeKind::Ellipse => ellipse_ops(sh, ph, &mut s),
+        ShapeKind::Polygon => poly_ops(&sh.points, true, ph, &mut s),
         ShapeKind::Triangle | ShapeKind::Diamond => {
             let pts: Vec<[f32; 2]> = if matches!(sh.kind, ShapeKind::Triangle) {
                 vec![
@@ -266,7 +269,7 @@ fn shape_ops(sh: &ShapeEl) -> String {
                     [sh.x + dx * cs - dy * sn, sh.y + dx * sn + dy * cs]
                 })
                 .collect();
-            poly_ops(&rot, true, &mut s);
+            poly_ops(&rot, true, ph, &mut s);
         }
     }
     s
@@ -279,12 +282,16 @@ fn gs_emitted(out: &mut String, alpha: f32, ctx: &Ctx) {
 }
 
 fn page_content(page: &Page, ctx: &Ctx) -> String {
+    let (pw, ph) = (page.width, page.height);
+    // Content is authored in page space; scale width onto A4 so PDF output
+    // keeps the historical A4 MediaBox (GoodNotes: 595.28/1091.35 ≈ 0.5455).
+    let scale = A4_W / pw;
     let mut s = String::with_capacity(64 * 1024);
-    s.push_str("q\n0.5454567 0 0 0.5454567 0 0 cm\n");
+    let _ = write!(s, "q\n{scale} 0 0 {scale} 0 0 cm\n");
     s.push_str("q\n1 1 1 rg\n0 0 ");
-    num(&mut s, PAGE_W);
+    num(&mut s, pw);
     s.push(' ');
-    num(&mut s, PAGE_H);
+    num(&mut s, ph);
     s.push_str(" re\nf\nQ\n");
 
     for item in &page.items {
@@ -320,28 +327,28 @@ fn page_content(page: &Page, ctx: &Ctx) -> String {
                 let first = &st.points[0];
                 num(&mut s, first[0]);
                 s.push(' ');
-                num(&mut s, PAGE_H - first[1]);
+                num(&mut s, ph - first[1]);
                 s.push_str(" m\n");
                 for seg in geom::smooth(&st.points, geom::MAX_GAP) {
                     match seg {
                         geom::Seg::Line(p) => {
                             num(&mut s, p[0]);
                             s.push(' ');
-                            num(&mut s, PAGE_H - p[1]);
+                            num(&mut s, ph - p[1]);
                             s.push_str(" l\n");
                         }
                         geom::Seg::Curve(c1, c2, p) => {
                             num(&mut s, c1[0]);
                             s.push(' ');
-                            num(&mut s, PAGE_H - c1[1]);
+                            num(&mut s, ph - c1[1]);
                             s.push(' ');
                             num(&mut s, c2[0]);
                             s.push(' ');
-                            num(&mut s, PAGE_H - c2[1]);
+                            num(&mut s, ph - c2[1]);
                             s.push(' ');
                             num(&mut s, p[0]);
                             s.push(' ');
-                            num(&mut s, PAGE_H - p[1]);
+                            num(&mut s, ph - p[1]);
                             s.push_str(" c\n");
                         }
                     }
@@ -359,7 +366,7 @@ fn page_content(page: &Page, ctx: &Ctx) -> String {
                 s.push(' ');
                 num(&mut s, im.x);
                 s.push(' ');
-                num(&mut s, PAGE_H - im.y - im.h);
+                num(&mut s, ph - im.y - im.h);
                 let _ = write!(s, " cm\n/Im{obj} Do\nQ\n");
             }
             Item::Sticky(st) => {
@@ -371,7 +378,7 @@ fn page_content(page: &Page, ctx: &Ctx) -> String {
                 s.push_str("rg\n");
                 num(&mut s, st.x);
                 s.push(' ');
-                num(&mut s, PAGE_H - st.y - st.h);
+                num(&mut s, ph - st.y - st.h);
                 s.push(' ');
                 num(&mut s, st.w);
                 s.push(' ');
@@ -390,7 +397,7 @@ fn page_content(page: &Page, ctx: &Ctx) -> String {
                 s.push_str(" Tf\n");
                 num(&mut s, t.x);
                 s.push(' ');
-                num(&mut s, PAGE_H - t.y);
+                num(&mut s, ph - t.y);
                 s.push_str(" Td\n");
                 pdf_escape(&t.text, &mut s);
                 s.push_str("\nTj\nET\nQ\n");
@@ -405,7 +412,7 @@ fn page_content(page: &Page, ctx: &Ctx) -> String {
                     s.push_str("rg\n");
                     num(&mut s, *x);
                     s.push(' ');
-                    num(&mut s, PAGE_H - y - h);
+                    num(&mut s, ph - y - h);
                     s.push(' ');
                     num(&mut s, *w);
                     s.push(' ');
@@ -414,7 +421,7 @@ fn page_content(page: &Page, ctx: &Ctx) -> String {
                 }
             }
             Item::Shape(sh) => {
-                let ops = shape_ops(sh);
+                let ops = shape_ops(sh, ph);
                 if sh.fill[3] >= 0.004 {
                     s.push_str("q\n");
                     gs_emitted(&mut s, sh.fill[3], ctx);
@@ -459,7 +466,7 @@ fn page_content(page: &Page, ctx: &Ctx) -> String {
                     s.push_str("RG\n");
                     num(&mut s, p.width);
                     s.push_str(" w\n1 J\n1 j\n");
-                    poly_ops(&p.points, false, &mut s);
+                    poly_ops(&p.points, false, ph, &mut s);
                     s.push_str("S\nQ\n");
                 }
                 if let Some(head) = p.head {
@@ -469,7 +476,7 @@ fn page_content(page: &Page, ctx: &Ctx) -> String {
                         s.push(' ');
                     }
                     s.push_str("rg\n");
-                    poly_ops(&head, true, &mut s);
+                    poly_ops(&head, true, ph, &mut s);
                     s.push_str("f\nQ\n");
                 }
             }
@@ -488,7 +495,7 @@ fn page_content(page: &Page, ctx: &Ctx) -> String {
                     }
                     s.push_str("RG\n2 w\n1 J\n1 j\n");
                     for c in &fp.contours {
-                        poly_ops(c, true, &mut s);
+                        poly_ops(c, true, ph, &mut s);
                     }
                     s.push_str("B\nQ\n");
                 }

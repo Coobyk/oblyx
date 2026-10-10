@@ -185,6 +185,23 @@ pub struct TextBox {
 pub struct Page {
     pub uuid: String,
     pub items: Vec<Item>,
+    /// Page width in points. GoodNotes pages use [`PAGE_W`]; `.ntb` pages
+    /// carry their own paper size (e.g. A4 596×842).
+    pub width: f32,
+    /// Page height in points; see [`Page::width`].
+    pub height: f32,
+}
+
+impl Page {
+    /// A GoodNotes-canvas-sized page (the historical default).
+    pub fn new(uuid: impl Into<String>, items: Vec<Item>) -> Self {
+        Self {
+            uuid: uuid.into(),
+            items,
+            width: PAGE_W,
+            height: PAGE_H,
+        }
+    }
 }
 
 type Zip = ZipArchive<BufReader<File>>;
@@ -676,6 +693,8 @@ impl Document {
         Ok(Page {
             uuid: src.uuid.clone(),
             items: out,
+            width: PAGE_W,
+            height: PAGE_H,
         })
     }
 }

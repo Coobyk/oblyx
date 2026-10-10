@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 
 use base64::Engine as _;
 
-use crate::doc::{Document, Item, PAGE_H, PAGE_W, Page, ShapeKind};
+use crate::doc::{Document, Item, Page, ShapeKind};
 use crate::geom;
 use crate::render::image_mime;
 
@@ -41,10 +41,11 @@ fn escape_xml(s: &str) -> String {
 
 pub fn page_to_svg(page: &Page, doc: &Document) -> String {
     let mut s = String::with_capacity(64 * 1024);
+    let (pw, ph) = (page.width, page.height);
     let _ = write!(
         s,
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{PAGE_W}\" height=\"{PAGE_H}\" \
-         viewBox=\"0 0 {PAGE_W} {PAGE_H}\"><rect width=\"{PAGE_W}\" height=\"{PAGE_H}\" fill=\"#ffffff\"/>"
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{pw}\" height=\"{ph}\" \
+         viewBox=\"0 0 {pw} {ph}\"><rect width=\"{pw}\" height=\"{ph}\" fill=\"#ffffff\"/>"
     );
     for item in &page.items {
         match item {

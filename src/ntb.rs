@@ -85,7 +85,7 @@ const ROOT_F4_TIMESTAMP: usize = 4;
 const ROOT_F6_ELEMENTS: usize = 6;
 
 /// Stroke table field indices (same for Type A and Type B).
-const STROKE_F1_ANCHOR: usize = 1; // struct 2×f32: (Y, X)
+const STROKE_F1_ANCHOR: usize = 1; // struct 2×f32: (X, Y)
 const STROKE_F8_WIDTH: usize = 8; // f32
 const STROKE_F9_POINTS: usize = 9; // uoffset to point blob
 
@@ -478,7 +478,7 @@ pub fn rgba_from_u32(v: u32) -> [f32; 4] {
 
 /// Parse a shape (inner nf=11/12/15 with an f5 geometry vector).
 ///
-/// - f1: struct 2×f32 `(Y, X)` — absolute anchor, same layout as strokes.
+/// - f1: struct 2×f32 `(X, Y)` — absolute anchor, same layout as strokes.
 /// - f5: vector of f32s. Length 8/12 → dims are `(v0, v1)`; length 14 →
 ///   first slot is a header and dims are `(v1, v2)`.
 /// - colour: layout-driven at f7/f9/f10 depending on nf (see below);
@@ -492,9 +492,11 @@ fn parse_shape(b: &Buf, tp: usize, fields: &[u16]) -> Result<Option<NtbShape>> {
         return Ok(None);
     }
 
-    // Anchor (Y, X), same struct as strokes.
-    let anchor_y = b.f32(tp + f1).unwrap_or(f32::NAN);
-    let anchor_x = b.f32(tp + f1 + 4).unwrap_or(f32::NAN);
+    // Anchor (X, Y): first f32 is horizontal, second is vertical (top-down).
+    // Thumbnail-overlay verified: dots at (f32[0], f32[1) track the handwriting
+    // exactly; the opposite order scatters over empty margin/grid.
+    let anchor_x = b.f32(tp + f1).unwrap_or(f32::NAN);
+    let anchor_y = b.f32(tp + f1 + 4).unwrap_or(f32::NAN);
     if !anchor_x.is_finite() || !anchor_y.is_finite() {
         return Ok(None);
     }
@@ -574,8 +576,8 @@ fn parse_shape(b: &Buf, tp: usize, fields: &[u16]) -> Result<Option<NtbShape>> {
 fn parse_stroke(b: &Buf, tp: usize, fields: &[u16]) -> Result<NtbStroke> {
     let field = |i: usize| -> usize { *fields.get(i).unwrap_or(&0) as usize };
 
-    // f1: struct 2×f32 (Y, X) — absolute page anchor.
-    let (anchor_y, anchor_x) = if field(STROKE_F1_ANCHOR) != 0 {
+    // f1: struct 2×f32 `(X, Y)` — absolute page anchor, same layout as strokes.
+    let (anchor_x, anchor_y) = if field(STROKE_F1_ANCHOR) != 0 {
         let off = tp + field(STROKE_F1_ANCHOR);
         (b.f32(off).unwrap_or(0.0), b.f32(off + 4).unwrap_or(0.0))
     } else {
@@ -702,7 +704,9 @@ pub fn paginate(doc: &NtbDocument, page_h: f32) -> Vec<NtbPage> {
 // Public helpers for external callers (e.g. the convert pipeline)
 // ---------------------------------------------------------------------------
 
-/// Default page height used when converting to [`Page`]: A4 at 72 dpi.
+/// Default page width/height used when the notebook has no page definitions:
+/// A4 portrait at 72 dpi (matches the PDF exports of all 9 samples).
+pub const NTB_PAGE_W: f32 = 595.28;
 pub const NTB_PAGE_H: f32 = 841.89;
 
 /// Parse a `noteBundle` blob from memory. Public wrapper around the private
@@ -733,6 +737,11 @@ pub fn parse_bundle_public(bundle: &[u8]) -> Result<BundleParts> {
 /// filled, because no fill colour was found in the samples.
 pub fn to_pages(doc: &NtbDocument, page_h: f32) -> Vec<Page> {
     let effective_h = doc.pages.first().map(|p| p.height).unwrap_or(page_h);
+    let (page_w, page_h) = doc
+        .pages
+        .first()
+        .map(|p| (p.width, p.height))
+        .unwrap_or((NTB_PAGE_W, page_h));
     paginate(doc, effective_h)
         .into_iter()
         .enumerate()
@@ -759,6 +768,8 @@ pub fn to_pages(doc: &NtbDocument, page_h: f32) -> Vec<Page> {
             Page {
                 uuid: format!("ntb-p{i:04}"),
                 items,
+                width: page_w,
+                height: page_h,
             }
         })
         .collect()
