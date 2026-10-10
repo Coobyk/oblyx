@@ -213,11 +213,10 @@ fn index_entries(raw: &[u8]) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     for rec in records(raw)? {
         let f = parse(rec)?;
-        if let (Some(a), Some(b)) = (bytes_of(&f, 1), bytes_of(&f, 2)) {
-            if let (Ok(u), Ok(p)) = (std::str::from_utf8(a), std::str::from_utf8(b)) {
+        if let (Some(a), Some(b)) = (bytes_of(&f, 1), bytes_of(&f, 2))
+            && let (Ok(u), Ok(p)) = (std::str::from_utf8(a), std::str::from_utf8(b)) {
                 out.push((u.to_string(), p.to_string()));
             }
-        }
     }
     Ok(out)
 }
@@ -243,18 +242,16 @@ fn parse_events(raw: &[u8]) -> Result<EventsIndex> {
     let mut page_cfgs: HashMap<String, String> = HashMap::new();
     for rec in records(raw)? {
         let f = parse(rec)?;
-        if let Some(p2) = bytes_of(&f, 2) {
-            if let Ok(pf) = parse(p2) {
-                if let (Some(ev), Some(att)) = (
+        if let Some(p2) = bytes_of(&f, 2)
+            && let Ok(pf) = parse(p2)
+                && let (Some(ev), Some(att)) = (
                     bytes_of(&f, 1).and_then(as_uuid),
                     bytes_of(&pf, 4).and_then(as_uuid),
                 ) {
                     configs.insert(ev.to_string(), (att.to_string(), varint_of(&pf, 5)));
                 }
-            }
-        }
-        if let Some(p54) = bytes_of(&f, 54) {
-            if let Ok(pf) = parse(p54) {
+        if let Some(p54) = bytes_of(&f, 54)
+            && let Ok(pf) = parse(p54) {
                 let page = bytes_of(&pf, 2).and_then(as_uuid);
                 let cfg = bytes_of(&pf, 3)
                     .and_then(|m| parse(m).ok())
@@ -263,7 +260,6 @@ fn parse_events(raw: &[u8]) -> Result<EventsIndex> {
                     page_cfgs.insert(p.to_string(), c.to_string());
                 }
             }
-        }
     }
     Ok((configs, page_cfgs))
 }
@@ -343,8 +339,8 @@ impl Document {
         }
 
         let mut page_cfg: HashMap<String, PageCfg> = HashMap::new();
-        if let Some(raw) = read_member(&mut z, "index.events.pb")? {
-            if let Ok((configs, page_cfgs)) = parse_events(&raw) {
+        if let Some(raw) = read_member(&mut z, "index.events.pb")?
+            && let Ok((configs, page_cfgs)) = parse_events(&raw) {
                 for page in &pages {
                     let Some(prev) = uuid_prev(&page.uuid) else {
                         continue;
@@ -363,7 +359,6 @@ impl Document {
                     }
                 }
             }
-        }
 
         Ok(Document {
             schema,
@@ -577,8 +572,8 @@ impl Document {
 
         let mut boxes: HashMap<String, [f32; 4]> = HashMap::new();
         for it in &items {
-            if let Item::Shape(s) = it {
-                if let Some(u) = &s.uuid {
+            if let Item::Shape(s) = it
+                && let Some(u) = &s.uuid {
                     let b = if matches!(s.kind, ShapeKind::Ellipse) {
                         [s.x - s.w, s.y - s.h, s.w * 2.0, s.h * 2.0]
                     } else {
@@ -586,7 +581,6 @@ impl Document {
                     };
                     boxes.insert(u.clone(), b);
                 }
-            }
         }
         let mut out: Vec<Item> = Vec::with_capacity(items.len());
         for it in items {
@@ -830,12 +824,8 @@ fn arrowhead(pts: &[[f32; 2]]) -> Option<[[f32; 2]; 3]> {
 }
 
 fn resolve_connector(c: &ConnectorEl, boxes: &HashMap<String, [f32; 4]>) -> Option<PathEl> {
-    let Some(b1) = boxes.get(&c.a) else {
-        return None;
-    };
-    let Some(b2) = boxes.get(&c.b) else {
-        return None;
-    };
+    let b1 = boxes.get(&c.a)?;
+    let b2 = boxes.get(&c.b)?;
     let c1 = [b1[0] + b1[2] * 0.5, b1[1] + b1[3] * 0.5];
     let c2 = [b2[0] + b2[2] * 0.5, b2[1] + b2[3] * 0.5];
     let a1 = edge_mid(b1, &c2);
@@ -871,8 +861,7 @@ fn decode_content(
     }
     if keys.len() == 1 {
         decode_element(keys[0], rec, items, include_deleted, wrapper);
-    } else {
-    }
+    } 
     Ok(())
 }
 
@@ -914,11 +903,10 @@ fn decode_stroke(rec: &[u8], items: &mut Vec<Item>) {
     };
 
     let mut rgba = [0.1176, 0.1059, 0.1059, 1.0];
-    if let Some(cm) = bytes_of(&stroke, 4).and_then(|m| parse(m).ok()) {
-        if let Some(c) = decode_rgba(&cm) {
+    if let Some(cm) = bytes_of(&stroke, 4).and_then(|m| parse(m).ok())
+        && let Some(c) = decode_rgba(&cm) {
             rgba = c;
         }
-    }
 
     let parented = bytes_of(&stroke, 100).is_some();
     let (mut dx, mut dy) = (0.0f32, 0.0f32);
@@ -1030,11 +1018,10 @@ fn decode_shape_f9(
         let g = parse(raw).ok()?;
         let mut out = Vec::new();
         for f in g.iter() {
-            if let Wire::Bytes(pb) = f.wire {
-                if let Some(p) = point_of(pb) {
+            if let Wire::Bytes(pb) = f.wire
+                && let Some(p) = point_of(pb) {
                     out.push([p[0] + dx, p[1] + dy]);
                 }
-            }
         }
         Some(out)
     };
@@ -1062,13 +1049,13 @@ fn decode_shape_f9(
         }));
         return true;
     }
-    if let Some(raw) = bytes_of(&f9, 3) {
-        if let Ok(r) = parse(raw) {
-            if let (Some(c), Some(s)) = (
+    if let Some(raw) = bytes_of(&f9, 3)
+        && let Ok(r) = parse(raw)
+            && let (Some(c), Some(s)) = (
                 bytes_of(&r, 1).and_then(point_of),
                 bytes_of(&r, 2).and_then(point_of),
-            ) {
-                if s[0] > 0.0 && s[1] > 0.0 {
+            )
+                && s[0] > 0.0 && s[1] > 0.0 {
                     items.push(Item::Shape(ShapeEl {
                         kind: ShapeKind::Rect,
                         x: c[0] + dx - s[0] * 0.5,
@@ -1087,16 +1074,13 @@ fn decode_shape_f9(
                     }));
                     return true;
                 }
-            }
-        }
-    }
-    if let Some(raw) = bytes_of(&f9, 4) {
-        if let Ok(e) = parse(raw) {
-            if let (Some(c), Some(s)) = (
+    if let Some(raw) = bytes_of(&f9, 4)
+        && let Ok(e) = parse(raw)
+            && let (Some(c), Some(s)) = (
                 bytes_of(&e, 1).and_then(point_of),
                 bytes_of(&e, 2).and_then(point_of),
-            ) {
-                if s[0] > 0.0 && s[1] > 0.0 {
+            )
+                && s[0] > 0.0 && s[1] > 0.0 {
                     let mut rot = num_as_u32(&e, 3).map(f32_bits).unwrap_or(0.0);
                     if !rot.is_finite() {
                         rot = 0.0;
@@ -1119,9 +1103,6 @@ fn decode_shape_f9(
                     }));
                     return true;
                 }
-            }
-        }
-    }
     false
 }
 
@@ -1404,21 +1385,19 @@ fn decode_shape_frame(f: &[Field<'_>], fill: [f32; 4], items: &mut Vec<Item>) {
         for fld in f4.iter().filter(|x| x.num == 1) {
             if let Wire::Bytes(b) = fld.wire {
                 let mut pushed = false;
-                if let Some(inner) = parse(b).ok() {
+                if let Ok(inner) = parse(b) {
                     for pf in inner.iter().filter(|x| x.num == 1) {
-                        if let Wire::Bytes(pb) = pf.wire {
-                            if let Some(p) = point_of(pb) {
+                        if let Wire::Bytes(pb) = pf.wire
+                            && let Some(p) = point_of(pb) {
                                 points.push(p);
                                 pushed = true;
                             }
-                        }
                     }
                 }
-                if !pushed {
-                    if let Some(p) = point_of(b) {
+                if !pushed
+                    && let Some(p) = point_of(b) {
                         points.push(p);
                     }
-                }
             }
         }
         ellipse = bytes_of(&f4, 4).and_then(|m| parse(m).ok()).and_then(|m| {
@@ -1532,11 +1511,10 @@ fn decode_equation(f: &[Field<'_>], items: &mut Vec<Item>) {
             continue;
         };
         let mut rgba = [0.1176, 0.1059, 0.1059, 1.0];
-        if let Some(cm) = bytes_of(&sub, 2).and_then(|m| parse(m).ok()) {
-            if let Some(c) = decode_rgba(&cm) {
+        if let Some(cm) = bytes_of(&sub, 2).and_then(|m| parse(m).ok())
+            && let Some(c) = decode_rgba(&cm) {
                 rgba = c;
             }
-        }
         let Some(blob) = bytes_of(&sub, 1) else {
             continue;
         };
@@ -1606,11 +1584,10 @@ fn extract_text(f: &[Field<'_>]) -> Option<String> {
         };
         if let Ok(bf) = parse(block) {
             for piece in bf.iter().filter(|x| x.num == 1) {
-                if let Wire::Bytes(s) = piece.wire {
-                    if let Ok(text) = std::str::from_utf8(s) {
+                if let Wire::Bytes(s) = piece.wire
+                    && let Ok(text) = std::str::from_utf8(s) {
                         out.push_str(text);
                     }
-                }
             }
         } else if let Ok(text) = std::str::from_utf8(block) {
             out.push_str(text);
@@ -1631,15 +1608,13 @@ fn decode_textbox(f: &[Field<'_>], items: &mut Vec<Item>) {
     let mut size = 0.0f32;
     let mut font: Option<String> = None;
     let mut bold = false;
-    if let Some(t5) = bytes_of(f, 5).and_then(|m| parse(m).ok()) {
-        if let Some(style) = bytes_of(&t5, 1).and_then(|m| parse(m).ok()) {
-            if let Some(name) = bytes_of(&style, 30) {
-                if let Ok(s) = std::str::from_utf8(name) {
-                    if !s.trim().is_empty() {
+    if let Some(t5) = bytes_of(f, 5).and_then(|m| parse(m).ok())
+        && let Some(style) = bytes_of(&t5, 1).and_then(|m| parse(m).ok()) {
+            if let Some(name) = bytes_of(&style, 30)
+                && let Ok(s) = std::str::from_utf8(name)
+                    && !s.trim().is_empty() {
                         font = Some(s.to_string());
                     }
-                }
-            }
             if let Some(v) = varint_of(&style, 40) {
                 let sz = f32_bits(v as u32);
                 if sz.is_finite() && sz > 0.0 && sz < 500.0 {
@@ -1647,7 +1622,6 @@ fn decode_textbox(f: &[Field<'_>], items: &mut Vec<Item>) {
                 }
             }
         }
-    }
     let mut inset_l = 10.0f32;
     let mut inset_t = 10.0f32;
     if let Some(t32) = bytes_of(f, 32).and_then(|m| parse(m).ok()) {
@@ -1665,31 +1639,26 @@ fn decode_textbox(f: &[Field<'_>], items: &mut Vec<Item>) {
                 inset_t = v;
             }
         }
-        if let Some(pm) = bytes_of(&t32, 5).and_then(|m| parse(m).ok()) {
-            if let Some(pa) = bytes_of(&pm, 1).and_then(|m| parse(m).ok()) {
-                if font.is_none() {
-                    if let Some(name) = bytes_of(&pa, 30) {
-                        if let Ok(s) = std::str::from_utf8(name) {
-                            if !s.trim().is_empty() {
+        if let Some(pm) = bytes_of(&t32, 5).and_then(|m| parse(m).ok())
+            && let Some(pa) = bytes_of(&pm, 1).and_then(|m| parse(m).ok()) {
+                if font.is_none()
+                    && let Some(name) = bytes_of(&pa, 30)
+                        && let Ok(s) = std::str::from_utf8(name)
+                            && !s.trim().is_empty() {
                                 font = Some(s.to_string());
                             }
-                        }
-                    }
-                }
-                if size <= 0.0 {
-                    if let Some(sz) = num_as_u32(&pa, 40)
+                if size <= 0.0
+                    && let Some(sz) = num_as_u32(&pa, 40)
                         .map(f32_bits)
                         .filter(|v| v.is_finite() && *v > 0.0 && *v < 500.0)
                     {
                         size = sz;
                     }
-                }
             }
-        }
-        if let Some(segf) = bytes_of(&t32, 1).and_then(|m| parse(m).ok()) {
-            if let Some(blob) = bytes_of(&segf, 2) {
-                if let Ok(d) = decompress_bv4(blob) {
-                    if let Ok(blocks) = parse(&d) {
+        if let Some(segf) = bytes_of(&t32, 1).and_then(|m| parse(m).ok())
+            && let Some(blob) = bytes_of(&segf, 2)
+                && let Ok(d) = decompress_bv4(blob)
+                    && let Ok(blocks) = parse(&d) {
                         let style = blocks
                             .iter()
                             .find(|b| b.num == 1)
@@ -1705,16 +1674,12 @@ fn decode_textbox(f: &[Field<'_>], items: &mut Vec<Item>) {
                             {
                                 size = sz;
                             }
-                            if let Some(v) = varint_of(&style, 60) {
-                                if v as i64 != -404 {
+                            if let Some(v) = varint_of(&style, 60)
+                                && v as i64 != -404 {
                                     bold = true;
                                 }
-                            }
                         }
                     }
-                }
-            }
-        }
     }
     if size <= 0.0 {
         size = 24.0;
@@ -1802,7 +1767,6 @@ fn decode_textbox(f: &[Field<'_>], items: &mut Vec<Item>) {
             }
         });
 
-    if size_opt.is_none() || stroke_width.is_none() {}
     if let (Some((bw, bh)), Some(sw_val)) = (size_opt, stroke_width) {
         let stroke = stroke_info
             .as_ref()
@@ -1835,7 +1799,7 @@ fn decode_textbox(f: &[Field<'_>], items: &mut Vec<Item>) {
             .map(f32_bits)
             .filter(|v| v.is_finite() && *v > 0.0);
         let radius = raw_r.unwrap_or(0.0).min(bw * 0.5).min(bh * 0.5);
-        if radius > 0.0 {}
+        
         let (kind, sx, sy, sw, sh, points, rot) = if let Some(units) = &unit_pts {
             let cs = rotation.cos();
             let sn = rotation.sin();
@@ -1899,13 +1863,12 @@ fn decode_textbox(f: &[Field<'_>], items: &mut Vec<Item>) {
 fn decode_kind22(f: &[Field<'_>], items: &mut Vec<Item>, wrapper: Option<&[Field<'_>]>) {
     let mut width = KIND22_WIDTH;
     let mut rgba = [0.1176, 0.1059, 0.1059, 1.0];
-    if let Some(style) = bytes_of(f, 32).and_then(|m| parse(m).ok()) {
-        if let Some(inner) = bytes_of(&style, 1).and_then(|m| parse(m).ok()) {
-            if let Some(w) = num_as_u32(&inner, 1).map(f32_bits) {
-                if w.is_finite() && w > 0.0 {
+    if let Some(style) = bytes_of(f, 32).and_then(|m| parse(m).ok())
+        && let Some(inner) = bytes_of(&style, 1).and_then(|m| parse(m).ok()) {
+            if let Some(w) = num_as_u32(&inner, 1).map(f32_bits)
+                && w.is_finite() && w > 0.0 {
                     width = w;
                 }
-            }
             if let Some(c) = bytes_of(&inner, 3)
                 .and_then(|m| parse(m).ok())
                 .and_then(|m| bytes_of(&m, 1))
@@ -1915,7 +1878,6 @@ fn decode_kind22(f: &[Field<'_>], items: &mut Vec<Item>, wrapper: Option<&[Field
                 rgba = c;
             }
         }
-    }
 
     if let Some(g) = bytes_of(f, 20).and_then(|m| parse(m).ok()) {
         let mut pts: Vec<[f32; 2]> = Vec::new();
@@ -1927,11 +1889,10 @@ fn decode_kind22(f: &[Field<'_>], items: &mut Vec<Item>, wrapper: Option<&[Field
             pts.push(s);
         }
         for fld in g.iter().filter(|x| x.num == 2) {
-            if let Wire::Bytes(b) = fld.wire {
-                if let Some(p) = point_of(b) {
+            if let Wire::Bytes(b) = fld.wire
+                && let Some(p) = point_of(b) {
                     pts.push(p);
                 }
-            }
         }
         if let Some(e) = bytes_of(&g, 3)
             .and_then(|m| parse(m).ok())
@@ -1972,8 +1933,7 @@ fn decode_kind22(f: &[Field<'_>], items: &mut Vec<Item>, wrapper: Option<&[Field
                     width,
                     rgba,
                 }));
-            } else {
-            }
+            } 
             return;
         }
         let start = bytes_of(&g, 1)
@@ -1995,7 +1955,6 @@ fn decode_kind22(f: &[Field<'_>], items: &mut Vec<Item>, wrapper: Option<&[Field
                 width,
                 rgba,
             }));
-        } else {
-        }
+        } 
     }
 }

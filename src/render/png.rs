@@ -194,8 +194,10 @@ fn draw_stroke(pm: &mut Pixmap, st: &StrokeData, scale: f32) {
     let Some(path) = pb.finish() else {
         return;
     };
-    let mut paint = Paint::default();
-    paint.anti_alias = true;
+    let mut paint = Paint {
+        anti_alias: true,
+        ..Default::default()
+    };
     if st.rgba[3] < 0.95 {
         paint.blend_mode = BlendMode::Multiply;
     }
@@ -228,8 +230,10 @@ fn draw_sticky(pm: &mut Pixmap, st: &Sticky, scale: f32) {
     let Some(rect) = tiny_skia::Rect::from_xywh(x, y, w, h) else {
         return;
     };
-    let mut paint = Paint::default();
-    paint.anti_alias = true;
+    let mut paint = Paint {
+        anti_alias: true,
+        ..Default::default()
+    };
     paint.set_color_rgba8(
         (st.rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8,
         (st.rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8,
@@ -253,8 +257,10 @@ fn draw_text(pm: &mut Pixmap, t: &TextBox, scale: f32) {
 }
 
 fn color_paint(rgba: [f32; 4]) -> Paint<'static> {
-    let mut paint = Paint::default();
-    paint.anti_alias = true;
+    let mut paint = Paint {
+        anti_alias: true,
+        ..Default::default()
+    };
     paint.set_color_rgba8(
         (rgba[0].clamp(0.0, 1.0) * 255.0).round() as u8,
         (rgba[1].clamp(0.0, 1.0) * 255.0).round() as u8,

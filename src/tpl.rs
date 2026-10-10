@@ -318,11 +318,10 @@ pub fn polyline(starts: &[[f32; 2]], segments: &[[f32; 4]]) -> Vec<[f32; 2]> {
     };
     pts.push(*first);
     for s in segments {
-        if let Some(last) = pts.last() {
-            if (last[0] - s[0]).abs() > 1e-3 || (last[1] - s[1]).abs() > 1e-3 {
+        if let Some(last) = pts.last()
+            && ((last[0] - s[0]).abs() > 1e-3 || (last[1] - s[1]).abs() > 1e-3) {
                 pts.push([s[0], s[1]]);
             }
-        }
         pts.push([s[2], s[3]]);
     }
     pts
@@ -355,7 +354,10 @@ fn pair_runs(runs: Vec<Vec<[f32; 2]>>) -> Vec<Vec<[f32; 2]>> {
     out
 }
 
-pub fn vector_fill_geometry(img: &[u8]) -> Result<Option<(Vec<Vec<[f32; 2]>>, bool)>> {
+/// Contour list plus a closed-path flag.
+type Contours = (Vec<Vec<[f32; 2]>>, bool);
+
+pub fn vector_fill_geometry(img: &[u8]) -> Result<Option<Contours>> {
     let (fmt, values) = decode_tpl(img)?;
     if fmt != VECTOR_FORMAT {
         return Ok(None);
@@ -418,11 +420,10 @@ pub fn vector_fill_geometry(img: &[u8]) -> Result<Option<(Vec<Vec<[f32; 2]>>, bo
                 nth = Some(runs);
             }
         }
-        if contours.is_empty() {
-            if let Some(runs) = nth {
+        if contours.is_empty()
+            && let Some(runs) = nth {
                 contours = runs.into_iter().filter(|r| r.len() >= 3).collect();
             }
-        }
     }
     if contours.is_empty() {
         return Ok(None);

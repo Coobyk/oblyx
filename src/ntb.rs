@@ -29,8 +29,7 @@ struct Buf<'a> {
 impl<'a> Buf<'a> {
     fn u32(&self, off: usize) -> Result<u32> {
         self.d
-            .get(off..off + 4)
-            .and_then(|b| Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+            .get(off..off + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .context(format!("u32 @ {off}"))
     }
 
@@ -40,15 +39,13 @@ impl<'a> Buf<'a> {
 
     fn u16(&self, off: usize) -> Result<u16> {
         self.d
-            .get(off..off + 2)
-            .and_then(|b| Some(u16::from_le_bytes([b[0], b[1]])))
+            .get(off..off + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
             .context(format!("u16 @ {off}"))
     }
 
     fn f32(&self, off: usize) -> Result<f32> {
         self.d
-            .get(off..off + 4)
-            .and_then(|b| Some(f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+            .get(off..off + 4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .context(format!("f32 @ {off}"))
     }
 

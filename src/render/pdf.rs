@@ -274,7 +274,7 @@ fn shape_ops(sh: &ShapeEl) -> String {
 
 fn gs_emitted(out: &mut String, alpha: f32, ctx: &Ctx) {
     if alpha < 0.95 && ctx.gs_obj.contains_key(&gs_key(alpha)) {
-        let _ = write!(out, "/GS{} gs\n", gs_key(alpha));
+        let _ = writeln!(out, "/GS{} gs", gs_key(alpha));
     }
 }
 
@@ -301,7 +301,7 @@ fn page_content(page: &Page, ctx: &Ctx) -> String {
                 let alpha = st.rgba[3];
                 s.push_str("q\n");
                 if alpha < 0.95 && ctx.gs_obj.contains_key(&stroke_gs_key(alpha)) {
-                    let _ = write!(s, "/GS{} gs\n", stroke_gs_key(alpha));
+                    let _ = writeln!(s, "/GS{} gs", stroke_gs_key(alpha));
                 }
                 for c in 0..3 {
                     num(&mut s, st.rgba[c].clamp(0.0, 1.0));
@@ -398,8 +398,8 @@ fn page_content(page: &Page, ctx: &Ctx) -> String {
             Item::Background(bg) => {
                 for (x, y, w, h, rgb) in &bg.rects {
                     s.push_str("q\n");
-                    for c in 0..3 {
-                        num(&mut s, rgb[c].clamp(0.0, 1.0));
+                    for &c in rgb.iter().take(3) {
+                        num(&mut s, c.clamp(0.0, 1.0));
                         s.push(' ');
                     }
                     s.push_str("rg\n");
@@ -682,8 +682,8 @@ pub fn document_to_pdf_with(
     }
     let xref_pos = out.len();
     out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
-    for i in 1..total {
-        out.extend_from_slice(format!("{:010} 00000 n \n", offsets[i]).as_bytes());
+    for &off in &offsets[1..total] {
+        out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
     }
     out.extend_from_slice(
         format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n")

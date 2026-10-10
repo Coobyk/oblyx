@@ -20,26 +20,20 @@ const CANDIDATES: &[&str] = &[
 
 fn load_font() -> Option<Font> {
     for path in CANDIDATES {
-        if let Ok(bytes) = std::fs::read(path) {
-            if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+        if let Ok(bytes) = std::fs::read(path)
+            && let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
                 return Some(font);
             }
-        }
     }
     if let Ok(out) = std::process::Command::new("fc-match")
         .args(["-f", "%{file}", "sans-serif"])
         .output()
-    {
-        if out.status.success() {
-            if let Ok(path) = String::from_utf8(out.stdout) {
-                if let Ok(bytes) = std::fs::read(path.trim()) {
-                    if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+        && out.status.success()
+            && let Ok(path) = String::from_utf8(out.stdout)
+                && let Ok(bytes) = std::fs::read(path.trim())
+                    && let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
                         return Some(font);
                     }
-                }
-            }
-        }
-    }
     None
 }
 
@@ -59,26 +53,20 @@ const BOLD_CANDIDATES: &[&str] = &[
 
 fn load_bold_font() -> Option<Font> {
     for path in BOLD_CANDIDATES {
-        if let Ok(bytes) = std::fs::read(path) {
-            if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+        if let Ok(bytes) = std::fs::read(path)
+            && let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
                 return Some(font);
             }
-        }
     }
     if let Ok(out) = std::process::Command::new("fc-match")
         .args(["-f", "%{file}", "sans-serif:bold"])
         .output()
-    {
-        if out.status.success() {
-            if let Ok(path) = String::from_utf8(out.stdout) {
-                if let Ok(bytes) = std::fs::read(path.trim()) {
-                    if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+        && out.status.success()
+            && let Ok(path) = String::from_utf8(out.stdout)
+                && let Ok(bytes) = std::fs::read(path.trim())
+                    && let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
                         return Some(font);
                     }
-                }
-            }
-        }
-    }
     None
 }
 
@@ -92,6 +80,7 @@ pub fn system_bold_font() -> Option<&'static Font> {
     FONT.get_or_init(load_bold_font).as_ref()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw_text_line(
     pm: &mut Pixmap,
     text: &str,
@@ -112,9 +101,9 @@ pub fn draw_text_line(
     if px <= 1.0 || text.is_empty() {
         return;
     }
-    let cr = (rgb[0].clamp(0.0, 1.0) * 255.0).round() as f32;
-    let cg = (rgb[1].clamp(0.0, 1.0) * 255.0).round() as f32;
-    let cb = (rgb[2].clamp(0.0, 1.0) * 255.0).round() as f32;
+    let cr = (rgb[0].clamp(0.0, 1.0) * 255.0).round();
+    let cg = (rgb[1].clamp(0.0, 1.0) * 255.0).round();
+    let cb = (rgb[2].clamp(0.0, 1.0) * 255.0).round();
     let a_full = alpha.clamp(0.0, 1.0) * 255.0;
 
     let pw = pm.width() as i32;
