@@ -91,27 +91,60 @@ Element counts in `root.f6` (full walk, no cap):
 | M1 | 24 |
 | P1 | 1235 |
 
-### 4.2 Element taxonomy — VERIFIED
+### 4.2 Element taxonomy — PARTIALLY DECODED
 
 Each `root.f6[i]` is a **wrapper table** with `nf=6` vtable fields. The wrapper
 holds u64 timestamps and a `f5` uoffset pointing at the **inner object** table.
 
 The inner table's field count (`nf`) determines the element type:
 
-| inner nf | count (Eth1) | type |
-| --- | --- | --- |
-| 16 | 220 | **handwriting stroke** (see 4.3) |
-| 12 | 19 | unknown (text? image?) |
-| 4 | 16 | unknown |
-| 1 | 13 | unknown |
-| 15 | 7 | unknown |
-| 7 | 3 | unknown |
-| 8 | 1 | unknown |
-| 2 | 1 | unknown |
-| 13 | 1 | unknown |
-| 11 | 1 | unknown |
+| inner nf | count (Eth1) | type | key fields |
+| --- | --- | --- | --- |
+| 16 | 220 | **handwriting stroke** (§4.3) | f1 anchor, f8 width, f9 points |
+| 12 | 19 | **shape / drawing** | f1 f32 Y, f5 vector, f9 colour, f10 width, f11 u32 |
+| 4 | 16 | unknown | f1 u32 small, f3 u8 |
+| 1 | 13 | lightweight element / annotation | f0 u32 (0, 4, or hash) |
+| 15 | 7 | **shape / drawing** | f1 f32 Y, f5 vector, f9 colour, f10 width, f14 f32 |
+| 7 | 3 | unknown | f0 vector n=1, f5 u8, f6 u32 |
+| 8 | 1 | **text box** | f4 string (font name, e.g. `"Inter"`), f5 f32 (font size) |
+| 2 | 1 | **page definition** | f1 vector: [width, height, …] in points |
+| 13 | 1 | unknown | f0 vector n=1, f12 vector n=2 |
+| 11 | 1 | **shape / drawing** | f1 f32 Y, f9 colour, f10 width |
 
-Only `nf=16` has been decoded so far.
+**nf=2 (page definition):** The f1 vector's first two f32s are the page width
+and height in points. Verified across samples:
+
+| sample | pages | dimensions (pt) | orientation |
+| --- | --- | --- | --- |
+| B1 | 2 | 651 × 407 | custom |
+| E1 | 5 | 596 × 842 | A4 portrait |
+| Eth1 | 1 | 596 × 842 | A4 portrait |
+| F1 | 7 | 455 × 571 | custom |
+| G1 | 6 | (varies) | — |
+| P1 | 6 | 842 × 595 | A4 landscape |
+| Cambridge, D1, M1 | 0 | — | continuous-scroll |
+
+**nf=8 (text box):** f4 is a FlatBuffer string holding the font family
+(e.g. `"Inter"`). f5 is an f32 font size (e.g. `14.0`). f3 is a u8 flag
+(bold?). The actual text characters are stored elsewhere (not in the element
+table); f1 is a vector of packed u32s, possibly glyph or layout data.
+
+**nf=11 / 12 / 15 (shapes):** All three share a common structure:
+- f1: f32, page Y coordinate (same range as stroke anchors)
+- f9: u32 colour, e.g. `0xFF000000` (RGBA bytes `00 00 00 FF` = black)
+- f10: f32 width (e.g. 0.7751, matching stroke widths)
+- f11 (nf=12): u32, e.g. `0xFFFFFFFF` (second colour / fill?)
+- f14 (nf=15): f32, another dimension (e.g. 1.746)
+- f5 (nf=12, nf=15): vector, possibly point coordinates (contents undecoded)
+
+**nf=1 (lightweight element):** Single f0 u32 field with values `0`, `4`, or
+a hash-like constant. The wrapper's f5 matches stroke-like table sizes
+(32, 36, 44), suggesting a shared envelope. Purpose unknown — possibly an
+annotation marker or a degenerate stroke.
+
+Odd vtable field offsets (e.g. 7, 19, 23, 27) are **u8 / bool fields**, not
+misaligned u32s. This was confirmed by the field-size gaps between consecutive
+offsets.
 
 ### 4.3 Stroke table — VERIFIED (two subtypes)
 
@@ -293,21 +326,28 @@ The convert pipeline dispatches `.ntb` files via `is_ntb()`; assets are loaded
 into the document attachment map. Example: `cargo run --bin oblyx -- -f svg,pdf
 ntb/Eth1.ntb`.
 
-## 8. Open problems
+## 9. Open problems
 
 1. **Point coordinate encoding** (4.4) — the blocker for render fidelity. The
    three f32s per point have a velocity-envelope pattern but do not integrate
    to the PDF path. May require inspecting the Notability app binary or SDK.
-2. **Non-stroke element types** (4.2, nf ≠ 16) — text, images, shapes, PDF-page
-   references are all undecoded.
-3. **Colour field** — the `00 ff 01` byte-run appears in stroke headers but its
-   exact encoding (RGBA? palette index?) is unconfirmed.
-4. **f15 u32** — matches neither point count nor byte length; purpose unknown.
-5. **u16 in points** — constant f16 1.0 for Type A, varying for Type B; likely
+2. **Text content location** (4.2, nf=8) — font name and size are decoded, but
+   the actual text characters are stored elsewhere (not in the element table).
+   Possibly in assets/ or a separate string table.
+3. **Shape geometry** (4.2, nf=11/12/15) — Y position, colour, and width are
+   decoded, but the f5 vectors (point coordinates?) are undecoded.
+4. **Colour encoding** — f9 = `0xFF000000` interpreted as RGBA bytes
+   `00 00 00 FF` (black). Needs verification with coloured notebooks.
+5. **nf=1 purpose** — single u32 field (0, 4, or hash). Wrapper envelope matches
+   strokes. Possibly annotations or degenerate strokes.
+6. **nf=4, 7, 13** — undecoded.
+7. **f15 u32 in strokes** — matches neither point count nor byte length;
+   purpose unknown.
+8. **u16 in points** — constant f16 1.0 for Type A, varying for Type B; likely
    pressure or timestamp, unconfirmed.
-6. **Page-size mismatch** — renderers use GoodNotes page constants (1091×1543);
-   `.ntb` coordinates are A4-height. Strokes appear in the upper portion of
-   the canvas. A proper fix needs a page-size-aware renderer or a coordinate
-   scale at load time.
-7. **No device validation** — no Notability/GoodNotes round-trip has been
-   performed; any future writer must be validated on a real device.
+9. **Page-size mismatch** — renderers use GoodNotes page constants (1091×1543);
+   `.ntb` coordinates are page-relative (e.g. A4 596×842). Strokes appear in
+   the upper portion of the canvas. A proper fix needs a page-size-aware
+   renderer or a coordinate scale at load time using nf=2 dimensions.
+10. **No device validation** — no Notability/GoodNotes round-trip has been
+    performed; any future writer must be validated on a real device.
