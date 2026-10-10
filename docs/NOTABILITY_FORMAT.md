@@ -163,17 +163,18 @@ Odd vtable field offsets (e.g. 7, 19, 23, 27) are **u8 / bool fields**, not
 misaligned u32s. This was confirmed by the field-size gaps between consecutive
 offsets.
 
-### 4.3 Stroke table — VERIFIED (two subtypes)
+### 4.3 Stroke table — VERIFIED (two primary subtypes)
 
-Handwriting strokes are inner tables with `nf=16`. Two subtypes exist,
-distinguished by table size and vtable layout:
+Handwriting strokes are inner tables with `nf=16`. Two primary subtypes exist,
+distinguished by table size and vtable layout (additional layout variants are
+listed in §4.4):
 
 | | Type A | Type B |
 | --- | --- | --- |
 | tsize | 44 | 40 |
 | vtable fields | `[32,24,0,0,0,23,0,19,12,8,0,0,0,0,0,4]` | `[28,20,0,0,0,0,0,16,12,8,0,0,0,0,0,4]` |
-| f9 uoffset | 36 | 32 |
-| u16 in points | constant `15360` (`0x3c00`) | varies (~14681–15401) |
+| f9 uoffset value | 36 | 32 (layout B); **larger in shifted variants** |
+| u16 in point records | constant `15360` (`0x3c00`) | varies (~14681–15401) |
 
 Observed distribution (B1): 55 Type A, 506 Type B out of 561 strokes.
 
@@ -181,15 +182,15 @@ Decoded fields (offsets differ per subtype; shown for Type A → Type B):
 
 | field | Type A off | Type B off | type | meaning |
 | --- | --- | --- | --- | --- |
-| f1 | 24 | 20 | struct 2×f32 | **stroke anchor (X, Y)** — absolute page coords, X horizontal, Y vertical (top-down). Thumbnail-overlay verified: plotting `(f32[0], f32[1)` tracks the handwriting exactly; the opposite order scatters over empty margin/grid. |
+| f1 | 24 | 20 | struct 2×f32 | **stroke anchor (X, Y)** — absolute page coords, X horizontal, Y vertical (top-down). Thumbnail-overlay verified: plotting `(f32[0], f32[1])` tracks the handwriting exactly; the opposite order scatters over empty margin/grid. |
 | f7 | 19 | 16 | u32 | **stroke colour** `0xAABBGGRR` (§4.6); f5 is noise (low byte always `0x01`) |
 | f8 | 12 | 12 | f32 | **stroke width** in points |
-| f9 | 8 | 8 | uoffset | points to the point-data blob at `tp + tsize` |
+| f9 | 8 | 8 | uoffset | **uoffset from its field slot** to the point-data blob: `P = (tp + fo5[9]) + u32(at slot)`. Equals `tp + tsize` only for layout A; shifted Type B layouts point *past* the table. Follow the uoffset — never assume `tp + tsize`. |
 | f15 | 4 | 4 | u32 | id-like, varies per stroke |
 
 The f1 struct covers 8 bytes (two f32s). For Type A the second f32 sits at
 offset 28 (not listed in the vtable — it is part of the struct, not a separate
-field). Verified by thumbnail overlay (dots at `(f32[0], f32[1)`, page-scaled,
+field). Verified by thumbnail overlay (dots at `(f32[0], f32[1])`, page-scaled,
 land exactly on the ink; the swapped order scatters over empty margin/grid):
 `(X=48.97, Y=69.18)` for one Cambridge stroke, `(X=109.44, Y=65.15)` for one
 Type B stroke. Across Eth1 strokes, X ranges 27.8–229.9, Y 23.7–153.7 —
@@ -202,96 +203,117 @@ up to 839.8 > 595) and put pagination splits on the wrong axis.
 notebook uses `0.725`); observed multipliers `1, 2, 4, 5, 10, 15, 30` — matching
 Notability's pen/highlighter size presets.
 
-### 4.4 Point-data blob — structure VERIFIED, coordinates UNSOLVED
+### 4.4 Point-data blob — VERIFIED (f16 cubic-Bézier records)
 
-Each stroke's `f9` points at a blob at `tp + tsize` (verified for 561/568 B1
-strokes). The blob layout:
+Each stroke's `f9` uoffset points at a point-data blob (§4.3 — the target is
+`follow(f9)`, **not** `tp + tsize`, for shifted Type B layouts). Blob layout:
 
 ```
-offset 0   u32    = 19*n − 5   (also serves as pt0's x, denormal ≈ 0)
+offset 0   u32    = vlen   (record-byte length; vlen % 19 == 14,
+                            vlen ≈ 19*n − 5 for full streams)
 offset 4   u8     = 0
-offset 5   u8     = n          (point count)
+offset 5   u8     = n      (record count; only when n < 256)
 offset 6   u8     = 0
-offset 7   u8     = 3          (constant)
-offset 8+  n × 19-byte point records
+offset 7   u8     = 3      (constant; last byte of rec0's first point)
+offset 8+  n × 19-byte records
 ```
 
-Each 19-byte point record:
+The header length `vlen` is **unreliable as a record count**: 177/220 Eth1
+strokes carry records past `vlen`, 43 do not. Ground truth is a **trailer
+scan** — walk `k = 0, 1, 2, …` while `d[P + 19k + 14 .. P + 19k + 19] ==
+00 3c ff 00 00`, stopping at the first miss (no overshoot: `n` never exceeds
+`(vlen + 5) / 19 + 5` on any sample).
+
+Each 19-byte record:
 
 ```
 offset  size  meaning
-0       4     f32 LE   x
-4       4     f32 LE   y
-8       4     f32 LE   z
-12      2     u16 LE   (Type A: constant 15360 = f16 1.0; Type B: varies)
+0       2     f16 LE   c1.x
+2       2     f16 LE   c1.y
+4       2     f16 LE   c2.x
+6       2     f16 LE   c2.y
+8       2     f16 LE   end.x
+10      2     f16 LE   end.y
+12      2     u16 LE   width hint (Type A: constant 0x3c00 = f16 1.0;
+                       Type B: varies ~14681–15401 — per-point width
+                       scale, unused by the renderer today)
 14      5     trailer, always 00 3c ff 00 00
 ```
 
-The earlier "7-byte trailer `00 3c 00 3c ff 00 00`" is the u16 (which for Type
-A is always `00 3c`) concatenated with the 5-byte trailer. Using the 5-byte
-trailer at offset 14 works for **both** subtypes and recovers the full stroke
-counts.
+All six coordinates are **IEEE-754 binary16 (f16) LE**, anchor-relative, y
+top-down. This matches the web app's `ProcessStroke` worker, which stores
+points as f16 pairs (confirmed against `/tmp/opencode/nweb/`).
 
-Corrected stroke/point totals (all 9 samples, 5-byte-trailer model):
+#### Path construction (validated visually on Eth1/G1/M1)
 
-| sample | strokes | total pts | Type A | Type B |
-| --- | --- | --- | --- | --- |
-| B1 | 561 | 16744 | 55 | 506 |
-| Eth1 | 220 | 4035 | 220 | 0 |
-| D1 | 1102 | 21229 | 438 | 664 |
-| E1 | 1485 | 31430 | 1208 | 277 |
-| F1 | 1301 | 20790 | 1301 | 0 |
-| G1 | 1790 | 46343 | 1752 | 38 |
-| P1 | 631 | 18059 | 631 | 0 |
-| Cambridge | 13 | 321 | 13 | 0 |
-| M1 | 1 | 54 | 1 | 0 |
+- `rec0`'s first 8 bytes are clobbered by the stream header; its `c1`/`c2`
+  decode to garbage (Eth1 rec0 c2 → −8192). **rec0 is a moveto**: the path
+  starts at `anchor + (0, 0)`, i.e. the f1 anchor.
+- For `k = 1 .. n−1`, record `k` is a cubic Bézier from the running point
+  `cur` through controls `c1`, `c2` to `end`, **all offset by the anchor**
+  (relative → absolute; forgetting this offset produced the "starburst"
+  render). `cur ← end` after each record.
+- Each cubic is sampled at `BEZIER_SAMPLES = 12` steps; the resulting
+  polyline is the stroke path. Non-finite f16 in a record falls through as a
+  straight segment to `end` when only `end` is finite.
+- Stroke width = table `f8` (f32, absolute points); colour = `f7` (§4.6).
 
-#### Coordinate encoding — UNSOLVED
+#### Stroke/point totals (trailer-scan + f9-uoffset model, all 9 samples)
 
-The three f32 values per point are **not** page coordinates and **not** simple
-deltas. Observed behaviour:
+| sample | strokes | total pts | note |
+| --- | --- | --- | --- |
+| B1 | 563 | 16 800 | |
+| Cambridge | 13 | 321 | |
+| D1 | 1 102 | 21 229 | |
+| E1 | 1 523 | 31 506 | |
+| Eth1 | 220 | 4 035 | matches PDF path count (230, close) |
+| F1 | 1 301 | 20 790 | |
+| G1 | 2 234 | 63 871 | shifted Type B layouts recovered (+444 strokes, +17 528 pts vs the `tp+tsize` model) |
+| M1 | 1 | 54 | |
+| P1 | 641 | 18 198 | |
 
-- Values start near zero, grow **exponentially** (each successive point is
-  ~2–10× the previous in magnitude), reaching ~10¹³ in long strokes. The sign
-  is negative for most points (sign bit set).
-- The u32 reinterpretation of these f32 bit patterns appears monotonically
-  increasing — but this is an **artifact**: for negative f32 values, larger
-  magnitude ⇒ larger u32 bit pattern. Not fixed-point coordinates.
-- `cumsum(x, y)` does **not** reproduce the PDF vector path shape.
-- No constant scale factor relates cumsum extents to PDF extents across
-  strokes.
-- The u16 field is constant 15360 (f16 = 1.0) for Type A and varies ~14681–15401
-  for Type B — possibly pressure or a timestamp delta, but unconfirmed.
+2 G1 strokes use a non-standard trailer (`…18,12,8,…` layout) and yield 0
+records under the trailer scan; they are filtered out.
 
-Hypotheses tried and rejected: fixed-point reinterpretation (u32/2^k for
-k=16,20,24,28), log-encoding, sqrt-encoding, velocity × constant-dt integration,
-velocity × z-as-dt integration, bfloat16 pairs, running average, trapezoidal
-integration, scale-normalized cumsum, z-as-altitude segmentation.
+#### Table-layout variants (G1)
 
-The stroke **anchor** (f1 = X, Y) is confirmed absolute page position by
-thumbnail overlay; only the intra-stroke path geometry is unsolved. May
-require inspecting the Notability app binary or SDK.
+The f1/f7/f8/f9 field *indices* are stable, but vtable field-offset arrays
+vary with element count:
 
-### 4.5 PDF comparison — anchors confirmed, paths not
+| tsize | vtable (first fields) | count |
+| --- | --- | --- |
+| 44 | `32,24,0,0,0,23,0,19,12,8,…` | 1 728 |
+| 40 | `40,32,0,0,0,31,0,27,20,16,12,8,…` | 432 |
+| 40 | `28,20,0,0,0,0,0,16,12,8,…` | 38 |
+| 44 | `44,36,0,0,35,34,0,30,24,20,…` | 13 |
+| 40 | `40,32,0,0,31,30,0,26,20,16,…` | 11 |
+| 52 | `52,44,…` | 9 |
+| 48 | `48,40,…` | 3 |
+| 32 | `32,24,0,0,23,22,0,18,12,8,…` | 2 (non-standard trailer) |
 
-Matching PDFs were used as an oracle. Findings:
+Always resolve f9 via the vtable (`field(9)`), never via a fixed offset.
+
+### 4.5 PDF/thumbnail comparison — VERIFIED
+
+Matching PDFs and thumbnails were used as oracles. Findings:
 
 - PDF handwriting is **rasterized** (`/Im1 Do`, 0 vector paths) in Cambridge and
   M1; the other 7 PDFs contain **vector** paths using both `l` (lineto) and `c`
   (cubic Bezier) operators.
 - PDF segment counts roughly match .ntb stroke counts (Eth1: 220 strokes vs 230
-  PDF paths; B1: 561 vs 3791 after Bezier subdivision).
+  PDF paths; B1: 563 vs 3791 after Bezier subdivision).
 - PDF paths are drawn with the **identity transform** (page coordinates
   directly); a `cm` scale/flip appears only for embedded images.
 - PDF y-axis is bottom-up; .ntb anchor Y is top-down. `pdf_y = pageH − ntb_Y`
   matches (Eth1 pageH = 841.89).
-- The decisive anchor check is the **thumbnail overlay** (§4.3): page-scaled
+- The decisive check is a **thumbnail overlay** (§4.3, §4.4): page-scaled
   dots at `(f32[0], f32[1)` land on the ink in Eth1/G1/E1; the swapped order
-  scatters over empty margin/grid. An earlier PDF-bbox matching pass that
-  reported ~42% for Eth1 was computed under the swapped reading and is
-  superseded by the overlay evidence.
-- Point-count and bbox-extent comparisons between .ntb and PDF do **not**
-  correlate, because the point coordinates themselves are undecoded.
+  scatters over empty margin/grid. After the f16 path decode, a three-panel
+  overlay (thumbnail | reconstruction | overlay) matches the handwriting on
+  Eth1, G1, and M1 — including red underlines, purple highlighter, and small
+  doodles. Caveat: some thumbnails/PDFs are stale exports (Eth1's thumbnail
+  and PDF contain no ink at all) — the recon itself is the authority once
+  validated.
 - The 24 decoded shapes could **not** be isolated as distinct PDF segments:
   under every transform tried, 0/4 sampled shapes matched a PDF line segment.
   Shapes are mostly template/annotation marks over imported-PDF thumbnails,
@@ -363,13 +385,12 @@ schemas are not yet decoded.
 
 ### 6.1 Rendering (`→` SVG/PDF/PNG)
 
-The format is **partially tractable today**: stroke anchors, widths, and counts
-are decoded; only the intra-stroke path geometry is missing. The Rust reader
-(`src/ntb.rs`) therefore emits each stroke as a 2-point horizontal dash at its
-anchor position — a placeholder that preserves page layout but does not
-reproduce the ink. Full render fidelity is blocked on the coordinate encoding
-(§4.4). Shapes fare better: ellipse/rect/line classification from the f5 vector
-(§4.2) is decoded and emitted as portable-IR shapes with colour + width.
+**Full-fidelity rendering is available.** Stroke anchors, widths, colours, and
+intra-stroke cubic-Bézier paths are all decoded (§4.3, §4.4); the reader emits
+real polylines sampled from the f16 cubics. Renders of Eth1/G1/M1 match the
+handwriting on the corresponding thumbnails (§4.5). Shapes fare as well as
+before: ellipse/rect/line classification from the f5 vector (§4.2) is decoded
+and emitted as portable-IR shapes with colour + width.
 
 Page geometry: `.ntb` notebooks are continuous-scroll; the matching PDF export
 paginates at the paper height from the first nf=2 page definition (A4 841.89 pt
@@ -397,15 +418,15 @@ parser. Verified against all 9 sample notebooks (Notability 16.12.5):
 
 | sample | strokes | point records | shapes |
 | --- | --- | --- | --- |
-| B1 | 561 | 16 744 | 4 |
+| B1 | 563 | 16 800 | 4 |
 | Cambridge | 13 | 321 | 0 |
 | D1 | 1 102 | 21 229 | 2 |
-| E1 | 1 485 | 31 430 | 4 |
+| E1 | 1 523 | 31 506 | 4 |
 | Eth1 | 220 | 4 035 | 2 |
 | F1 | 1 301 | 20 790 | 3 |
-| G1 | 1 790 | 46 343 | 4 |
+| G1 | 2 234 | 63 871 | 4 |
 | M1 | 1 | 54 | 1 |
-| P1 | 631 | 18 059 | 4 |
+| P1 | 641 | 18 198 | 4 |
 
 Public API:
 
@@ -413,43 +434,47 @@ Public API:
 - `ntb::parse_bundle_public(bytes)` → same, from an in-memory `noteBundle`
 - `ntb::paginate(doc, page_h)` → `Vec<NtbPage>` (strokes + shapes split by Y)
 - `ntb::to_pages(doc, page_h)` → `Vec<Page>` (portable IR items with true
-  page dimensions; shapes → ellipse/rect/line, strokes coloured via
-  `rgba_from_u32` with alpha)
+  page dimensions; strokes emitted as decoded Bézier polylines — a lone
+  moveto degenerates to a 2-point zero-length segment; shapes →
+  ellipse/rect/line; colours via `rgba_from_u32` with alpha)
 
-Anchor fields are `(X, Y)` (thumbnail-overlay verified; see §4.3). Renders of
-Eth1/G1 place dash anchors on the handwriting lines of the matching
-thumbnail.
-
-The convert pipeline dispatches `.ntb` files via `is_ntb()`; assets are loaded
-into the document attachment map. Example: `cargo run --bin oblyx -- -f svg,pdf
-ntb/Eth1.ntb`.
+Anchor fields are `(X, Y)` (thumbnail-overlay verified; see §4.3). Point paths
+are f16 cubic-Béziers offset by the anchor and sampled at 12 steps per cubic
+(§4.4); `decode_stroke_points()` in `src/ntb.rs` is the reference
+implementation. The convert pipeline dispatches `.ntb` files via `is_ntb()`;
+assets are loaded into the document attachment map. Example: `cargo run --bin
+oblyx -- -f svg,pdf ntb/Eth1.ntb`.
 
 ## 9. Open problems
 
-1. **Point coordinate encoding** (4.4) — the blocker for render fidelity. The
-   three f32s per point have a velocity-envelope pattern but do not integrate
-   to the PDF path. May require inspecting the Notability app binary or SDK.
-2. **Typed text** (4.2, nf=8) — no user-typed text exists in any of the 9
+1. **Typed text** (4.2, nf=8) — no user-typed text exists in any of the 9
    samples; noteBundles contain only UUIDs, MIME types, and asset-title
    fragments. If the feature exists, its storage is undiscovered.
-3. **Shape position convention** (4.2) — anchor (X, Y) and dims are decoded
+2. **Shape position convention** (4.2) — anchor (X, Y) and dims are decoded
    and render plausibly on the thumbnail, but top-left vs centre placement
    is unconfirmed (0/4 sampled shapes matched PDF line segments).
-4. **nf=12 f11 fill colour** (4.2) — second colour likely means fill; kept
+3. **nf=12 f11 fill colour** (4.2) — second colour likely means fill; kept
    transparent until semantics are confirmed against a rendered shape.
-5. **Rejected nf=11/12 elements** (4.7) — negative-i32 header resolves to a
+4. **Rejected nf=11/12 elements** (4.7) — negative-i32 header resolves to a
    shared table (grid spacing 36.0 in B1); consistent with import grid/table
    marks. Decode fully before emitting.
-6. **nf=1 purpose** — single u32 field (0, 4, or hash). Wrapper envelope matches
+5. **nf=1 purpose** — single u32 field (0, 4, or hash). Wrapper envelope matches
    strokes. Possibly annotations or degenerate strokes.
-7. **nf=4, 7, 13** — undecoded.
-8. **f15 u32 in strokes** — matches neither point count nor byte length;
+6. **nf=4, 7, 13** — undecoded.
+7. **f15 u32 in strokes** — matches neither point count nor byte length;
    purpose unknown.
-9. **u16 in points** — constant f16 1.0 for Type A, varying for Type B; likely
-   pressure or timestamp, unconfirmed.
+8. **u16 width hint in point records** — constant f16 1.0 for Type A, varying
+   for Type B; likely a per-point width/pressure scale (multiplies the table
+   f8 base width) but unused by the renderer today — unconfirmed.
+9. **Non-standard trailers** — 2 G1 strokes have a trailer other than
+   `00 3c ff 00 00` and yield 0 records under the trailer scan; layout
+   `(32,24,0,0,23,22,0,18,12,8,…)`. Currently filtered out.
 10. **Mixed paper sizes** — B1/F1 carry non-A4 first page defs (651×407,
     455×571); pagination uses the first def's height for all slices. Cumulative
     per-def pagination is unimplemented (samples keep all ink within one or
     two slices either way).
 11. **No device validation** — no Notability/GoodNotes round-trip has been
     performed; any future writer must be validated on a real device.
+
+Point coordinate encoding (former open problem 1) is **solved** — see §4.4
+(f16 cubic-Bézier records, trailer-scan count, anchor-relative paths).

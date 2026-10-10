@@ -1,14 +1,16 @@
 //! `.ntb` (Notability cloud) reader.
 //!
 //! Parses the ZIP container, walks the `noteBundle` FlatBuffer, and extracts
-//! handwriting strokes (anchor position, width, point count). The intra-stroke
-//! path geometry is **not** decoded — the three f32s per point have a
-//! velocity-envelope pattern that does not integrate to page coordinates
-//! (see `docs/NOTABILITY_FORMAT.md` §4.4). Strokes are therefore emitted as
-//! zero-length paths at their anchor so the page layout is preserved.
+//! handwriting strokes (anchor position, width, and decoded path geometry).
+//! Intra-stroke paths are cubic Bézier records: each 19-byte record holds
+//! three IEEE-754 half-precision points `(c1, c2, end)` relative to the
+//! stroke anchor (y top-down); record 0 is a moveto whose control points are
+//! clobbered by the stream header, so the path starts at the anchor itself.
+//! See `docs/NOTABILITY_FORMAT.md` §4.4.
 //!
 //! No public prior art exists for this format; the layout below was reverse
-//! engineered from 9 sample notebooks (Notability 16.12.5).
+//! engineered from 9 sample notebooks (Notability 16.12.5) and cross-checked
+//! against the notability.com web app's stroke codec.
 
 use std::io::{Cursor, Read};
 use std::path::Path;
@@ -93,13 +95,16 @@ const STROKE_F9_POINTS: usize = 9; // uoffset to point blob
 const POINT_TRAILER: [u8; 5] = [0x00, 0x3c, 0xff, 0x00, 0x00];
 /// Bytes per point record.
 const POINT_STRIDE: usize = 19;
+/// Bézier samples emitted per cubic record when decoding paths to polylines.
+const BEZIER_SAMPLES: usize = 12;
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-/// A decoded handwriting stroke. `points` is empty until the coordinate
-/// encoding is solved; `anchor` is the verified absolute page position.
+/// A decoded handwriting stroke. `points` holds the sampled absolute page
+/// path (anchor + relative Bézier geometry); `anchor` is the verified
+/// absolute page position of the path origin.
 #[derive(Debug, Clone)]
 pub struct NtbStroke {
     /// Absolute page X (left-right), points.
@@ -108,9 +113,10 @@ pub struct NtbStroke {
     pub anchor_y: f32,
     /// Stroke width in points.
     pub width: f32,
-    /// Number of point records in the blob (the raw path length).
+    /// Number of 19-byte point records in the blob (the raw path length).
     pub point_count: usize,
-    /// Decoded path points. Currently always empty — see module docs.
+    /// Decoded absolute page path, sampled from the cubic Bézier records.
+    /// Empty when the blob carries no trailer-verified records.
     pub points: Vec<[f32; 2]>,
     /// Raw colour u32 (`0xAABBGGRR`, i.e. LE bytes are R,G,B,A) when the
     /// stroke table carries one (fields f5/f7); `None` → default black.
@@ -591,11 +597,14 @@ fn parse_stroke(b: &Buf, tp: usize, fields: &[u16]) -> Result<NtbStroke> {
         0.0
     };
 
-    // f9: uoffset to the point blob, at tp + tsize.
-    let table_size = infer_table_size(fields);
+    // f9: uoffset to the point blob. Follow the uoffset from the field slot —
+    // the target is NOT always at tp+tsize (shifted Type B layouts store a
+    // larger table with f9 pointing past it).
     let (point_count, points) = if field(STROKE_F9_POINTS) != 0 {
-        let blob = tp + table_size;
-        count_points(b.d, blob)
+        match b.follow(tp + field(STROKE_F9_POINTS)) {
+            Ok(blob) => decode_stroke_points(b.d, blob, anchor_x, anchor_y),
+            Err(_) => (0, Vec::new()),
+        }
     } else {
         (0, Vec::new())
     };
@@ -618,38 +627,91 @@ fn parse_stroke(b: &Buf, tp: usize, fields: &[u16]) -> Result<NtbStroke> {
     })
 }
 
-/// Infer the table size from the vtable: the blob starts at tp + tsize, and
-/// the largest field offset + its size gives a lower bound. For Type A tsize=44
-/// and Type B tsize=40; both have their largest field at offset 32 (Type A f0)
-/// or 28 (Type B f0), so tsize = max_field_off + 4 rounded up works, but the
-/// reliable rule is: tsize is the value stored at vtable+2. We recompute it
-/// from the caller — here we just use the known constants via field layout.
-fn infer_table_size(fields: &[u16]) -> usize {
-    // Type A: largest offset 32, tsize 44. Type B: largest offset 28, tsize 40.
-    // tsize = largest_offset + 12 in both cases (32+12=44, 28+12=40).
-    let max_off = fields.iter().copied().max().unwrap_or(0) as usize;
-    max_off + 12
-}
-
-/// Count point records in a blob using the 5-byte trailer at offset 14 of each
-/// 19-byte record. Returns `(count, decoded_points)`; `decoded_points` is
-/// always empty because the coordinate encoding is unsolved.
+/// Decode the point blob at `blob` into `(record_count, absolute_points)`.
 ///
-/// Only trailer-verified records are counted — the header byte at `blob+5`
-/// also stores the count, but trusting it alone admits false positives from
-/// non-stroke blobs that happen to have a non-zero byte at that offset.
-fn count_points(d: &[u8], blob: usize) -> (usize, Vec<[f32; 2]>) {
-    if blob + 8 > d.len() {
-        return (0, Vec::new());
-    }
-    let mut count = 0;
+/// Layout (validated against 9 notebooks + the web-app stroke codec):
+/// the blob is a stream of 19-byte records. Record 0's first 8 bytes are
+/// clobbered by the stream header (`u32` byte-length ≈ 19n−5, then the record
+/// count); its last point is `(0, 0)` — the path origin. Records 1..n are
+/// cubic Béziers: three IEEE-754 half-precision points `(c1, c2, end)`,
+/// anchor-relative with y top-down, followed by a `u16` width hint and the
+/// constant 5-byte trailer. The record count is found by scanning for the
+/// trailer at 19-byte stride (the header length field is unreliable).
+///
+/// Points are returned in absolute page coordinates (anchor + relative),
+/// sampled at [`BEZIER_SAMPLES`] steps per cubic.
+fn decode_stroke_points(d: &[u8], blob: usize, anchor_x: f32, anchor_y: f32) -> (usize, Vec<[f32; 2]>) {
+    // Count records via trailer scan (ground truth; the header length admits
+    // false positives on non-stroke blobs).
+    let mut count = 0usize;
     let mut p = blob;
     while p + POINT_STRIDE <= d.len() && d[p + 14..p + 19] == POINT_TRAILER {
         count += 1;
         p += POINT_STRIDE;
     }
-    // Path geometry not decoded — see module docs.
-    (count, Vec::new())
+    if count == 0 {
+        return (0, Vec::new());
+    }
+    // rec0 = moveto at the anchor; rec1..count−1 = cubics.
+    let mut points = Vec::with_capacity(count.saturating_mul(BEZIER_SAMPLES));
+    points.push([anchor_x, anchor_y]);
+    let mut cur = [0.0f32, 0.0f32]; // relative
+    for k in 1..count {
+        let off = blob + k * POINT_STRIDE;
+        let c1 = read_f16_point(d, off);
+        let c2 = read_f16_point(d, off + 4);
+        let end = read_f16_point(d, off + 8);
+        match (c1, c2, end) {
+            (Some(c1), Some(c2), Some(end)) => {
+                for i in 1..=BEZIER_SAMPLES {
+                    let t = i as f32 / BEZIER_SAMPLES as f32;
+                    let u = 1.0 - t;
+                    let (ur, ut) = (u * u, t * t);
+                    let x = u * ur * cur[0] + 3.0 * ur * t * c1[0] + 3.0 * u * ut * c2[0] + t * ut * end[0];
+                    let y = u * ur * cur[1] + 3.0 * ur * t * c1[1] + 3.0 * u * ut * c2[1] + t * ut * end[1];
+                    points.push([anchor_x + x, anchor_y + y]);
+                }
+                cur = end;
+            }
+            _ => {
+                // Non-finite half somewhere in the record — fall through as a
+                // straight segment to the end point when only that is finite.
+                if let Some(end) = end {
+                    points.push([anchor_x + end[0], anchor_y + end[1]]);
+                    cur = end;
+                }
+            }
+        }
+    }
+    (count, points)
+}
+
+/// Read an IEEE-754 half-precision point `(x, y)` at `off`. Returns `None`
+/// when out of bounds or when either component is non-finite.
+fn read_f16_point(d: &[u8], off: usize) -> Option<[f32; 2]> {
+    let xb = d.get(off..off + 2)?;
+    let yb = d.get(off + 2..off + 4)?;
+    let x = f16_to_f32(u16::from_le_bytes([xb[0], xb[1]]));
+    let y = f16_to_f32(u16::from_le_bytes([yb[0], yb[1]]));
+    if x.is_finite() && y.is_finite() { Some([x, y]) } else { None }
+}
+
+/// Convert an IEEE-754 binary16 bit pattern to `f32`.
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+    let exp = ((bits >> 10) & 0x1F) as i32;
+    let frac = (bits & 0x3FF) as f32;
+    match exp {
+        0 => sign * frac * (2.0f32).powi(-24),
+        31 => {
+            if frac == 0.0 {
+                sign * f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        }
+        _ => sign * (1.0 + frac / 1024.0) * (2.0f32).powi(exp - 15),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -725,11 +787,10 @@ pub fn parse_bundle_public(bundle: &[u8]) -> Result<BundleParts> {
 /// When the notebook contains page definitions (nf=2), the first page's height
 /// is used for pagination; otherwise `page_h` is the fallback.
 ///
-/// Strokes are emitted as 2-point horizontal dashes at their anchor position,
-/// because the intra-stroke path geometry is not yet decoded (see module
-/// docs). The dash length equals the stroke width, so the page layout is
-/// preserved as a field of position-weighted marks. Stroke colours come from
-/// the element colour field (`0xAABBGGRR`) and default to opaque black.
+/// Strokes are emitted with their decoded cubic-Bézier paths (sampled to
+/// polylines). A 1-record stroke (moveto only) degenerates to a zero-length
+/// mark at its anchor. Stroke colours come from the element colour field
+/// (`0xAABBGGRR`) and default to opaque black.
 ///
 /// Shapes are emitted as [`ShapeEl`] rectangles/ellipses sized from the f5
 /// geometry vector, or as 2-point [`Item::Stroke`] lines when the vector
@@ -755,8 +816,15 @@ pub fn to_pages(doc: &NtbDocument, page_h: f32) -> Vec<Page> {
                     } else {
                         1.0
                     };
+                    // Real path when decoded; a lone moveto becomes a
+                    // zero-length mark so the position is still visible.
+                    let points = if s.points.len() >= 2 {
+                        s.points.clone()
+                    } else {
+                        vec![[s.anchor_x, s.anchor_y], [s.anchor_x, s.anchor_y]]
+                    };
                     Item::Stroke(Stroke {
-                        points: vec![[s.anchor_x, s.anchor_y], [s.anchor_x + w, s.anchor_y]],
+                        points,
                         width: w,
                         rgba: s.color.map(rgba_from_u32).unwrap_or(BLACK),
                         dash: None,
