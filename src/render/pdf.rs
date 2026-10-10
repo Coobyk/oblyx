@@ -2,7 +2,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::io::Cursor;
 
-use crate::doc::{Document, Item, PAGE_H, PAGE_W, Page, ShapeEl, ShapeKind};
+use lopdf::{Document as PdfDoc, ObjectId};
+
+use crate::doc::{Document, Item, PAGE_H, PAGE_W, Page, PdfBgEl, ShapeEl, ShapeKind};
+use crate::pdfinput;
 use crate::geom;
 use crate::render::png::decode_rgba_image;
 
@@ -362,6 +365,8 @@ fn page_content(page: &Page, ctx: &Ctx) -> String {
                 num(&mut s, PAGE_H - im.y - im.h);
                 let _ = write!(s, " cm\n/Im{obj} Do\nQ\n");
             }
+            // Embedded in a post-pass so Form XObjects can be imported via lopdf.
+            Item::PdfBackground(_) => {}
             Item::Sticky(st) => {
                 s.push_str("q\n");
                 for c in 0..3 {
@@ -508,6 +513,15 @@ pub fn document_to_pdf_with(
     pages: &[Page],
     doc: &Document,
     mut on_page: impl FnMut(usize),
+) -> Vec<u8> {
+    let bytes = document_to_pdf_ink(pages, doc, &mut on_page);
+    embed_pdf_backgrounds(bytes, pages, doc)
+}
+
+fn document_to_pdf_ink(
+    pages: &[Page],
+    doc: &Document,
+    on_page: &mut impl FnMut(usize),
 ) -> Vec<u8> {
     let mut img_order: Vec<&String> = Vec::new();
     let mut inline: HashMap<&str, &[u8]> = HashMap::new();
@@ -690,4 +704,136 @@ pub fn document_to_pdf_with(
             .as_bytes(),
     );
     out
+}
+
+/// Import each [`Item::PdfBackground`] as a Form XObject and draw it under the
+/// ink, inside the existing page-space scale transform.
+fn embed_pdf_backgrounds(bytes: Vec<u8>, pages: &[Page], doc: &Document) -> Vec<u8> {
+    let has_bg = pages
+        .iter()
+        .any(|p| p.items.iter().any(|i| matches!(i, Item::PdfBackground(_))));
+    if !has_bg {
+        return bytes;
+    }
+    let Ok(mut out) = PdfDoc::load_mem(&bytes) else {
+        crate::vlog!(1, "pdf backgrounds: could not re-open ink PDF for embedding");
+        return bytes;
+    };
+
+    let out_pages = out.get_pages();
+    let mut src_cache: HashMap<String, PdfDoc> = HashMap::new();
+    let mut form_cache: HashMap<(String, u64), (ObjectId, [f32; 4])> = HashMap::new();
+
+    for (page_idx, page) in pages.iter().enumerate() {
+        let bgs: Vec<&PdfBgEl> = page
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::PdfBackground(bg) => Some(bg),
+                _ => None,
+            })
+            .collect();
+        if bgs.is_empty() {
+            continue;
+        }
+        let page_no = (page_idx + 1) as u32;
+        let Some(&page_id) = out_pages.get(&page_no) else {
+            continue;
+        };
+
+        let mut draw = String::new();
+        for bg in bgs {
+            let key = (bg.attachment.clone(), bg.pdf_page);
+            let (form_id, bbox) = if let Some(&hit) = form_cache.get(&key) {
+                hit
+            } else {
+                if !src_cache.contains_key(&bg.attachment) {
+                    let Some(att) = doc.attachments.get(&bg.attachment) else {
+                        crate::vlog!(1, "pdf background {}: attachment missing", bg.attachment);
+                        continue;
+                    };
+                    let Some(src) = pdfinput::load_pdf(att) else {
+                        crate::vlog!(1, "pdf background {}: failed to parse PDF", bg.attachment);
+                        continue;
+                    };
+                    src_cache.insert(bg.attachment.clone(), src);
+                }
+                let Some(src) = src_cache.get(&bg.attachment) else {
+                    continue;
+                };
+                let Some(imported) =
+                    pdfinput::import_page_as_form(src, bg.pdf_page as u32, &mut out)
+                else {
+                    crate::vlog!(
+                        1,
+                        "pdf background {}:{}: import failed",
+                        bg.attachment,
+                        bg.pdf_page
+                    );
+                    continue;
+                };
+                form_cache.insert(key, imported);
+                imported
+            };
+
+            let name = format!("PBg{}", form_id.0);
+            if let Err(e) = out.add_xobject(page_id, name.as_bytes(), form_id) {
+                crate::vlog!(1, "pdf background: add_xobject failed: {e}");
+                continue;
+            }
+
+            let bw = (bbox[2] - bbox[0]).max(1.0);
+            let bh = (bbox[3] - bbox[1]).max(1.0);
+            draw.push_str("q\n");
+            num(&mut draw, bg.w / bw);
+            draw.push_str(" 0 0 ");
+            num(&mut draw, bg.h / bh);
+            draw.push(' ');
+            num(&mut draw, bg.x);
+            draw.push(' ');
+            num(&mut draw, PAGE_H - bg.y - bg.h);
+            let _ = write!(draw, " cm\n/{name} Do\nQ\n");
+        }
+
+        if draw.is_empty() {
+            continue;
+        }
+        let content = out.get_page_content(page_id);
+        let content_str = String::from_utf8_lossy(&content);
+        let new_content = insert_after_white_fill(&content_str, &draw);
+        if let Err(e) = out.change_page_content(page_id, new_content.into_bytes()) {
+            crate::vlog!(1, "pdf background: change_page_content failed: {e}");
+        }
+    }
+
+    let mut buf = Vec::new();
+    match out.save_to(&mut buf) {
+        Ok(()) => buf,
+        Err(e) => {
+            crate::vlog!(1, "pdf backgrounds: save failed: {e}");
+            bytes
+        }
+    }
+}
+
+/// Insert `prefix` after the white page fill so backgrounds sit under ink but
+/// above the blank page paint.
+fn insert_after_white_fill(content: &str, prefix: &str) -> String {
+    const MARKER: &str = "1 1 1 rg\n";
+    const END: &str = "f\nQ\n";
+    if let Some(i) = content.find(MARKER)
+        && let Some(rel) = content[i..].find(END)
+    {
+        let at = i + rel + END.len();
+        let mut s = String::with_capacity(content.len() + prefix.len());
+        s.push_str(&content[..at]);
+        s.push_str(prefix);
+        s.push_str(&content[at..]);
+        return s;
+    }
+    // Fallback: paint backgrounds at the start of the content stream.
+    let mut s = String::with_capacity(content.len() + prefix.len());
+    s.push_str(prefix);
+    s.push_str(content);
+    s
 }

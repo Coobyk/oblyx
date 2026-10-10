@@ -12,3 +12,5 @@ crate-type = ["cdylib"]
 [dependencies]
 oblyx = { path = ".." }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+# Matches the wasm getrandom backend configured in ../.cargo/config.toml.
+getrandom = { version = "0.4", default-features = false }

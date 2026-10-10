@@ -521,6 +521,8 @@ pub fn page_to_png(page: &Page, doc: &Document, scale: f32) -> Result<Vec<u8>> {
                     crate::vlog!(1, "asset {}: attachment missing, skipped", im.attachment);
                 }
             }
+            // PDF page backgrounds are embedded only in PDF output for now.
+            Item::PdfBackground(_) => {}
             Item::Sticky(st) => draw_sticky(&mut pm, st, scale),
             Item::Text(t) => draw_text(&mut pm, t, scale),
             Item::Background(bg) => draw_background(&mut pm, bg, scale),

@@ -1,0 +1,4 @@
+# getrandom (via lopdf → rand) needs an explicit wasm backend.
+# "custom" keeps us on raw WASM without wasm-bindgen (see web/src/lib.rs).
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="custom"']

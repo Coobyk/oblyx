@@ -8,6 +8,23 @@
 //!   `oblyx_convert` writes straight into an in-memory zip) → `oblyx_pack_zip`
 //!   → OUT holds the packed archive.
 
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+unsafe extern "Rust" fn __getrandom_v03_custom(
+    dest: *mut u8,
+    len: usize,
+) -> Result<(), getrandom::Error> {
+    // lopdf only needs entropy for encrypted PDFs; GoodNotes attachments are
+    // not encrypted. A deterministic fill keeps us on raw WASM (no wbg).
+    let buf = unsafe { std::slice::from_raw_parts_mut(dest, len) };
+    let mut x = 0xA5u8;
+    for b in buf {
+        x = x.wrapping_mul(37).wrapping_add(17);
+        *b = x;
+    }
+    Ok(())
+}
+
 use std::cell::RefCell;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -17,7 +34,7 @@ use oblyx::doc::{Document, Page};
 use oblyx::render::pdf::document_to_pdf_with;
 use oblyx::render::svg::page_to_svg;
 
-/// Matches the native CLI default; pdf.js renders at `scale = DPI / 72`.
+/// Matches the native CLI default (used when decoding pages).
 const DPI: f32 = 144.0;
 
 const PHASE_DECODE: u32 = 0;
@@ -47,7 +64,6 @@ struct ArchEntry {
 
 thread_local! {
     static DOC: RefCell<Option<Document>> = const { RefCell::new(None) };
-    static JOBS: RefCell<Vec<(String, u64)>> = const { RefCell::new(Vec::new()) };
     static OUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static ARCHIVE: RefCell<Option<zip::ZipArchive<Cursor<Vec<u8>>>>> =
         const { RefCell::new(None) };
@@ -108,7 +124,7 @@ pub extern "C" fn oblyx_free(ptr: *mut u8, len: usize) {
     }
 }
 
-/// Parse the archive. OUT becomes `{"pages":N,"jobs":[["att-uuid",page],…]}`.
+/// Parse the archive. OUT becomes `{"pages":N}`.
 #[unsafe(no_mangle)]
 pub extern "C" fn oblyx_open(ptr: *mut u8, len: usize) -> i32 {
     clear_archive();
@@ -118,16 +134,7 @@ pub extern "C" fn oblyx_open(ptr: *mut u8, len: usize) -> i32 {
 fn open_doc(data: Vec<u8>) -> i32 {
     match Document::from_bytes(data) {
         Ok(doc) => {
-            let jobs = doc.pdf_raster_jobs();
-            let mut json = format!("{{\"pages\":{},\"jobs\":[", doc.pages.len());
-            for (i, (att, page)) in jobs.iter().enumerate() {
-                if i > 0 {
-                    json.push(',');
-                }
-                json.push_str(&format!("[\"{att}\",{page}]"));
-            }
-            json.push_str("]}");
-            JOBS.with(|j| *j.borrow_mut() = jobs);
+            let json = format!("{{\"pages\":{}}}", doc.pages.len());
             DOC.with(|d| *d.borrow_mut() = Some(doc));
             set_out(json.into_bytes())
         }
@@ -179,7 +186,6 @@ pub extern "C" fn oblyx_open_archive(ptr: *mut u8, len: usize) -> i32 {
     }
     json.push_str("]}");
     DOC.with(|d| *d.borrow_mut() = None);
-    JOBS.with(|j| *j.borrow_mut() = Vec::new());
     CURRENT.with(|c| *c.borrow_mut() = None);
     SINK.with(|s| *s.borrow_mut() = None);
     ARCHIVE.with(|a| *a.borrow_mut() = Some(archive));
@@ -216,14 +222,14 @@ pub extern "C" fn oblyx_set_member(ptr: *mut u8, len: usize) -> i32 {
 }
 
 /// Open one notebook's bytes without dropping an in-progress output archive.
-/// OUT becomes the same jobs JSON as `oblyx_open`.
+/// OUT becomes the same JSON as `oblyx_open`.
 #[unsafe(no_mangle)]
 pub extern "C" fn oblyx_open_member(ptr: *mut u8, len: usize) -> i32 {
     open_doc(take_input(ptr, len))
 }
 
 /// Load archive entry `index` (order from `oblyx_open_archive`). OUT becomes
-/// the same jobs JSON as `oblyx_open`.
+/// the same JSON as `oblyx_open`.
 #[unsafe(no_mangle)]
 pub extern "C" fn oblyx_open_entry(index: u32) -> i32 {
     let entry = ENTRIES.with(|e| e.borrow().get(index as usize).cloned());
@@ -250,37 +256,6 @@ pub extern "C" fn oblyx_open_entry(index: u32) -> i32 {
         }
         Err(e) => fail(e),
     }
-}
-
-/// OUT becomes the raw bytes of a PDF attachment (fed to pdf.js).
-#[unsafe(no_mangle)]
-pub extern "C" fn oblyx_attachment(ptr: *mut u8, len: usize) -> i32 {
-    let uuid = String::from_utf8_lossy(&take_input(ptr, len)).into_owned();
-    let bytes = DOC.with(|d| {
-        d.borrow()
-            .as_ref()
-            .and_then(|doc| doc.attachments.get(&uuid).map(|b| (**b).clone()))
-    });
-    match bytes {
-        Some(b) => set_out(b),
-        None => fail(format!("unknown attachment {uuid}")),
-    }
-}
-
-/// Store a pdf.js-rendered JPEG for job `index` (order from `oblyx_open`).
-#[unsafe(no_mangle)]
-pub extern "C" fn oblyx_set_raster(index: u32, ptr: *mut u8, len: usize) -> i32 {
-    let jpeg = take_input(ptr, len);
-    let Some(job) = JOBS.with(|j| j.borrow().get(index as usize).cloned()) else {
-        return fail(format!("no raster job {index}"));
-    };
-    DOC.with(|d| match d.borrow().as_ref() {
-        Some(doc) => match doc.set_page_raster(&job.0, job.1, DPI, jpeg) {
-            Ok(()) => set_out(Vec::new()),
-            Err(e) => fail(format!("store raster: {e:#}")),
-        },
-        None => fail("no document".into()),
-    })
 }
 
 /// Decode every page, then render. For a single notebook OUT becomes the PDF

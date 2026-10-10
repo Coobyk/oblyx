@@ -111,6 +111,8 @@ pub fn page_to_svg(page: &Page, doc: &Document) -> String {
                     im.x, im.y, im.w, im.h
                 );
             }
+            // PDF page backgrounds are embedded only in PDF output for now.
+            Item::PdfBackground(_) => {}
             Item::Sticky(st) => {
                 let _ = write!(
                     s,

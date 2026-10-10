@@ -10,7 +10,7 @@ Not affiliated with or endorsed by GoodNotes.
   Catmull-Rom interpolation so curves stay rounded instead of polygonal
 - Embedded images (JPEG/PNG attachments and frames)
 - Sticky notes, text boxes and equations
-- Multi-page PDF with embedded images and text
+- Multi-page PDF with embedded images, text, and vector PDF page backgrounds
 - Bulk conversion: pass files and/or directories (scanned recursively)
 - Fast: parallel decoding and rendering across CPU cores
 

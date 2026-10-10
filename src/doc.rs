@@ -1,8 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -47,35 +46,14 @@ pub struct Document {
     /// Paper rectangles per background attachment, parsed once and shared
     /// across every page (backgrounds can be a 300 MB PDF).
     paper_cache: Mutex<HashMap<usize, Arc<PaperRects>>>,
-    /// Temp copies of PDF attachments for pdftoppm, keyed by attachment
-    /// pointer so aliased attachment uuids share one file.
-    pdf_temps: Mutex<HashMap<usize, PathBuf>>,
-    /// Single-flight raster results keyed by (attachment ptr, pdf page, dpi).
-    /// Several notebook pages can share one PDF page (copied pages); without
-    /// this they race on the same pdftoppm output file and corrupt/lose it.
-    raster_cache: Mutex<HashMap<(usize, u64, u32), RasterCell>>,
-    /// Per-document nonce so temp names never collide across processes.
-    /// Unused on wasm, where `temp_pdf`/pdftoppm do not exist.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    temp_tag: u64,
-}
-
-static DOC_TAG: AtomicU64 = AtomicU64::new(0);
-
-impl Drop for Document {
-    fn drop(&mut self) {
-        if let Ok(temps) = self.pdf_temps.lock() {
-            for path in temps.values() {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
 pub enum Item {
     Stroke(Stroke),
     Image(ImageEl),
+    /// Vector PDF page used as a notebook background (embedded, not rasterized).
+    PdfBackground(PdfBgEl),
     Sticky(Sticky),
     Text(TextBox),
     Shape(ShapeEl),
@@ -83,6 +61,22 @@ pub enum Item {
     FillPath(FillPathEl),
     Connector(ConnectorEl),
     Background(Background),
+}
+
+/// A page from a PDF attachment, placed as a background on a notebook page.
+#[derive(Debug, Clone)]
+pub struct PdfBgEl {
+    pub attachment: String,
+    /// 1-based page index inside the PDF attachment.
+    pub pdf_page: u64,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Source page width in PDF points (viewer orientation).
+    pub src_w: f32,
+    /// Source page height in PDF points (viewer orientation).
+    pub src_h: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -157,8 +151,8 @@ pub struct ImageEl {
     pub w: f32,
     pub h: f32,
     pub from_frame: bool,
-    /// Inline image data (rasterized PDF page) when the bytes are not part of
-    /// the shared document attachment map.
+    /// Inline image data when the bytes are not part of the shared document
+    /// attachment map (e.g. decoded frame assets).
     pub bytes: Option<Arc<Vec<u8>>>,
 }
 
@@ -190,8 +184,6 @@ pub struct Page {
 type Zip = ZipArchive<BufReader<File>>;
 /// `(x, y, w, h, rgb)` per paper rectangle.
 type PaperRects = Vec<(f32, f32, f32, f32, [f32; 3])>;
-/// Single-flight result of rasterizing one PDF page.
-type RasterCell = Arc<Mutex<Option<Arc<Vec<u8>>>>>;
 /// `(configs, page_cfgs)` as returned by [`parse_events`].
 type EventsIndex = (
     HashMap<String, (String, Option<u64>)>,
@@ -269,6 +261,51 @@ fn parse_events(raw: &[u8]) -> Result<EventsIndex> {
 }
 
 impl Document {
+    /// Place a PDF attachment page as a centred, fit-to-page background item.
+    fn push_pdf_background(
+        &self,
+        items: &mut Vec<Item>,
+        page_uuid: &str,
+        page_w: f32,
+        page_h: f32,
+    ) -> bool {
+        let Some(cfg) = self.page_cfg.get(page_uuid) else {
+            return false;
+        };
+        let Some(att) = self.attachments.get(&cfg.attachment) else {
+            return false;
+        };
+        let Some(pdf_page) = cfg.pdf_page else {
+            return false;
+        };
+        if !att.starts_with(b"%PDF-") {
+            return false;
+        }
+        let Some((src_w, src_h)) = pdfinput::page_size(att, pdf_page) else {
+            crate::vlog!(
+                1,
+                "page {page_uuid}: could not read PDF page {pdf_page} size"
+            );
+            return false;
+        };
+        let s = (page_w / src_w).min(page_h / src_h);
+        let (w, h) = (src_w * s, src_h * s);
+        items.insert(
+            0,
+            Item::PdfBackground(PdfBgEl {
+                attachment: cfg.attachment.clone(),
+                pdf_page,
+                x: (page_w - w) / 2.0,
+                y: (page_h - h) / 2.0,
+                w,
+                h,
+                src_w,
+                src_h,
+            }),
+        );
+        true
+    }
+
     pub fn open(path: &Path) -> Result<Document> {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let z = Zip::new(BufReader::new(file))
@@ -350,104 +387,7 @@ impl Document {
             attachments,
             page_cfg,
             paper_cache: Mutex::new(HashMap::new()),
-            pdf_temps: Mutex::new(HashMap::new()),
-            raster_cache: Mutex::new(HashMap::new()),
-            temp_tag: DOC_TAG.fetch_add(1, Ordering::Relaxed),
         })
-    }
-
-    /// Temp copy of a PDF attachment for pdftoppm, created once per document
-    /// (aliased attachment uuids share the same bytes and thus one file).
-    /// Not available on wasm — rasterizations are injected from JavaScript.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn temp_pdf(&self, att: &Arc<Vec<u8>>) -> Option<PathBuf> {
-        let key = Arc::as_ptr(att) as usize;
-        let mut temps = self.pdf_temps.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(path) = temps.get(&key) {
-            return Some(path.clone());
-        }
-        let dir = pdfinput::pdf_cache_dir();
-        pdfinput::sweep_stale(&dir);
-        let path = dir.join(format!(
-            "oblyx-{}-{}-{:x}.pdf",
-            std::process::id(),
-            self.temp_tag,
-            key
-        ));
-        if let Err(e) = pdfinput::write_temp_pdf(&path, att) {
-            crate::vlog!(1, "temp pdf write failed: {e:#}");
-            return None;
-        }
-        temps.insert(key, path.clone());
-        Some(path)
-    }
-
-    /// Single-flight rasterization of a PDF page: concurrent decode threads
-    /// requesting the same (attachment, page, dpi) share one pdftoppm run
-    /// instead of racing on its output file.
-    fn raster_page(&self, att: &Arc<Vec<u8>>, pdf_page: u64, dpi: f32) -> Option<Arc<Vec<u8>>> {
-        let key = (Arc::as_ptr(att) as usize, pdf_page, dpi.to_bits());
-        let cell = {
-            let mut cache = self.raster_cache.lock().unwrap_or_else(|e| e.into_inner());
-            Arc::clone(cache.entry(key).or_default())
-        };
-        let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(hit) = guard.as_ref() {
-            return Some(Arc::clone(hit));
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        let bytes = self
-            .temp_pdf(att)
-            .and_then(|temp| pdfinput::rasterize_pdf_page(&temp, pdf_page, dpi).map(Arc::new));
-        #[cfg(target_arch = "wasm32")]
-        let bytes: Option<Arc<Vec<u8>>> = None;
-        let bytes = bytes?;
-        *guard = Some(Arc::clone(&bytes));
-        Some(bytes)
-    }
-
-    /// Unique `(attachment uuid, 1-based PDF page)` pairs whose pages show a
-    /// PDF background — the work list a caller must rasterize before decoding
-    /// (pdftoppm on native, pdf.js in the browser).
-    pub fn pdf_raster_jobs(&self) -> Vec<(String, u64)> {
-        let mut seen: HashSet<(String, u64)> = HashSet::new();
-        let mut jobs = Vec::new();
-        for page in &self.pages {
-            let Some(cfg) = self.page_cfg.get(&page.uuid) else {
-                continue;
-            };
-            let Some(att) = self.attachments.get(&cfg.attachment) else {
-                continue;
-            };
-            let (Some(pdf_page), true) = (cfg.pdf_page, att.starts_with(b"%PDF-")) else {
-                continue;
-            };
-            if seen.insert((cfg.attachment.clone(), pdf_page)) {
-                jobs.push((cfg.attachment.clone(), pdf_page));
-            }
-        }
-        jobs
-    }
-
-    /// Store a caller-rendered JPEG for a PDF background page (keyed like
-    /// `raster_page`), so `decode_page` picks it up without pdftoppm.
-    pub fn set_page_raster(
-        &self,
-        attachment: &str,
-        pdf_page: u64,
-        dpi: f32,
-        jpeg: Vec<u8>,
-    ) -> Result<()> {
-        let att = self
-            .attachments
-            .get(attachment)
-            .with_context(|| format!("unknown attachment {attachment}"))?;
-        let key = (Arc::as_ptr(att) as usize, pdf_page, dpi.to_bits());
-        let mut cache = self.raster_cache.lock().unwrap_or_else(|e| e.into_inner());
-        let cell = RasterCell::default();
-        *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(jpeg));
-        cache.insert(key, cell);
-        Ok(())
     }
 
     /// Paper rectangles for a background attachment, computed once per file.
@@ -579,39 +519,8 @@ impl Document {
             }
         }
 
-        if let Some(cfg) = self.page_cfg.get(&src.uuid)
-            && let Some(att) = self.attachments.get(&cfg.attachment)
-            && let Some(pdf_page) = cfg.pdf_page
-            && att.starts_with(b"%PDF-")
-            && let Some(bytes) = self.raster_page(att, pdf_page, dpi)
-        {
-            match pdfinput::jpeg_size(&bytes) {
-                Some((pw, ph)) => {
-                    let (pw, ph) = (pw as f32, ph as f32);
-                    let s = (PAGE_W / pw).min(PAGE_H / ph);
-                    let (w, h) = (pw * s, ph * s);
-                    out.insert(
-                        0,
-                        Item::Image(ImageEl {
-                            attachment: format!("pdf:{}:{pdf_page}", cfg.attachment),
-                            x: (PAGE_W - w) / 2.0,
-                            y: (PAGE_H - h) / 2.0,
-                            w,
-                            h,
-                            from_frame: false,
-                            bytes: Some(bytes),
-                        }),
-                    );
-                }
-                None => {
-                    crate::vlog!(
-                        1,
-                        "page {}: raster of pdf page {pdf_page} unreadable",
-                        src.uuid
-                    );
-                }
-            }
-        }
+        let _ = dpi; // retained for API stability; PDF backgrounds are vector
+        self.push_pdf_background(&mut out, &src.uuid, PAGE_W, PAGE_H);
         if let Some(cfg) = self.page_cfg.get(&src.uuid)
             && let Some(att) = self.attachments.get(&cfg.attachment)
         {
@@ -631,7 +540,7 @@ impl Document {
             for it in &out {
                 match it {
                     Item::Stroke(_) => strokes += 1,
-                    Item::Image(_) => images += 1,
+                    Item::Image(_) | Item::PdfBackground(_) => images += 1,
                     Item::Text(_) => texts += 1,
                     Item::Shape(_) => shapes += 1,
                     _ => {}
