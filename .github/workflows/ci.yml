@@ -1,0 +1,176 @@
+# Desktop binaries (CLI + GUI) for Linux / macOS / Windows, plus Pages deploy.
+# - push to main: upload build artifacts + deploy the web app
+# - tag v*: publish those binaries as a GitHub Release
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: desktop (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: linux-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: macos-arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            name: macos-x64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: windows-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux GUI deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxcb1-dev \
+            libxcb-xkb-dev \
+            libxcb-xfixes0-dev \
+            libxcb-shape0-dev \
+            libxcb-render0-dev \
+            libxcb-keysyms1-dev \
+            libx11-xcb-dev \
+            libwayland-dev \
+            libfontconfig1-dev
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-${{ matrix.target }}
+          cache-targets: false
+
+      - name: Build CLI
+        run: cargo build --release --target ${{ matrix.target }} --bin oblyx
+
+      - name: Build GUI
+        run: cargo build --release --target ${{ matrix.target }} --features gui --bin oblyx-gui
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="oblyx-${{ matrix.name }}"
+          mkdir -p "$staging"
+          ext=""
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            ext=".exe"
+          fi
+          cp "target/${{ matrix.target }}/release/oblyx${ext}" "$staging/"
+          cp "target/${{ matrix.target }}/release/oblyx-gui${ext}" "$staging/"
+          if command -v strip >/dev/null 2>&1 && [[ "${{ runner.os }}" != "Windows" ]]; then
+            strip "$staging/oblyx${ext}" "$staging/oblyx-gui${ext}" || true
+          fi
+          {
+            echo "oblyx ${{ github.ref_name }} (${{ matrix.name }})"
+            echo
+            echo "- oblyx${ext}      CLI converter"
+            echo "- oblyx-gui${ext}  native GUI"
+            echo
+            echo "CLI:  ./oblyx${ext} -f pdf notebook.goodnotes"
+            echo "GUI:  ./oblyx-gui${ext}"
+          } > "$staging/README.txt"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            7z a -tzip "${staging}.zip" "$staging"
+            echo "ASSET=${staging}.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "${staging}.tar.gz" "$staging"
+            echo "ASSET=${staging}.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oblyx-${{ matrix.name }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  pages:
+    name: deploy pages
+    runs-on: ubuntu-latest
+    # Skip Pages deploy on version tags; those are for desktop releases.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/ui/package-lock.json
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: pages-wasm
+          cache-targets: false
+
+      - name: Build WASM + UI
+        run: |
+          ./web/build.sh
+          cd web/ui
+          npm ci
+          npm run build
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy web/www --project-name=oblyx-converter
+
+  release:
+    name: github release
+    needs: desktop
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: oblyx-*
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
