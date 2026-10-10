@@ -132,7 +132,7 @@ text characters (if any) are stored elsewhere (see open problem 2).
 
 **nf=11 / 12 / 15 (shapes) — DECODED:**
 
-- f1: struct 2×f32 `(Y, X)` — absolute page anchor, same layout as strokes.
+- f1: struct 2×f32 `(X, Y)` — absolute page anchor, same layout as strokes.
 - f5: uoffset → vector of f32s holding the geometry (table below).
 - f4: u8 subtype (1 and 3 observed; 1 ↔ line-like vectors, 3 ↔ closed).
 - colour: layout-driven (§4.6) — nf=15 → f7; nf=11 → f9 (f10 when f9 is
@@ -181,7 +181,7 @@ Decoded fields (offsets differ per subtype; shown for Type A → Type B):
 
 | field | Type A off | Type B off | type | meaning |
 | --- | --- | --- | --- | --- |
-| f1 | 24 | 20 | struct 2×f32 | **stroke anchor (Y, X)** — absolute page coords, Y increases downward |
+| f1 | 24 | 20 | struct 2×f32 | **stroke anchor (X, Y)** — absolute page coords, X horizontal, Y vertical (top-down). Thumbnail-overlay verified: plotting `(f32[0], f32[1)` tracks the handwriting exactly; the opposite order scatters over empty margin/grid. |
 | f7 | 19 | 16 | u32 | **stroke colour** `0xAABBGGRR` (§4.6); f5 is noise (low byte always `0x01`) |
 | f8 | 12 | 12 | f32 | **stroke width** in points |
 | f9 | 8 | 8 | uoffset | points to the point-data blob at `tp + tsize` |
@@ -189,9 +189,14 @@ Decoded fields (offsets differ per subtype; shown for Type A → Type B):
 
 The f1 struct covers 8 bytes (two f32s). For Type A the second f32 sits at
 offset 28 (not listed in the vtable — it is part of the struct, not a separate
-field). Verified: anchor `(Y=48.97, X=69.18)` for one Cambridge stroke,
-`(Y=109.44, X=65.15)` for one Type B stroke. Across Eth1, anchors range
-Y 27.8–229.9, X 23.7–153.7 — page-plausible.
+field). Verified by thumbnail overlay (dots at `(f32[0], f32[1)`, page-scaled,
+land exactly on the ink; the swapped order scatters over empty margin/grid):
+`(X=48.97, Y=69.18)` for one Cambridge stroke, `(X=109.44, Y=65.15)` for one
+Type B stroke. Across Eth1 strokes, X ranges 27.8–229.9, Y 23.7–153.7 —
+page-plausible (handwriting sits in the upper-left of the imported page).
+Note: this corrects an earlier reading that had the fields as `(Y, X)`; that
+order made anchors exceed the page width on portrait notebooks (e.g. G1 X
+up to 839.8 > 595) and put pagination splits on the wrong axis.
 
 **Widths are integer multiples of a base pen width.** Base is `0.7751` (one
 notebook uses `0.725`); observed multipliers `1, 2, 4, 5, 10, 15, 30` — matching
@@ -263,9 +268,9 @@ k=16,20,24,28), log-encoding, sqrt-encoding, velocity × constant-dt integration
 velocity × z-as-dt integration, bfloat16 pairs, running average, trapezoidal
 integration, scale-normalized cumsum, z-as-altitude segmentation.
 
-The stroke **anchor** (f1 = Y, X) is confirmed absolute page position; only the
-intra-stroke path geometry is unsolved. May require inspecting the Notability
-app binary or SDK.
+The stroke **anchor** (f1 = X, Y) is confirmed absolute page position by
+thumbnail overlay; only the intra-stroke path geometry is unsolved. May
+require inspecting the Notability app binary or SDK.
 
 ### 4.5 PDF comparison — anchors confirmed, paths not
 
@@ -280,16 +285,17 @@ Matching PDFs were used as an oracle. Findings:
   directly); a `cm` scale/flip appears only for embedded images.
 - PDF y-axis is bottom-up; .ntb anchor Y is top-down. `pdf_y = pageH − ntb_Y`
   matches (Eth1 pageH = 841.89).
-- Matching .ntb anchors to PDF path bbox centers (y-flipped) succeeds for
-  ~42% of Eth1 strokes at a 15-point threshold, with residuals of a few points —
-  confirming the anchor is the stroke's page position.
+- The decisive anchor check is the **thumbnail overlay** (§4.3): page-scaled
+  dots at `(f32[0], f32[1)` land on the ink in Eth1/G1/E1; the swapped order
+  scatters over empty margin/grid. An earlier PDF-bbox matching pass that
+  reported ~42% for Eth1 was computed under the swapped reading and is
+  superseded by the overlay evidence.
 - Point-count and bbox-extent comparisons between .ntb and PDF do **not**
   correlate, because the point coordinates themselves are undecoded.
 - The 24 decoded shapes could **not** be isolated as distinct PDF segments:
-  under every transform tried (raw, y-flipped with H=841.89), 0/4 sampled
-  shapes matched a PDF line segment. Either the position convention or the
-  dims semantics is off; shapes are mostly template/annotation marks over
-  imported-PDF thumbnails, so they may not export as vector ink at all.
+  under every transform tried, 0/4 sampled shapes matched a PDF line segment.
+  Shapes are mostly template/annotation marks over imported-PDF thumbnails,
+  so they may not export as vector ink at all.
 
 ### 4.6 Colour encoding — VERIFIED
 
@@ -325,15 +331,17 @@ Example stroke colour histograms (after the f7 fix; `0x6b…` = highlighter):
 Many nf=11/12 elements share the shape layout (f1 anchor and f9/f10
 colour/width are readable in-table) but their f5 vector's **first slot is a
 negative i32**, not a count. For every such element,
-`landing + |i32|` is a constant per notebook (e.g. B1 401860), suggesting
-an encoded offset/delta rather than geometry. The u32 values at +4/+8 look
-like sane dims but form repeating 18/36-multiple grid patterns.
+`landing + |i32|` points at a **shared table** — most rejected elements in a
+notebook converge on one of a handful of such tables (B1: 34 of 40 → a single
+table whose inline f32 is `36.0`, matching B1's 36 pt grid paper). The dims
+readable around those tables form repeating 18/36-multiple grid patterns.
 
 Counts: B1 40, D1 10, E1 181, G1 121, P1 108. Colours include red and
 purple in E1 (`0xff902d62`, `0xff1515b5`) and grays. Thumbnails show the
 affected notebooks are grid-paper pages (B1), imported PDF worksheets
-(D1), and template pages with ruled tables (E1) — the grid-like geometry
-is consistent with table/grid artifacts of imports rather than user shapes.
+(D1), and template pages with ruled tables (E1) — the shared-table +
+grid-spacing evidence is consistent with **page-grid/table marks of imports
+rather than user shapes**.
 
 The reader **rejects** these elements (vector count ∉ {8,12,14}). Semantics
 unverified — do not emit them until decoded. See open problem 5.
@@ -364,8 +372,16 @@ reproduce the ink. Full render fidelity is blocked on the coordinate encoding
 (§4.2) is decoded and emitted as portable-IR shapes with colour + width.
 
 Page geometry: `.ntb` notebooks are continuous-scroll; the matching PDF export
-paginates at A4 height (841.89 pt). `ntb::paginate()` splits strokes by Y
-coordinate using a caller-supplied page height.
+paginates at the paper height from the first nf=2 page definition (A4 841.89 pt
+when absent). `ntb::paginate()` splits strokes/shapes by Y using that height.
+
+Page size is carried on the portable IR (`Page.width/height`). `.ntb` pages
+use their nf=2 dimensions (fallback A4 595.28×841.89); GoodNotes pages keep
+the historical 1091.35×1543.5 canvas. Renderers honour per-page size: SVG/PNG
+use it for the canvas; the PDF renderer scales page width onto a fixed A4
+MediaBox (`595.28/page.width` — 0.5455 for GoodNotes, ≈1.0 for `.ntb`), which
+fixes the old bug where `.ntb` coordinates were double-shrunk into the upper
+quarter of the A4 page.
 
 ### 6.2 Editable export (`→` `.ntb` or `→` `.goodnotes`)
 
@@ -396,8 +412,13 @@ Public API:
 - `ntb::open(path)` → `NtbDocument` (meta + strokes + shapes + assets)
 - `ntb::parse_bundle_public(bytes)` → same, from an in-memory `noteBundle`
 - `ntb::paginate(doc, page_h)` → `Vec<NtbPage>` (strokes + shapes split by Y)
-- `ntb::to_pages(doc, page_h)` → `Vec<Page>` (portable IR items; shapes →
-  ellipse/rect/line, strokes coloured via `rgba_from_u32` with alpha)
+- `ntb::to_pages(doc, page_h)` → `Vec<Page>` (portable IR items with true
+  page dimensions; shapes → ellipse/rect/line, strokes coloured via
+  `rgba_from_u32` with alpha)
+
+Anchor fields are `(X, Y)` (thumbnail-overlay verified; see §4.3). Renders of
+Eth1/G1 place dash anchors on the handwriting lines of the matching
+thumbnail.
 
 The convert pipeline dispatches `.ntb` files via `is_ntb()`; assets are loaded
 into the document attachment map. Example: `cargo run --bin oblyx -- -f svg,pdf
@@ -408,17 +429,17 @@ ntb/Eth1.ntb`.
 1. **Point coordinate encoding** (4.4) — the blocker for render fidelity. The
    three f32s per point have a velocity-envelope pattern but do not integrate
    to the PDF path. May require inspecting the Notability app binary or SDK.
-2. **Text content location** (4.2, nf=8) — only font name and size are
-   decoded; no typed text exists in any sample. The actual characters are
-   stored elsewhere (possibly assets/ or a separate string table).
-3. **Shape position convention** (4.2) — anchor (Y, X) and dims are decoded,
-   but top-left vs centre placement is unconfirmed: 0/4 sampled shapes
-   matched PDF line segments under any transform tried.
+2. **Typed text** (4.2, nf=8) — no user-typed text exists in any of the 9
+   samples; noteBundles contain only UUIDs, MIME types, and asset-title
+   fragments. If the feature exists, its storage is undiscovered.
+3. **Shape position convention** (4.2) — anchor (X, Y) and dims are decoded
+   and render plausibly on the thumbnail, but top-left vs centre placement
+   is unconfirmed (0/4 sampled shapes matched PDF line segments).
 4. **nf=12 f11 fill colour** (4.2) — second colour likely means fill; kept
    transparent until semantics are confirmed against a rendered shape.
-5. **Rejected nf=11/12 elements** (4.7) — negative-i32 vector header with
-   `landing+|i32|` constant per notebook; grid/table-like dims. Possibly
-   table/grid artifacts of PDF imports; decode before emitting.
+5. **Rejected nf=11/12 elements** (4.7) — negative-i32 header resolves to a
+   shared table (grid spacing 36.0 in B1); consistent with import grid/table
+   marks. Decode fully before emitting.
 6. **nf=1 purpose** — single u32 field (0, 4, or hash). Wrapper envelope matches
    strokes. Possibly annotations or degenerate strokes.
 7. **nf=4, 7, 13** — undecoded.
@@ -426,9 +447,9 @@ ntb/Eth1.ntb`.
    purpose unknown.
 9. **u16 in points** — constant f16 1.0 for Type A, varying for Type B; likely
    pressure or timestamp, unconfirmed.
-10. **Page-size mismatch** — renderers use GoodNotes page constants (1091×1543);
-    `.ntb` coordinates are page-relative (e.g. A4 596×842). Strokes appear in
-    the upper portion of the canvas. A proper fix needs a page-size-aware
-    renderer or a coordinate scale at load time using nf=2 dimensions.
+10. **Mixed paper sizes** — B1/F1 carry non-A4 first page defs (651×407,
+    455×571); pagination uses the first def's height for all slices. Cumulative
+    per-def pagination is unimplemented (samples keep all ink within one or
+    two slices either way).
 11. **No device validation** — no Notability/GoodNotes round-trip has been
     performed; any future writer must be validated on a real device.
