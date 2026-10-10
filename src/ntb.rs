@@ -16,6 +16,8 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use zip::ZipArchive;
 
+use crate::doc::{Item, Page, Stroke};
+
 // ---------------------------------------------------------------------------
 // FlatBuffer walker (minimal, schema-less)
 // ---------------------------------------------------------------------------
@@ -422,4 +424,59 @@ pub fn paginate(doc: &NtbDocument, page_h: f32) -> Vec<NtbPage> {
         pages[idx].strokes.push(s.clone());
     }
     pages
+}
+
+// ---------------------------------------------------------------------------
+// Public helpers for external callers (e.g. the convert pipeline)
+// ---------------------------------------------------------------------------
+
+/// Default page height used when converting to [`Page`]: A4 at 72 dpi.
+pub const NTB_PAGE_H: f32 = 841.89;
+
+/// Parse a `noteBundle` blob from memory. Public wrapper around the private
+/// [`parse_bundle`], for callers that already hold the bytes (e.g. zip members).
+pub fn parse_bundle_public(bundle: &[u8]) -> Result<(NtbMeta, Vec<NtbStroke>)> {
+    parse_bundle(bundle)
+}
+
+// ---------------------------------------------------------------------------
+// Conversion into the portable Page / Document model
+// ---------------------------------------------------------------------------
+
+/// Convert an `.ntb` document into a list of portable [`Page`] objects,
+/// one per `page_h` slice.
+///
+/// Strokes are emitted as 2-point horizontal dashes at their anchor position,
+/// because the intra-stroke path geometry is not yet decoded (see module
+/// docs). The dash length equals the stroke width, so the page layout is
+/// preserved as a field of position-weighted marks.
+pub fn to_pages(doc: &NtbDocument, page_h: f32) -> Vec<Page> {
+    paginate(doc, page_h)
+        .into_iter()
+        .enumerate()
+        .map(|(i, np)| {
+            let items: Vec<Item> = np
+                .strokes
+                .iter()
+                .map(|s| {
+                    let w = if s.width.is_finite() && s.width > 0.0 {
+                        s.width
+                    } else {
+                        1.0
+                    };
+                    Item::Stroke(Stroke {
+                        points: vec![[s.anchor_x, s.anchor_y], [s.anchor_x + w, s.anchor_y]],
+                        width: w,
+                        rgba: [0.0, 0.0, 0.0, 1.0],
+                        dash: None,
+                        parented: false,
+                    })
+                })
+                .collect();
+            Page {
+                uuid: format!("ntb-p{i:04}"),
+                items,
+            }
+        })
+        .collect()
 }

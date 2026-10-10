@@ -269,6 +269,27 @@ fn parse_events(raw: &[u8]) -> Result<EventsIndex> {
 }
 
 impl Document {
+    /// An empty document with no pages or attachments. Useful for renderers
+    /// that only need `attachments` resolved (e.g. stroke-only formats like
+    /// `.ntb` whose assets are not yet mapped).
+    pub fn empty() -> Document {
+        Document {
+            schema: 0,
+            pages: Vec::new(),
+            attachments: HashMap::new(),
+            page_cfg: HashMap::new(),
+            paper_cache: Mutex::new(HashMap::new()),
+            pdf_temps: Mutex::new(HashMap::new()),
+            raster_cache: Mutex::new(HashMap::new()),
+            temp_tag: 0,
+        }
+    }
+
+    /// Insert a content-addressed asset attachment.
+    pub fn insert_attachment(&mut self, key: impl Into<String>, bytes: Vec<u8>) {
+        self.attachments.insert(key.into(), Arc::new(bytes));
+    }
+
     pub fn open(path: &Path) -> Result<Document> {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let z = Zip::new(BufReader::new(file))
