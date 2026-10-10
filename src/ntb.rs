@@ -114,6 +114,21 @@ pub struct NtbStroke {
     pub points: Vec<[f32; 2]>,
 }
 
+/// A page definition (inner nf=2). Dimensions are in points.
+#[derive(Debug, Clone, Copy)]
+pub struct NtbPageDef {
+    pub width: f32,
+    pub height: f32,
+}
+
+/// A text box (inner nf=8). The actual text characters are stored elsewhere;
+/// only font metadata is decoded here.
+#[derive(Debug, Clone)]
+pub struct NtbText {
+    pub font: String,
+    pub size: f32,
+}
+
 /// Metadata extracted from the noteBundle root table.
 #[derive(Debug, Clone, Default)]
 pub struct NtbMeta {
@@ -137,6 +152,10 @@ pub struct NtbDocument {
     pub meta: NtbMeta,
     /// Handwriting strokes, in file order.
     pub strokes: Vec<NtbStroke>,
+    /// Page definitions (inner nf=2). Empty for continuous-scroll notebooks.
+    pub pages: Vec<NtbPageDef>,
+    /// Text boxes (inner nf=8).
+    pub texts: Vec<NtbText>,
     /// Raw `manifest.json` bytes.
     pub manifest: Vec<u8>,
     /// Raw `thumbnail.png` bytes, if present.
@@ -184,10 +203,12 @@ fn parse_zip<R: std::io::Read + std::io::Seek>(
         }
     }
 
-    let (meta, strokes) = parse_bundle(&bundle)?;
+    let (meta, strokes, pages, texts) = parse_bundle(&bundle)?;
     Ok(NtbDocument {
         meta,
         strokes,
+        pages,
+        texts,
         manifest,
         thumbnail,
         assets,
@@ -212,7 +233,10 @@ fn read_member<R: std::io::Read + std::io::Seek>(
 // noteBundle parsing
 // ---------------------------------------------------------------------------
 
-fn parse_bundle(d: &[u8]) -> Result<(NtbMeta, Vec<NtbStroke>)> {
+/// Parsed contents of a noteBundle: metadata, strokes, pages, texts.
+pub type BundleParts = (NtbMeta, Vec<NtbStroke>, Vec<NtbPageDef>, Vec<NtbText>);
+
+fn parse_bundle(d: &[u8]) -> Result<BundleParts> {
     let b = Buf { d };
     if d.len() < 8 {
         bail!("noteBundle too small ({} bytes)", d.len());
@@ -260,6 +284,8 @@ fn parse_bundle(d: &[u8]) -> Result<(NtbMeta, Vec<NtbStroke>)> {
 
     // f6: vector of element tables.
     let mut strokes = Vec::new();
+    let mut pages = Vec::new();
+    let mut texts = Vec::new();
     if field(ROOT_F6_ELEMENTS) != 0 {
         let vec_pos = b.follow(root_pos + field(ROOT_F6_ELEMENTS))?;
         let n = b.u32(vec_pos)? as usize;
@@ -267,13 +293,18 @@ fn parse_bundle(d: &[u8]) -> Result<(NtbMeta, Vec<NtbStroke>)> {
         for i in 0..n {
             let ep = vec_pos + 4 + 4 * i;
             let Ok(el_pos) = b.follow(ep) else { continue };
-            if let Ok(Some(stroke)) = parse_element(&b, el_pos) {
-                strokes.push(stroke);
+            let Ok(Some(elem)) = parse_element(&b, el_pos) else {
+                continue;
+            };
+            match elem {
+                ParsedElement::Stroke(s) => strokes.push(s),
+                ParsedElement::PageDef(p) => pages.push(p),
+                ParsedElement::Text(t) => texts.push(t),
             }
         }
     }
 
-    Ok((meta, strokes))
+    Ok((meta, strokes, pages, texts))
 }
 
 fn read_string(b: &Buf, table: usize, field_off: usize) -> Result<Option<String>> {
@@ -290,9 +321,16 @@ fn read_string(b: &Buf, table: usize, field_off: usize) -> Result<Option<String>
     Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
 }
 
-/// Parse one element: wrapper (nf=6) → inner table. Returns a stroke when the
-/// inner table has nf=16 (the handwriting-stroke type).
-fn parse_element(b: &Buf, el_pos: usize) -> Result<Option<NtbStroke>> {
+/// A decoded element from the root f6 vector, dispatched by inner-table nf.
+enum ParsedElement {
+    Stroke(NtbStroke),
+    PageDef(NtbPageDef),
+    Text(NtbText),
+}
+
+/// Parse one element: wrapper (nf=6) → inner table. Dispatches on the inner
+/// table's field count (nf) to the appropriate decoder.
+fn parse_element(b: &Buf, el_pos: usize) -> Result<Option<ParsedElement>> {
     let (_ws, _wt, wf) = b.table(el_pos)?;
     if wf.len() != 6 {
         return Ok(None); // wrapper always has 6 vtable fields
@@ -303,16 +341,64 @@ fn parse_element(b: &Buf, el_pos: usize) -> Result<Option<NtbStroke>> {
     }
     let inner = b.follow(el_pos + f5)?;
     let (_is, _it, inf) = b.table(inner)?;
-    if inf.len() != 16 {
-        return Ok(None); // only nf=16 is a stroke
+    match inf.len() {
+        16 => {
+            let stroke = parse_stroke(b, inner, &inf)?;
+            // Only emit strokes with trailer-verified points; nf=16 elements
+            // with an empty or unrecognised blob are not handwriting.
+            if stroke.point_count == 0 {
+                return Ok(None);
+            }
+            Ok(Some(ParsedElement::Stroke(stroke)))
+        }
+        2 => Ok(parse_page_def(b, inner, &inf)?.map(ParsedElement::PageDef)),
+        8 => Ok(parse_text(b, inner, &inf)?.map(ParsedElement::Text)),
+        _ => Ok(None), // other types undecoded
     }
-    let stroke = parse_stroke(b, inner, &inf)?;
-    // Only emit strokes with trailer-verified points; nf=16 elements with an
-    // empty or unrecognised blob are not handwriting.
-    if stroke.point_count == 0 {
+}
+
+/// Parse a page definition (inner nf=2). f1 is a vector whose first two f32s
+/// are the page width and height in points.
+fn parse_page_def(b: &Buf, tp: usize, fields: &[u16]) -> Result<Option<NtbPageDef>> {
+    let f1 = *fields.get(1).unwrap_or(&0) as usize;
+    if f1 == 0 {
         return Ok(None);
     }
-    Ok(Some(stroke))
+    let vec_pos = b.follow(tp + f1)?;
+    let n = b.u32(vec_pos)? as usize;
+    if n < 2 {
+        return Ok(None);
+    }
+    let width = b.f32(vec_pos + 4)?;
+    let height = b.f32(vec_pos + 8)?;
+    // Validate: reasonable page dimensions (reject garbage from non-page nf=2).
+    if !width.is_finite() || !height.is_finite() || width < 50.0 || height < 50.0
+        || width > 10_000.0 || height > 10_000.0
+    {
+        return Ok(None);
+    }
+    Ok(Some(NtbPageDef { width, height }))
+}
+
+/// Parse a text box (inner nf=8). f4 is a string (font family), f5 is an f32
+/// font size. The actual text characters are stored elsewhere.
+fn parse_text(b: &Buf, tp: usize, fields: &[u16]) -> Result<Option<NtbText>> {
+    let f4 = *fields.get(4).unwrap_or(&0) as usize;
+    let f5 = *fields.get(5).unwrap_or(&0) as usize;
+    let font = if f4 != 0 {
+        read_string(b, tp, f4)?.unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let size = if f5 != 0 {
+        b.f32(tp + f5).unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    if font.is_empty() && size <= 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(NtbText { font, size }))
 }
 
 fn parse_stroke(b: &Buf, tp: usize, fields: &[u16]) -> Result<NtbStroke> {
@@ -432,7 +518,7 @@ pub const NTB_PAGE_H: f32 = 841.89;
 
 /// Parse a `noteBundle` blob from memory. Public wrapper around the private
 /// [`parse_bundle`], for callers that already hold the bytes (e.g. zip members).
-pub fn parse_bundle_public(bundle: &[u8]) -> Result<(NtbMeta, Vec<NtbStroke>)> {
+pub fn parse_bundle_public(bundle: &[u8]) -> Result<BundleParts> {
     parse_bundle(bundle)
 }
 

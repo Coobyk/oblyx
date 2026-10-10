@@ -702,10 +702,12 @@ fn parse_ntb_bytes(bytes: &[u8]) -> Result<crate::ntb::NtbDocument> {
             assets.push((name, buf));
         }
     }
-    let (meta, strokes) = crate::ntb::parse_bundle_public(&bundle)?;
+    let (meta, strokes, pages, texts) = crate::ntb::parse_bundle_public(&bundle)?;
     Ok(crate::ntb::NtbDocument {
         meta,
         strokes,
+        pages,
+        texts,
         manifest,
         thumbnail,
         assets,

@@ -23,11 +23,19 @@ fn main() -> anyhow::Result<()> {
         "  device_upper={} device_lower={}",
         m.device_uuid_upper, m.device_uuid_lower
     );
-    println!("  strokes={} assets={} thumbnail={} manifest={}B",
+    println!("  strokes={} pages={} texts={} assets={} thumbnail={} manifest={}B",
         doc.strokes.len(),
+        doc.pages.len(),
+        doc.texts.len(),
         doc.assets.len(),
         doc.thumbnail.is_some(),
         doc.manifest.len());
+    for (i, p) in doc.pages.iter().enumerate() {
+        println!("    page[{i}]: {:.0}×{:.0} pt", p.width, p.height);
+    }
+    for (i, t) in doc.texts.iter().enumerate() {
+        println!("    text[{i}]: font={:?} size={:.1}", t.font, t.size);
+    }
     // Stroke stats
     if !doc.strokes.is_empty() {
         let widths: std::collections::HashMap<u32, usize> = doc
