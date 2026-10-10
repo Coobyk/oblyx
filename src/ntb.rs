@@ -1,17 +1,28 @@
 //! `.ntb` (Notability cloud) reader.
 //!
-//! Parses the ZIP container, walks the `noteBundle` FlatBuffer, and extracts
-//! handwriting strokes (anchor position, width, and decoded path geometry).
-//! Intra-stroke paths are cubic Bézier records: each 19-byte record holds
-//! three IEEE-754 half-precision points `(c1, c2, end)` relative to the
-//! stroke anchor (y top-down); record 0 is a moveto whose control points are
-//! clobbered by the stream header, so the path starts at the anchor itself.
-//! See `docs/NOTABILITY_FORMAT.md` §4.4.
+//! Parses the ZIP container, walks the `noteBundle` FlatBuffer, and folds its
+//! CRDT op log into the final document state. The root f6 vector holds `Op`
+//! tables; each op carries an entity id (f0), a `payloadType` (f4) and a
+//! payload union (f5). Creates insert entities, later modifies patch them
+//! (origin, colour, width, path), and `DeleteEntities` ops remove them — the
+//! fold applies ops in log order and emits only live entities. See
+//! `docs/NOTABILITY_FORMAT.md` §4.2 and §5.
+//!
+//! Handwriting strokes (CreateInk) decode anchor position, width, colour and
+//! cubic-Bézier path geometry: each 19-byte point record holds three IEEE-754
+//! half-precision points `(c1, c2, end)` relative to the stroke anchor (y
+//! top-down); record 0 is a moveto whose control points are clobbered by the
+//! stream header, so the path starts at the anchor itself. See §4.4.
+//!
+//! Shapes (CreateShape) decode definition type (Line / Polygon / NormalShape),
+//! a top-left origin, stroke colour, border width and optional fill colour.
+//! See §4.3.
 //!
 //! No public prior art exists for this format; the layout below was reverse
 //! engineered from 9 sample notebooks (Notability 16.12.5) and cross-checked
-//! against the notability.com web app's stroke codec.
+//! against the notability.com web app's FlatBuffer schema and stroke codec.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 use std::path::Path;
 
@@ -45,6 +56,10 @@ impl<'a> Buf<'a> {
             .context(format!("u16 @ {off}"))
     }
 
+    fn u8(&self, off: usize) -> Result<u8> {
+        self.d.get(off).copied().context(format!("u8 @ {off}"))
+    }
+
     fn f32(&self, off: usize) -> Result<f32> {
         self.d
             .get(off..off + 4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -76,20 +91,91 @@ impl<'a> Buf<'a> {
         let rel = self.u32(pos)? as usize;
         Ok(pos + rel)
     }
+
+    /// Field byte offset within a table, or 0 when the field is absent.
+    fn field_off(fields: &[u16], i: usize) -> usize {
+        *fields.get(i).unwrap_or(&0) as usize
+    }
 }
 
 // ---------------------------------------------------------------------------
-// noteBundle schema (verified, see docs/NOTABILITY_FORMAT.md §4)
+// noteBundle schema (verified, see docs/NOTABILITY_FORMAT.md §4–§5)
 // ---------------------------------------------------------------------------
 
 /// Root table field indices.
-const ROOT_F4_TIMESTAMP: usize = 4;
-const ROOT_F6_ELEMENTS: usize = 6;
+const ROOT_F6_OPS: usize = 6;
 
-/// Stroke table field indices (same for Type A and Type B).
-const STROKE_F1_ANCHOR: usize = 1; // struct 2×f32: (X, Y)
-const STROKE_F8_WIDTH: usize = 8; // f32
-const STROKE_F9_POINTS: usize = 9; // uoffset to point blob
+// Op table field indices.
+const OP_F0_ID: usize = 0; // sf struct (site u16, timestamp u32), inline 8 bytes
+const OP_F4_PAYLOAD_TYPE: usize = 4; // u8
+const OP_F5_PAYLOAD: usize = 5; // uoffset to payload union table
+
+// PayloadType enum (from the web-app schema; see §4.2).
+const PT_CREATE_PAGE: u8 = 3;
+const PT_CREATE_INK: u8 = 15;
+const PT_MODIFY_INK: u8 = 17;
+const PT_CREATE_SHAPE: u8 = 18;
+const PT_MODIFY_SHAPE: u8 = 19;
+const PT_MODIFY_POSITIONS: u8 = 24;
+const PT_DELETE_ENTITIES: u8 = 25;
+
+// CreateInk payload field indices (nf=16 in archived tables).
+const INK_F0_PAGE: usize = 0; // df SeqId (site u16, timestamp u32, index u32), 12B inline
+const INK_F1_ORIGIN: usize = 1; // Sf struct 2×f32, inline
+const INK_F4_TOOL: usize = 4; // i8
+const INK_F5_STYLE: usize = 5; // i8
+const INK_F7_COLOR: usize = 7; // gf struct (R,G,B,A bytes)
+const INK_F8_WIDTH: usize = 8; // f32
+const INK_F9_PATH: usize = 9; // uoffset to point blob
+const INK_F15_AUDIO_DURATION: usize = 15; // i32 (ms)
+
+// CreateShape payload field indices.
+const SHAPE_F0_PAGE: usize = 0; // df SeqId, 12B inline
+const SHAPE_F1_ORIGIN: usize = 1; // Sf struct 2×f32 (top-left), inline
+const SHAPE_F2_ROTATION: usize = 2; // f32
+const SHAPE_F4_DEF_TYPE: usize = 4; // u8 (1=Line, 2=Polygon, 3=NormalShape)
+const SHAPE_F5_DEF: usize = 5; // uoffset to definition table
+const SHAPE_F9_COLOR: usize = 9; // gf struct
+const SHAPE_F10_BORDER: usize = 10; // f32
+const SHAPE_F11_FILL: usize = 11; // gf struct (present when nf >= 12)
+
+// CreateShape definitionType values.
+const DEF_LINE: u8 = 1;
+const DEF_POLYGON: u8 = 2;
+const DEF_NORMAL: u8 = 3;
+
+// ModifyInk payload field indices.
+const MINK_F0_TARGETS: usize = 0; // vector of sf structs (8 bytes each)
+const MINK_F2_ORIGIN: usize = 2; // Sf struct
+const MINK_F6_COLOR: usize = 6; // gf struct
+const MINK_F7_WIDTH: usize = 7; // f32
+const MINK_F8_PATH: usize = 8; // uoffset to point blob
+
+// ModifyShape payload field indices (shifted +1 vs CreateShape: f0 = targets).
+const MSHAPE_F0_TARGETS: usize = 0;
+const MSHAPE_F2_ORIGIN: usize = 2;
+const MSHAPE_F10_COLOR: usize = 10;
+const MSHAPE_F11_BORDER: usize = 11;
+const MSHAPE_F12_FILL: usize = 12;
+
+// ModifyPositions payload field indices.
+const MPOS_F0_MODS: usize = 0; // vector of uoffsets to ModifyPosition tables
+
+// ModifyPosition table field indices.
+const MPOS_TARGET: usize = 0; // sf struct
+const MPOS_PAGE: usize = 1; // df SeqId (moves the target to this page)
+const MPOS_ORIGIN: usize = 2; // Sf struct
+
+// DeleteEntities payload field indices.
+const DEL_F0_DELETES: usize = 0; // vector of sf structs
+const DEL_F1_UNDELETES: usize = 1; // vector of sf structs
+
+// CreatePage payload field indices.
+const PAGE_F0_LOCATION: usize = 0; // df SeqId (matches ink/shape f0 page ids)
+const PAGE_F1_BACKGROUND: usize = 1; // uoffset to PageBackground table
+
+// PageBackground table field indices.
+const BG_F3_SIZE: usize = 3; // vf struct 2×f32 (width, height), inline
 
 /// Constant 5-byte trailer ending each 19-byte point record.
 const POINT_TRAILER: [u8; 5] = [0x00, 0x3c, 0xff, 0x00, 0x00];
@@ -97,6 +183,14 @@ const POINT_TRAILER: [u8; 5] = [0x00, 0x3c, 0xff, 0x00, 0x00];
 const POINT_STRIDE: usize = 19;
 /// Bézier samples emitted per cubic record when decoding paths to polylines.
 const BEZIER_SAMPLES: usize = 12;
+
+/// Entity id: `(site, timestamp)` from an op's f0 sf struct.
+type EntityId = (u16, u32);
+
+/// Page id: `(site, timestamp, index)` from a df SeqId struct (12 bytes,
+/// aligned: `site u16 @0`, `pad 2 @2`, `timestamp u32 @4`, `index u32 @8`).
+/// Matches CreateInk/CreateShape f0 and CreatePage f0 (location).
+type PageId = (u16, u32, u32);
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -107,6 +201,8 @@ const BEZIER_SAMPLES: usize = 12;
 /// absolute page position of the path origin.
 #[derive(Debug, Clone)]
 pub struct NtbStroke {
+    /// Page id (CreateInk f0 df SeqId); `None` when the field is absent.
+    pub page: Option<PageId>,
     /// Absolute page X (left-right), points.
     pub anchor_x: f32,
     /// Absolute page Y (top-down), points.
@@ -119,56 +215,82 @@ pub struct NtbStroke {
     /// Empty when the blob carries no trailer-verified records.
     pub points: Vec<[f32; 2]>,
     /// Raw colour u32 (`0xAABBGGRR`, i.e. LE bytes are R,G,B,A) when the
-    /// stroke table carries one (fields f5/f7); `None` → default black.
+    /// stroke table carries one (field f7); `None` → default black.
     pub color: Option<u32>,
+    /// Tool enum (CreateInk f4): Pen=0, Pencil=1, Highlighter=2, Tape=3 …
+    pub tool: Option<i8>,
+    /// Style enum (CreateInk f5): VariableWidth=0, FixedWidth=1, Dash=2,
+    /// Dots=3. Controls whether the per-record u16 width hint varies.
+    pub style: Option<i8>,
+    /// Audio-sync duration in milliseconds (CreateInk f15) when the stroke
+    /// was drawn during a recording; `None` otherwise.
+    pub audio_duration_ms: Option<i32>,
 }
 
-/// A page definition (inner nf=2). Dimensions are in points.
+/// A page definition from a CreatePage op's background size.
+/// Dimensions are in points. `id` is the CreatePage f0 location SeqId
+/// matching ink/shape page ids.
 #[derive(Debug, Clone, Copy)]
 pub struct NtbPageDef {
+    pub id: PageId,
     pub width: f32,
     pub height: f32,
 }
 
-/// A text style record (inner nf=8 with font metadata). In all 9 samples the
-/// only such element is a document-level style record at element index 0
-/// (font `Inter`, size 14, locale `en_US`); no positioned text boxes with
-/// content were found, so no position/text is decoded here. Other nf=8
-/// elements without font metadata are pen-style records and are filtered out.
+/// A text style record (best-effort). In all 9 samples the only such element
+/// is a document-level style record (font `Inter`, size 14, locale `en_US`);
+/// no positioned text boxes with content were found, so no position/text is
+/// decoded here.
 #[derive(Debug, Clone)]
 pub struct NtbText {
     pub font: String,
     pub size: f32,
 }
 
-/// A shape (inner nf=11/12/15 with an f5 geometry vector).
-///
-/// Geometry comes from the f5 vector's first values: for vectors of length 8
-/// or 12 they are `(v0, v1)`; for length 14 the first slot is a header
-/// (`0x01000000`) and the dims are `(v1, v2)`.
-///
-/// Classification (best-effort, see `docs/NOTABILITY_FORMAT.md` §4.3):
-/// - length 8 with near-equal dims → ellipse (dims are the bbox size);
-/// - length 8 with unequal dims → rectangle;
-/// - length 12 or 14 → straight line from the anchor by `(dx, dy)`.
+/// Shape geometry, decoded from a CreateShape definition union.
+/// Origins are top-left (web-schema verified); Line/Polygon points are
+/// origin-relative and converted to absolute here.
+#[derive(Debug, Clone)]
+pub enum NtbShapeGeom {
+    /// A (possibly cubic) line. `c1`/`c2` are optional cubic control points;
+    /// when absent the line is straight from start to end.
+    Line {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        c1: Option<[f32; 2]>,
+        c2: Option<[f32; 2]>,
+    },
+    /// An axis-aligned box with top-left `(x, y)` and size `(w, h)`.
+    /// `ellipse` is true for NormalShape type Ellipse (the only type in the
+    /// web schema); other types render as rectangles.
+    Box {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        ellipse: bool,
+    },
+    /// A closed polygon through absolute points (at least 3).
+    Polygon { points: Vec<[f32; 2]> },
+}
+
+/// A decoded shape (CreateShape, payloadType 18).
 #[derive(Debug, Clone)]
 pub struct NtbShape {
-    /// Absolute page X (left-right), points.
-    pub anchor_x: f32,
-    /// Absolute page Y (top-down), points.
-    pub anchor_y: f32,
-    /// X extent of the geometry (line delta or bbox width), points.
-    pub dx: f32,
-    /// Y extent of the geometry (line delta or bbox height), points.
-    pub dy: f32,
-    /// Number of f32 slots in the f5 vector (8, 12 or 14).
-    pub vector_len: usize,
-    /// Raw colour u32 (`0xAABBGGRR`); `None` → default black.
+    /// Page id (CreateShape f0 df SeqId); `None` when the field is absent.
+    pub page: Option<PageId>,
+    /// Shape geometry in absolute page coordinates.
+    pub geom: NtbShapeGeom,
+    /// Rotation in degrees (payload f2); 0 when absent.
+    pub rotation: f32,
+    /// Stroke colour u32 (`0xAABBGGRR`); `None` → default black.
     pub color: Option<u32>,
-    /// Outline width in points; 0 when the field was missing.
-    pub width: f32,
-    /// Shape subtype (inner f4, u8): 1 and 3 observed in samples.
-    pub subtype: u8,
+    /// Fill colour u32 (`0xAABBGGRR`); `None` → transparent.
+    pub fill: Option<u32>,
+    /// Outline width in points (payload f10); 1.0 when absent.
+    pub border_width: f32,
 }
 
 /// Metadata extracted from the noteBundle root table.
@@ -184,21 +306,24 @@ pub struct NtbMeta {
     pub timestamp_ms: u64,
     /// Version-like u32 (root f7).
     pub version: u32,
-    /// Number of elements in root f6.
+    /// Number of ops in root f6.
     pub element_count: usize,
 }
 
-/// A fully parsed `.ntb` notebook.
+/// A fully parsed `.ntb` notebook. Strokes and shapes hold the folded final
+/// state: creates patched by later modifies, with deleted entities removed.
 #[derive(Debug)]
 pub struct NtbDocument {
     pub meta: NtbMeta,
-    /// Handwriting strokes, in file order.
+    /// Live handwriting strokes, in creation order.
     pub strokes: Vec<NtbStroke>,
-    /// Page definitions (inner nf=2). Empty for continuous-scroll notebooks.
+    /// Page sizes from CreatePage backgrounds (informational; pagination
+    /// still uses Y-slicing because op-log page ids do not reliably group
+    /// strokes — see §9).
     pub pages: Vec<NtbPageDef>,
-    /// Text style records (inner nf=8 with font metadata).
+    /// Text style records (best-effort).
     pub texts: Vec<NtbText>,
-    /// Shapes (inner nf=11/12/15 with an f5 geometry vector).
+    /// Live shapes, in creation order.
     pub shapes: Vec<NtbShape>,
     /// Raw `manifest.json` bytes.
     pub manifest: Vec<u8>,
@@ -275,12 +400,11 @@ fn read_member<R: std::io::Read + std::io::Seek>(
 }
 
 // ---------------------------------------------------------------------------
-// noteBundle parsing
+// noteBundle parsing: CRDT op-log fold
 // ---------------------------------------------------------------------------
 
-/// Parsed contents of a noteBundle: metadata, strokes, pages, texts.
-/// `(meta, strokes, pages, texts, shapes)` — the decoded contents of a
-/// `noteBundle`, for callers that parse from memory.
+/// Parsed contents of a noteBundle: metadata, live strokes, pages, texts,
+/// live shapes. `(meta, strokes, pages, texts, shapes)`.
 pub type BundleParts = (
     NtbMeta,
     Vec<NtbStroke>,
@@ -288,6 +412,15 @@ pub type BundleParts = (
     Vec<NtbText>,
     Vec<NtbShape>,
 );
+
+/// Mutable fold state while walking the op log.
+struct Fold {
+    strokes: HashMap<EntityId, NtbStroke>,
+    shapes: HashMap<EntityId, NtbShape>,
+    stroke_order: Vec<EntityId>,
+    shape_order: Vec<EntityId>,
+    deleted: HashSet<EntityId>,
+}
 
 fn parse_bundle(d: &[u8]) -> Result<BundleParts> {
     let b = Buf { d };
@@ -298,7 +431,7 @@ fn parse_bundle(d: &[u8]) -> Result<BundleParts> {
     // Root: u32 uoffset at byte 0 → root table.
     let root_pos = b.u32(0)? as usize;
     let (_rp, _rts, rf) = b.table(root_pos)?;
-    let field = |i: usize| -> usize { *rf.get(i).unwrap_or(&0) as usize };
+    let field = |i: usize| -> usize { Buf::field_off(&rf, i) };
 
     let mut meta = NtbMeta::default();
 
@@ -309,8 +442,8 @@ fn parse_bundle(d: &[u8]) -> Result<BundleParts> {
     }
 
     // f4: u64 timestamp at offset 40.
-    if field(ROOT_F4_TIMESTAMP) != 0 {
-        let off = root_pos + field(ROOT_F4_TIMESTAMP);
+    if field(4) != 0 {
+        let off = root_pos + field(4);
         if d.len() >= off + 8 {
             meta.timestamp_ms = u64::from_le_bytes([
                 d[off], d[off + 1], d[off + 2], d[off + 3],
@@ -335,31 +468,362 @@ fn parse_bundle(d: &[u8]) -> Result<BundleParts> {
         }
     }
 
-    // f6: vector of element tables.
-    let mut strokes = Vec::new();
+    // f6: vector of Op tables — the CRDT log.
+    let mut fold = Fold {
+        strokes: HashMap::new(),
+        shapes: HashMap::new(),
+        stroke_order: Vec::new(),
+        shape_order: Vec::new(),
+        deleted: HashSet::new(),
+    };
     let mut pages = Vec::new();
     let mut texts = Vec::new();
-    let mut shapes = Vec::new();
-    if field(ROOT_F6_ELEMENTS) != 0 {
-        let vec_pos = b.follow(root_pos + field(ROOT_F6_ELEMENTS))?;
+
+    if field(ROOT_F6_OPS) != 0 {
+        let vec_pos = b.follow(root_pos + field(ROOT_F6_OPS))?;
         let n = b.u32(vec_pos)? as usize;
         meta.element_count = n;
         for i in 0..n {
             let ep = vec_pos + 4 + 4 * i;
-            let Ok(el_pos) = b.follow(ep) else { continue };
-            let Ok(Some(elem)) = parse_element(&b, el_pos) else {
-                continue;
-            };
-            match elem {
-                ParsedElement::Stroke(s) => strokes.push(s),
-                ParsedElement::PageDef(p) => pages.push(p),
-                ParsedElement::Text(t) => texts.push(t),
-                ParsedElement::Shape(s) => shapes.push(s),
-            }
+            let Ok(op_pos) = b.follow(ep) else { continue };
+            let _ = fold_op(&b, op_pos, &mut fold, &mut pages, &mut texts);
+        }
+    }
+
+    // Emit live entities in creation order.
+    let mut strokes = Vec::with_capacity(fold.stroke_order.len());
+    for id in &fold.stroke_order {
+        if !fold.deleted.contains(id)
+            && let Some(s) = fold.strokes.get(id)
+        {
+            strokes.push(s.clone());
+        }
+    }
+    let mut shapes = Vec::with_capacity(fold.shape_order.len());
+    for id in &fold.shape_order {
+        if !fold.deleted.contains(id)
+            && let Some(s) = fold.shapes.get(id)
+        {
+            shapes.push(s.clone());
         }
     }
 
     Ok((meta, strokes, pages, texts, shapes))
+}
+
+/// Apply one op to the fold state. Errors on a single op are non-fatal
+/// (the op is skipped).
+fn fold_op(
+    b: &Buf,
+    op_pos: usize,
+    fold: &mut Fold,
+    pages: &mut Vec<NtbPageDef>,
+    texts: &mut Vec<NtbText>,
+) -> Result<()> {
+    let (_ops, _ot, of) = b.table(op_pos)?;
+    let id = read_entity_id(b, op_pos, Buf::field_off(&of, OP_F0_ID));
+    let payload_type = if Buf::field_off(&of, OP_F4_PAYLOAD_TYPE) != 0 {
+        b.u8(op_pos + Buf::field_off(&of, OP_F4_PAYLOAD_TYPE))?
+    } else {
+        0
+    };
+    let payload_pos = if Buf::field_off(&of, OP_F5_PAYLOAD) != 0 {
+        b.follow(op_pos + Buf::field_off(&of, OP_F5_PAYLOAD))?
+    } else {
+        return Ok(());
+    };
+    let (_ps, _pt, pf) = b.table(payload_pos)?;
+
+    match payload_type {
+        PT_CREATE_INK => {
+            if let Some(id) = id {
+                let stroke = parse_stroke(b, payload_pos, &pf)?;
+                if stroke.point_count > 0 {
+                    if !fold.strokes.contains_key(&id) {
+                        fold.stroke_order.push(id);
+                    }
+                    fold.strokes.insert(id, stroke);
+                }
+            }
+        }
+        PT_CREATE_SHAPE => {
+            if let Some(id) = id
+                && let Ok(Some(shape)) = parse_shape(b, payload_pos, &pf)
+            {
+                if !fold.shapes.contains_key(&id) {
+                    fold.shape_order.push(id);
+                }
+                fold.shapes.insert(id, shape);
+            }
+        }
+        PT_MODIFY_INK => {
+            apply_ink_patch(b, payload_pos, &pf, fold)?;
+        }
+        PT_MODIFY_SHAPE => {
+            apply_shape_patch(b, payload_pos, &pf, fold)?;
+        }
+        PT_MODIFY_POSITIONS => {
+            apply_positions(b, payload_pos, &pf, fold)?;
+        }
+        PT_DELETE_ENTITIES => {
+            apply_deletes(b, payload_pos, &pf, fold)?;
+        }
+        PT_CREATE_PAGE => {
+            if let Some(pd) = parse_create_page(b, payload_pos, &pf)? {
+                pages.push(pd);
+            }
+        }
+        _ => {
+            // Best-effort text-style extraction from unhandled payloads
+            // (f4 string + f5 f32 that looks like a font size).
+            if let Some(t) = parse_text(b, payload_pos, &pf)? {
+                texts.push(t);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read an entity id from an op's f0 sf struct: `(site u16, timestamp u32)`.
+fn read_entity_id(b: &Buf, tp: usize, off: usize) -> Option<EntityId> {
+    if off == 0 {
+        return None;
+    }
+    let site = b.u16(tp + off).ok()?;
+    let ts = b.u32(tp + off + 4).ok()?;
+    Some((site, ts))
+}
+
+/// Read a vector of sf entity ids (8 bytes each) at `tp + field_off`.
+/// Each element is an inline sf struct: site u16 @0, timestamp u32 @4.
+fn read_id_vector(b: &Buf, tp: usize, field_off: usize) -> Vec<EntityId> {
+    let mut out = Vec::new();
+    if field_off == 0 {
+        return out;
+    }
+    let Ok(vec_pos) = b.follow(tp + field_off) else {
+        return out;
+    };
+    let Ok(n) = b.u32(vec_pos) else { return out };
+    for k in 0..n as usize {
+        let s = vec_pos + 4 + 8 * k;
+        if let (Ok(site), Ok(ts)) = (b.u16(s), b.u32(s + 4)) {
+            out.push((site, ts));
+        }
+    }
+    out
+}
+
+/// Apply a ModifyInk op: patch origin (f2), colour (f6), width (f7) and
+/// path (f8) on each target entity.
+fn apply_ink_patch(b: &Buf, tp: usize, fields: &[u16], fold: &mut Fold) -> Result<()> {
+    let targets = read_id_vector(b, tp, Buf::field_off(fields, MINK_F0_TARGETS));
+    let origin = read_sf(b, tp, Buf::field_off(fields, MINK_F2_ORIGIN));
+    let color = read_color(b, tp, Buf::field_off(fields, MINK_F6_COLOR));
+    let width = read_f32_field(b, tp, Buf::field_off(fields, MINK_F7_WIDTH));
+    let path_pos = if Buf::field_off(fields, MINK_F8_PATH) != 0 {
+        b.follow(tp + Buf::field_off(fields, MINK_F8_PATH)).ok()
+    } else {
+        None
+    };
+
+    for tid in &targets {
+        let Some(s) = fold.strokes.get_mut(tid) else {
+            continue;
+        };
+        if let Some([nx, ny]) = origin {
+            let dx = nx - s.anchor_x;
+            let dy = ny - s.anchor_y;
+            s.anchor_x = nx;
+            s.anchor_y = ny;
+            for p in &mut s.points {
+                p[0] += dx;
+                p[1] += dy;
+            }
+        }
+        if color.is_some() {
+            s.color = color;
+        }
+        if let Some(w) = width
+            && w.is_finite()
+            && w > 0.0
+        {
+            s.width = w;
+        }
+        if let Some(blob) = path_pos {
+            let (count, points) = decode_stroke_points(b.d, blob, s.anchor_x, s.anchor_y);
+            if count > 0 {
+                s.point_count = count;
+                s.points = points;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply a ModifyShape op: patch origin (f2), colour (f10), border (f11)
+/// and fill (f12) on each target entity.
+fn apply_shape_patch(b: &Buf, tp: usize, fields: &[u16], fold: &mut Fold) -> Result<()> {
+    let targets = read_id_vector(b, tp, Buf::field_off(fields, MSHAPE_F0_TARGETS));
+    let origin = read_sf(b, tp, Buf::field_off(fields, MSHAPE_F2_ORIGIN));
+    let color = read_color(b, tp, Buf::field_off(fields, MSHAPE_F10_COLOR));
+    let border = read_f32_field(b, tp, Buf::field_off(fields, MSHAPE_F11_BORDER));
+    let fill = read_color(b, tp, Buf::field_off(fields, MSHAPE_F12_FILL));
+
+    for tid in &targets {
+        let Some(s) = fold.shapes.get_mut(tid) else {
+            continue;
+        };
+        if let Some([nx, ny]) = origin {
+            shift_shape_origin(&mut s.geom, nx, ny);
+        }
+        if color.is_some() {
+            s.color = color;
+        }
+        if let Some(w) = border
+            && w.is_finite()
+            && w > 0.0
+        {
+            s.border_width = w;
+        }
+        if fill.is_some() {
+            s.fill = fill;
+        }
+    }
+    Ok(())
+}
+
+/// Shift a shape geometry so its origin moves to `(nx, ny)`. For Box the
+/// origin is the top-left; for Line/Polygon the origin is implicit in the
+/// absolute points, so we translate by the delta from the current origin.
+fn shift_shape_origin(geom: &mut NtbShapeGeom, nx: f32, ny: f32) {
+    match geom {
+        NtbShapeGeom::Line { x1, y1, x2, y2, c1, c2 } => {
+            let dx = nx - *x1;
+            let dy = ny - *y1;
+            *x1 = nx;
+            *y1 = ny;
+            *x2 += dx;
+            *y2 += dy;
+            if let Some(c) = c1.as_mut() {
+                c[0] += dx;
+                c[1] += dy;
+            }
+            if let Some(c) = c2.as_mut() {
+                c[0] += dx;
+                c[1] += dy;
+            }
+        }
+        NtbShapeGeom::Box { x, y, .. } => {
+            *x = nx;
+            *y = ny;
+        }
+        NtbShapeGeom::Polygon { points } => {
+            if let Some(first) = points.first().copied() {
+                let dx = nx - first[0];
+                let dy = ny - first[1];
+                for p in points.iter_mut() {
+                    p[0] += dx;
+                    p[1] += dy;
+                }
+            }
+        }
+    }
+}
+
+/// Apply a ModifyPositions op: for each ModifyPosition entry, patch the
+/// Apply a ModifyPositions op: for each ModifyPosition entry, patch the
+/// target's page (f1) and origin (f2).
+fn apply_positions(b: &Buf, tp: usize, fields: &[u16], fold: &mut Fold) -> Result<()> {
+    let f0 = Buf::field_off(fields, MPOS_F0_MODS);
+    if f0 == 0 {
+        return Ok(());
+    }
+    let vec_pos = b.follow(tp + f0)?;
+    let n = b.u32(vec_pos)? as usize;
+    for k in 0..n {
+        let slot = vec_pos + 4 + 4 * k;
+        let Ok(mp) = b.follow(slot) else { continue };
+        let (_ms, _mt, mf) = b.table(mp).unwrap_or((0, 0, Vec::new()));
+        let target = read_entity_id(b, mp, Buf::field_off(&mf, MPOS_TARGET));
+        let page = read_page_id(b, mp, Buf::field_off(&mf, MPOS_PAGE));
+        let origin = read_sf(b, mp, Buf::field_off(&mf, MPOS_ORIGIN));
+        let Some(tid) = target else { continue };
+        if let Some(s) = fold.strokes.get_mut(&tid) {
+            if let Some(p) = page {
+                s.page = Some(p);
+            }
+            if let Some([nx, ny]) = origin {
+                let dx = nx - s.anchor_x;
+                let dy = ny - s.anchor_y;
+                s.anchor_x = nx;
+                s.anchor_y = ny;
+                for pt in &mut s.points {
+                    pt[0] += dx;
+                    pt[1] += dy;
+                }
+            }
+        } else if let Some(s) = fold.shapes.get_mut(&tid) {
+            if let Some(p) = page {
+                s.page = Some(p);
+            }
+            if let Some([nx, ny]) = origin {
+                shift_shape_origin(&mut s.geom, nx, ny);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply a DeleteEntities op: add f0 deletes to the dead set, remove f1
+/// undeletes from it (order matters: a later undelete revives, a later
+/// delete re-kills).
+fn apply_deletes(b: &Buf, tp: usize, fields: &[u16], fold: &mut Fold) -> Result<()> {
+    for id in read_id_vector(b, tp, Buf::field_off(fields, DEL_F0_DELETES)) {
+        fold.deleted.insert(id);
+    }
+    for id in read_id_vector(b, tp, Buf::field_off(fields, DEL_F1_UNDELETES)) {
+        fold.deleted.remove(&id);
+    }
+    Ok(())
+}
+
+/// Parse a CreatePage op: f0 location SeqId + f1 → PageBackground → f3 size.
+fn parse_create_page(b: &Buf, tp: usize, fields: &[u16]) -> Result<Option<NtbPageDef>> {
+    let f0 = Buf::field_off(fields, PAGE_F0_LOCATION);
+    let Some(id) = read_page_id(b, tp, f0) else {
+        return Ok(None);
+    };
+    let f1 = Buf::field_off(fields, PAGE_F1_BACKGROUND);
+    if f1 == 0 {
+        return Ok(None);
+    }
+    let bg = b.follow(tp + f1)?;
+    let (_bs, _bt, bf) = b.table(bg)?;
+    let f3 = Buf::field_off(&bf, BG_F3_SIZE);
+    if f3 == 0 {
+        return Ok(None);
+    }
+    let width = b.f32(bg + f3)?;
+    let height = b.f32(bg + f3 + 4)?;
+    if !width.is_finite() || !height.is_finite() || width < 50.0 || height < 50.0
+        || width > 10_000.0 || height > 10_000.0
+    {
+        return Ok(None);
+    }
+    Ok(Some(NtbPageDef { id, width, height }))
+}
+
+/// Read a df SeqId struct (12 bytes, aligned) at `tp + off`:
+/// `site u16 @0`, `pad 2 @2`, `timestamp u32 @4`, `index u32 @8`.
+fn read_page_id(b: &Buf, tp: usize, off: usize) -> Option<PageId> {
+    if off == 0 {
+        return None;
+    }
+    let site = b.u16(tp + off).ok()?;
+    let ts = b.u32(tp + off + 4).ok()?;
+    let idx = b.u32(tp + off + 8).ok()?;
+    Some((site, ts, idx))
 }
 
 fn read_string(b: &Buf, table: usize, field_off: usize) -> Result<Option<String>> {
@@ -376,86 +840,23 @@ fn read_string(b: &Buf, table: usize, field_off: usize) -> Result<Option<String>
     Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
 }
 
-/// A decoded element from the root f6 vector, dispatched by inner-table nf.
-enum ParsedElement {
-    Stroke(NtbStroke),
-    PageDef(NtbPageDef),
-    Text(NtbText),
-    Shape(NtbShape),
+/// Read an Sf struct (2×f32) inline at `tp + off`. `None` when off == 0.
+fn read_sf(b: &Buf, tp: usize, off: usize) -> Option<[f32; 2]> {
+    if off == 0 {
+        return None;
+    }
+    let x = b.f32(tp + off).ok()?;
+    let y = b.f32(tp + off + 4).ok()?;
+    if x.is_finite() && y.is_finite() { Some([x, y]) } else { None }
 }
 
-/// Parse one element: wrapper (nf=6) → inner table. Dispatches on the inner
-/// table's field count (nf) to the appropriate decoder.
-fn parse_element(b: &Buf, el_pos: usize) -> Result<Option<ParsedElement>> {
-    let (_ws, _wt, wf) = b.table(el_pos)?;
-    if wf.len() != 6 {
-        return Ok(None); // wrapper always has 6 vtable fields
+/// Read an f32 field at `tp + off`. `None` when off == 0 or non-finite.
+fn read_f32_field(b: &Buf, tp: usize, off: usize) -> Option<f32> {
+    if off == 0 {
+        return None;
     }
-    let f5 = *wf.get(5).unwrap_or(&0) as usize;
-    if f5 == 0 {
-        return Ok(None);
-    }
-    let inner = b.follow(el_pos + f5)?;
-    let (_is, _it, inf) = b.table(inner)?;
-    match inf.len() {
-        16 => {
-            let stroke = parse_stroke(b, inner, &inf)?;
-            // Only emit strokes with trailer-verified points; nf=16 elements
-            // with an empty or unrecognised blob are not handwriting.
-            if stroke.point_count == 0 {
-                return Ok(None);
-            }
-            Ok(Some(ParsedElement::Stroke(stroke)))
-        }
-        2 => Ok(parse_page_def(b, inner, &inf)?.map(ParsedElement::PageDef)),
-        8 => Ok(parse_text(b, inner, &inf)?.map(ParsedElement::Text)),
-        11 | 12 | 15 => Ok(parse_shape(b, inner, &inf)?.map(ParsedElement::Shape)),
-        _ => Ok(None), // other types undecoded
-    }
-}
-
-/// Parse a page definition (inner nf=2). f1 is a vector whose first two f32s
-/// are the page width and height in points.
-fn parse_page_def(b: &Buf, tp: usize, fields: &[u16]) -> Result<Option<NtbPageDef>> {
-    let f1 = *fields.get(1).unwrap_or(&0) as usize;
-    if f1 == 0 {
-        return Ok(None);
-    }
-    let vec_pos = b.follow(tp + f1)?;
-    let n = b.u32(vec_pos)? as usize;
-    if n < 2 {
-        return Ok(None);
-    }
-    let width = b.f32(vec_pos + 4)?;
-    let height = b.f32(vec_pos + 8)?;
-    // Validate: reasonable page dimensions (reject garbage from non-page nf=2).
-    if !width.is_finite() || !height.is_finite() || width < 50.0 || height < 50.0
-        || width > 10_000.0 || height > 10_000.0
-    {
-        return Ok(None);
-    }
-    Ok(Some(NtbPageDef { width, height }))
-}
-
-/// Parse a text style record (inner nf=8). f4 is a string (font family), f5
-/// is an f32 font size. The actual text characters are stored elsewhere.
-fn parse_text(b: &Buf, tp: usize, fields: &[u16]) -> Result<Option<NtbText>> {
-    let f4 = *fields.get(4).unwrap_or(&0) as usize;
-    let f5 = *fields.get(5).unwrap_or(&0) as usize;
-    let font = if f4 != 0 {
-        read_string(b, tp, f4)?.unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let size = if f5 != 0 {
-        b.f32(tp + f5).unwrap_or(0.0)
-    } else {
-        0.0
-    };
-    if font.is_empty() && size <= 0.0 {
-        return Ok(None);
-    }
-    Ok(Some(NtbText { font, size }))
+    let v = b.f32(tp + off).ok()?;
+    v.is_finite().then_some(v)
 }
 
 /// Read a colour u32 at `tp + off`. The alpha byte is `0xFF` for opaque
@@ -482,126 +883,175 @@ pub fn rgba_from_u32(v: u32) -> [f32; 4] {
     ]
 }
 
-/// Parse a shape (inner nf=11/12/15 with an f5 geometry vector).
-///
-/// - f1: struct 2×f32 `(X, Y)` — absolute anchor, same layout as strokes.
-/// - f5: vector of f32s. Length 8/12 → dims are `(v0, v1)`; length 14 →
-///   first slot is a header and dims are `(v1, v2)`.
-/// - colour: layout-driven at f7/f9/f10 depending on nf (see below);
-///   width: first plausible f32 among f8/f9/f10 that is not the colour.
-/// - f4: u8 subtype (1 and 3 observed).
+/// Parse a shape (CreateShape payload). Field indices from the web schema;
+/// origin is top-left. Returns `None` on unparseable geometry.
 fn parse_shape(b: &Buf, tp: usize, fields: &[u16]) -> Result<Option<NtbShape>> {
-    let field = |i: usize| -> usize { *fields.get(i).unwrap_or(&0) as usize };
-    let f1 = field(1);
-    let f5 = field(5);
-    if f1 == 0 || f5 == 0 {
-        return Ok(None);
-    }
+    let field = |i: usize| -> usize { Buf::field_off(fields, i) };
 
-    // Anchor (X, Y): first f32 is horizontal, second is vertical (top-down).
-    // Thumbnail-overlay verified: dots at (f32[0], f32[1) track the handwriting
-    // exactly; the opposite order scatters over empty margin/grid.
-    let anchor_x = b.f32(tp + f1).unwrap_or(f32::NAN);
-    let anchor_y = b.f32(tp + f1 + 4).unwrap_or(f32::NAN);
-    if !anchor_x.is_finite() || !anchor_y.is_finite() {
-        return Ok(None);
-    }
+    // f0: page SeqId (df, 12B aligned).
+    let page = read_page_id(b, tp, field(SHAPE_F0_PAGE));
 
-    // Geometry vector.
-    let vec_pos = b.follow(tp + f5)?;
-    let n = b.u32(vec_pos)? as usize;
-    let (dx, dy) = match n {
-        8 | 12 => (b.f32(vec_pos + 4)?, b.f32(vec_pos + 8)?),
-        14 => (b.f32(vec_pos + 8)?, b.f32(vec_pos + 12)?),
-        _ => return Ok(None),
+    // f1: origin (Sf, top-left of the bounding box).
+    let Some([origin_x, origin_y]) = read_sf(b, tp, field(SHAPE_F1_ORIGIN)) else {
+        return Ok(None);
     };
-    if !dx.is_finite() || !dy.is_finite() || dx.abs() > 10_000.0 || dy.abs() > 10_000.0 {
-        return Ok(None);
-    }
-    if dx == 0.0 && dy == 0.0 {
-        return Ok(None);
-    }
 
-    // Colour: layout-driven, never a scan — scanning false-positives on
-    // noise fields (f0/f4 hold values like `0xfffedc01` whose low byte is
-    // `0x01`, mirroring the stroke f5 noise). Observed: nf=15 → f7;
-    // nf=11 → f9 or f10; nf=12 → f7 or f9 (f11 may be a fill colour and
-    // is left unused — fill stays transparent).
-    let mut color = None;
-    let mut color_idx = 0;
-    for i in [7usize, 9, 10] {
-        let o = field(i);
-        if o == 0 {
-            continue;
-        }
-        if let Some(c) = read_color(b, tp, o) {
-            color = Some(c);
-            color_idx = i;
-            break;
-        }
-    }
+    // f2: rotation (degrees).
+    let rotation = read_f32_field(b, tp, field(SHAPE_F2_ROTATION)).unwrap_or(0.0);
 
-    // Width: an f32 in 0.01..=100 among the neighbouring fields
-    // (f8/f9/f10 in samples); whichever of them is not the colour.
-    let mut width = 0.0;
-    for i in [8usize, 9, 10] {
-        if i == color_idx {
-            continue;
-        }
-        let o = field(i);
-        if o == 0 {
-            continue;
-        }
-        if let Ok(v) = b.f32(tp + o)
-            && v.is_finite()
-            && (0.01..=100.0).contains(&v)
-        {
-            width = v;
-            break;
-        }
-    }
-
-    let subtype = if field(4) != 0 {
-        b.d.get(tp + field(4)).copied().unwrap_or(0)
+    // f4: definitionType u8.
+    let def_type = if field(SHAPE_F4_DEF_TYPE) != 0 {
+        b.u8(tp + field(SHAPE_F4_DEF_TYPE)).unwrap_or(0)
     } else {
         0
     };
 
+    // f5: definition union.
+    let Some(geom) = parse_shape_def(b, tp, field(SHAPE_F5_DEF), def_type, origin_x, origin_y)?
+    else {
+        return Ok(None);
+    };
+
+    let color = read_color(b, tp, field(SHAPE_F9_COLOR));
+    let fill = read_color(b, tp, field(SHAPE_F11_FILL));
+    let border_width = read_f32_field(b, tp, field(SHAPE_F10_BORDER)).unwrap_or(1.0);
+
     Ok(Some(NtbShape {
-        anchor_x,
-        anchor_y,
-        dx,
-        dy,
-        vector_len: n,
+        page,
+        geom,
+        rotation,
         color,
-        width,
-        subtype,
+        fill,
+        border_width,
     }))
 }
 
-fn parse_stroke(b: &Buf, tp: usize, fields: &[u16]) -> Result<NtbStroke> {
-    let field = |i: usize| -> usize { *fields.get(i).unwrap_or(&0) as usize };
+/// Parse a shape definition union at `tp + def_off`, dispatched on
+/// `def_type`. Points are origin-relative and converted to absolute.
+fn parse_shape_def(
+    b: &Buf,
+    tp: usize,
+    def_off: usize,
+    def_type: u8,
+    origin_x: f32,
+    origin_y: f32,
+) -> Result<Option<NtbShapeGeom>> {
+    if def_off == 0 {
+        return Ok(None);
+    }
+    let dpos = b.follow(tp + def_off)?;
+    let (_ds, _dt, df) = b.table(dpos)?;
+    let dfield = |i: usize| -> usize { Buf::field_off(&df, i) };
 
-    // f1: struct 2×f32 `(X, Y)` — absolute page anchor, same layout as strokes.
-    let (anchor_x, anchor_y) = if field(STROKE_F1_ANCHOR) != 0 {
-        let off = tp + field(STROKE_F1_ANCHOR);
-        (b.f32(off).unwrap_or(0.0), b.f32(off + 4).unwrap_or(0.0))
+    match def_type {
+        DEF_LINE => {
+            // start (f0), cp1 (f1), cp2 (f2), end (f3) — inline Sf structs.
+            let Some([sx, sy]) = read_sf(b, dpos, dfield(0)) else {
+                return Ok(None);
+            };
+            let Some([ex, ey]) = read_sf(b, dpos, dfield(3)) else {
+                return Ok(None);
+            };
+            let c1 = read_sf(b, dpos, dfield(1));
+            let c2 = read_sf(b, dpos, dfield(2));
+            Ok(Some(NtbShapeGeom::Line {
+                x1: origin_x + sx,
+                y1: origin_y + sy,
+                x2: origin_x + ex,
+                y2: origin_y + ey,
+                c1: c1.map(|[x, y]| [origin_x + x, origin_y + y]),
+                c2: c2.map(|[x, y]| [origin_x + x, origin_y + y]),
+            }))
+        }
+        DEF_NORMAL => {
+            // type (f0, i8, default Ellipse=0), size (f1, vf 2×f32 inline).
+            let ntype = if dfield(0) != 0 {
+                b.u8(dpos + dfield(0)).unwrap_or(0)
+            } else {
+                0
+            };
+            let Some([w, h]) = read_sf(b, dpos, dfield(1)) else {
+                return Ok(None);
+            };
+            if !w.is_finite() || !h.is_finite() || w == 0.0 && h == 0.0 {
+                return Ok(None);
+            }
+            Ok(Some(NtbShapeGeom::Box {
+                x: origin_x,
+                y: origin_y,
+                w,
+                h,
+                ellipse: ntype == 0,
+            }))
+        }
+        DEF_POLYGON => {
+            // points (f0): vector of inline Sf structs.
+            let f0 = dfield(0);
+            if f0 == 0 {
+                return Ok(None);
+            }
+            let vec_pos = b.follow(dpos + f0)?;
+            let n = b.u32(vec_pos)? as usize;
+            if n < 2 {
+                return Ok(None);
+            }
+            let mut points = Vec::with_capacity(n);
+            for k in 0..n {
+                let off = vec_pos + 4 + 8 * k;
+                let Ok(x) = b.f32(off) else { break };
+                let Ok(y) = b.f32(off + 4) else { break };
+                points.push([origin_x + x, origin_y + y]);
+            }
+            if points.len() < 2 {
+                return Ok(None);
+            }
+            Ok(Some(NtbShapeGeom::Polygon { points }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Parse a text style record (best-effort from any payload: f4 string +
+/// f5 f32). Used only for unhandled payload types.
+fn parse_text(b: &Buf, tp: usize, fields: &[u16]) -> Result<Option<NtbText>> {
+    let f4 = Buf::field_off(fields, 4);
+    let f5 = Buf::field_off(fields, 5);
+    let font = if f4 != 0 {
+        read_string(b, tp, f4)?.unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let size = if f5 != 0 {
+        b.f32(tp + f5).unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    if font.is_empty() && size <= 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(NtbText { font, size }))
+}
+
+/// Parse a CreateInk payload into a stroke.
+fn parse_stroke(b: &Buf, tp: usize, fields: &[u16]) -> Result<NtbStroke> {
+    let field = |i: usize| -> usize { Buf::field_off(fields, i) };
+
+    // f0: page SeqId (df, 12B aligned).
+    let page = read_page_id(b, tp, field(INK_F0_PAGE));
+
+    // f1: origin (Sf 2×f32) — absolute page anchor.
+    let (anchor_x, anchor_y) = if let Some([x, y]) = read_sf(b, tp, field(INK_F1_ORIGIN)) {
+        (x, y)
     } else {
         (0.0, 0.0)
     };
 
     // f8: f32 width.
-    let width = if field(STROKE_F8_WIDTH) != 0 {
-        b.f32(tp + field(STROKE_F8_WIDTH)).unwrap_or(0.0)
-    } else {
-        0.0
-    };
+    let width = read_f32_field(b, tp, field(INK_F8_WIDTH)).unwrap_or(0.0);
 
-    // f9: uoffset to the point blob. Follow the uoffset from the field slot —
-    // the target is NOT always at tp+tsize (shifted Type B layouts store a
-    // larger table with f9 pointing past it).
-    let (point_count, points) = if field(STROKE_F9_POINTS) != 0 {
-        match b.follow(tp + field(STROKE_F9_POINTS)) {
+    // f9: uoffset to the point blob.
+    let (point_count, points) = if field(INK_F9_PATH) != 0 {
+        match b.follow(tp + field(INK_F9_PATH)) {
             Ok(blob) => decode_stroke_points(b.d, blob, anchor_x, anchor_y),
             Err(_) => (0, Vec::new()),
         }
@@ -609,21 +1059,39 @@ fn parse_stroke(b: &Buf, tp: usize, fields: &[u16]) -> Result<NtbStroke> {
         (0, Vec::new())
     };
 
-    // Colour is always at f7 (PDF-verified: `0xff1515b5` ↔ `#b51515`).
-    // f5 looks similar but is noise — its low byte is always `0x01`.
-    let color = fields
-        .get(7)
-        .copied()
-        .filter(|&o| o != 0)
-        .and_then(|o| read_color(b, tp, o as usize));
+    // f7: colour (gf). PDF-verified: `0xff1515b5` ↔ `#b515b5`.
+    let color = read_color(b, tp, field(INK_F7_COLOR));
+
+    // f4/f5: tool and style enums (i8).
+    let tool = if field(INK_F4_TOOL) != 0 {
+        b.u8(tp + field(INK_F4_TOOL)).ok().map(|v| v as i8)
+    } else {
+        None
+    };
+    let style = if field(INK_F5_STYLE) != 0 {
+        b.u8(tp + field(INK_F5_STYLE)).ok().map(|v| v as i8)
+    } else {
+        None
+    };
+
+    // f15: audio duration (i32 ms).
+    let audio_duration_ms = if field(INK_F15_AUDIO_DURATION) != 0 {
+        b.i32(tp + field(INK_F15_AUDIO_DURATION)).ok()
+    } else {
+        None
+    };
 
     Ok(NtbStroke {
+        page,
         anchor_x,
         anchor_y,
         width,
         point_count,
         points,
         color,
+        tool,
+        style,
+        audio_duration_ms,
     })
 }
 
@@ -638,16 +1106,28 @@ fn parse_stroke(b: &Buf, tp: usize, fields: &[u16]) -> Result<NtbStroke> {
 /// constant 5-byte trailer. The record count is found by scanning for the
 /// trailer at 19-byte stride (the header length field is unreliable).
 ///
+/// A few strokes (2 in G1) carry a shifted header; when the aligned scan
+/// finds nothing, the decoder retries at byte offsets 1..19 to recover
+/// alignment (see §4.4).
+///
 /// Points are returned in absolute page coordinates (anchor + relative),
 /// sampled at [`BEZIER_SAMPLES`] steps per cubic.
 fn decode_stroke_points(d: &[u8], blob: usize, anchor_x: f32, anchor_y: f32) -> (usize, Vec<[f32; 2]>) {
     // Count records via trailer scan (ground truth; the header length admits
     // false positives on non-stroke blobs).
-    let mut count = 0usize;
-    let mut p = blob;
-    while p + POINT_STRIDE <= d.len() && d[p + 14..p + 19] == POINT_TRAILER {
-        count += 1;
-        p += POINT_STRIDE;
+    let mut count = scan_trailers(d, blob);
+    let mut base = blob;
+    if count == 0 {
+        // Fallback: shifted-header strokes (2 known in G1). Try each
+        // alignment offset until trailers line up.
+        for shift in 1..POINT_STRIDE {
+            let c = scan_trailers(d, blob + shift);
+            if c > 0 {
+                count = c;
+                base = blob + shift;
+                break;
+            }
+        }
     }
     if count == 0 {
         return (0, Vec::new());
@@ -657,7 +1137,7 @@ fn decode_stroke_points(d: &[u8], blob: usize, anchor_x: f32, anchor_y: f32) -> 
     points.push([anchor_x, anchor_y]);
     let mut cur = [0.0f32, 0.0f32]; // relative
     for k in 1..count {
-        let off = blob + k * POINT_STRIDE;
+        let off = base + k * POINT_STRIDE;
         let c1 = read_f16_point(d, off);
         let c2 = read_f16_point(d, off + 4);
         let end = read_f16_point(d, off + 8);
@@ -684,6 +1164,18 @@ fn decode_stroke_points(d: &[u8], blob: usize, anchor_x: f32, anchor_y: f32) -> 
         }
     }
     (count, points)
+}
+
+/// Count consecutive 19-byte records starting at `start` whose last 5 bytes
+/// match the constant trailer.
+fn scan_trailers(d: &[u8], start: usize) -> usize {
+    let mut count = 0usize;
+    let mut p = start;
+    while p + POINT_STRIDE <= d.len() && d[p + 14..p + 19] == POINT_TRAILER {
+        count += 1;
+        p += POINT_STRIDE;
+    }
+    count
 }
 
 /// Read an IEEE-754 half-precision point `(x, y)` at `off`. Returns `None`
@@ -718,56 +1210,144 @@ fn f16_to_f32(bits: u16) -> f32 {
 // Conversion to renderable pages
 // ---------------------------------------------------------------------------
 
-/// One renderable page. `.ntb` notebooks are continuous-scroll, so strokes
-/// and shapes are assigned to pages by their Y coordinate using the given
-/// page height.
+/// One renderable page with its dimensions.
 #[derive(Debug)]
 pub struct NtbPage {
     pub strokes: Vec<NtbStroke>,
     pub shapes: Vec<NtbShape>,
+    pub width: f32,
+    pub height: f32,
 }
 
-/// Split strokes and shapes into pages of `page_h` points each (top-down Y).
+/// Split strokes and shapes into pages.
 ///
-/// Notability's cloud notebooks are continuous-scroll; the matching PDF export
-/// paginates at A4 height (841.89 pt) or a multiple thereof. Callers pick the
-/// height that matches the target output.
+/// Primary strategy: group by the page SeqId carried on each entity's Create
+/// op (CreateInk/CreateShape f0). Page dimensions come from the matching
+/// CreatePage background (by location SeqId), defaulting to A4. Entities
+/// without a page id fall through to the secondary Y-slice strategy.
+///
+/// Secondary strategy (no page ids at all): split by Y coordinate at
+/// `page_h` points — the continuous-scroll approximation.
 pub fn paginate(doc: &NtbDocument, page_h: f32) -> Vec<NtbPage> {
-    let empty = || NtbPage {
+    let a4 = || NtbPage {
         strokes: Vec::new(),
         shapes: Vec::new(),
+        width: NTB_PAGE_W,
+        height: if page_h > 0.0 { page_h } else { NTB_PAGE_H },
     };
-    if page_h <= 0.0 || (doc.strokes.is_empty() && doc.shapes.is_empty()) {
+    if doc.strokes.is_empty() && doc.shapes.is_empty() {
+        return vec![NtbPage {
+            strokes: Vec::new(),
+            shapes: Vec::new(),
+            width: NTB_PAGE_W,
+            height: if page_h > 0.0 { page_h } else { NTB_PAGE_H },
+        }];
+    }
+
+    // Page-id grouping when every entity carries one.
+    let all_have_ids = doc.strokes.iter().all(|s| s.page.is_some())
+        && doc.shapes.iter().all(|s| s.page.is_some());
+    if all_have_ids {
+        return paginate_by_page_id(doc, page_h);
+    }
+
+    // Y-slice fallback.
+    if page_h <= 0.0 {
         return vec![NtbPage {
             strokes: doc.strokes.clone(),
             shapes: doc.shapes.clone(),
+            width: NTB_PAGE_W,
+            height: NTB_PAGE_H,
         }];
     }
     let max_y = doc
         .strokes
         .iter()
         .map(|s| s.anchor_y)
-        .chain(doc.shapes.iter().map(|s| s.anchor_y))
+        .chain(doc.shapes.iter().map(shape_anchor_y))
         .fold(0.0f32, f32::max);
     let n_pages = ((max_y / page_h).ceil() as usize).max(1);
-    let mut pages: Vec<NtbPage> = (0..n_pages).map(|_| empty()).collect();
+    let mut pages: Vec<NtbPage> = (0..n_pages).map(|_| a4()).collect();
     for s in &doc.strokes {
         let idx = ((s.anchor_y / page_h).floor() as usize).min(n_pages - 1);
         pages[idx].strokes.push(s.clone());
     }
     for s in &doc.shapes {
-        let idx = ((s.anchor_y / page_h).floor() as usize).min(n_pages - 1);
+        let idx = ((shape_anchor_y(s) / page_h).floor() as usize).min(n_pages - 1);
         pages[idx].shapes.push(s.clone());
     }
     pages
+}
+
+/// Group by page SeqId in first-appearance order (stroke/shape creation
+/// order). Dimensions from matching CreatePage defs; default A4.
+fn paginate_by_page_id(doc: &NtbDocument, fallback_h: f32) -> Vec<NtbPage> {
+    use std::collections::HashMap as Map;
+
+    let default_h = if fallback_h > 0.0 { fallback_h } else { NTB_PAGE_H };
+    let def_by_id: Map<PageId, (f32, f32)> = doc
+        .pages
+        .iter()
+        .map(|p| (p.id, (p.width, p.height)))
+        .collect();
+
+    let mut order: Vec<PageId> = Vec::new();
+    let mut groups: Map<PageId, NtbPage> = Map::new();
+    for s in &doc.strokes {
+        if let Some(id) = s.page {
+            groups.entry(id).or_insert_with(|| {
+                order.push(id);
+                let (w, h) = def_by_id.get(&id).copied().unwrap_or((NTB_PAGE_W, default_h));
+                NtbPage {
+                    strokes: Vec::new(),
+                    shapes: Vec::new(),
+                    width: w,
+                    height: h,
+                }
+            });
+            if let Some(p) = groups.get_mut(&id) {
+                p.strokes.push(s.clone());
+            }
+        }
+    }
+    for s in &doc.shapes {
+        if let Some(id) = s.page {
+            groups.entry(id).or_insert_with(|| {
+                order.push(id);
+                let (w, h) = def_by_id.get(&id).copied().unwrap_or((NTB_PAGE_W, default_h));
+                NtbPage {
+                    strokes: Vec::new(),
+                    shapes: Vec::new(),
+                    width: w,
+                    height: h,
+                }
+            });
+            if let Some(p) = groups.get_mut(&id) {
+                p.shapes.push(s.clone());
+            }
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|id| groups.remove(&id))
+        .collect()
+}
+
+/// Y anchor of a shape for pagination (top of the bounding box).
+fn shape_anchor_y(s: &NtbShape) -> f32 {
+    match &s.geom {
+        NtbShapeGeom::Line { y1, .. } => *y1,
+        NtbShapeGeom::Box { y, .. } => *y,
+        NtbShapeGeom::Polygon { points } => points.first().map(|p| p[1]).unwrap_or(0.0),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Public helpers for external callers (e.g. the convert pipeline)
 // ---------------------------------------------------------------------------
 
-/// Default page width/height used when the notebook has no page definitions:
-/// A4 portrait at 72 dpi (matches the PDF exports of all 9 samples).
+/// Default page width/height used for pagination: A4 portrait at 72 dpi
+/// (matches the PDF exports of all 9 samples).
 pub const NTB_PAGE_W: f32 = 595.28;
 pub const NTB_PAGE_H: f32 = 841.89;
 
@@ -781,29 +1361,22 @@ pub fn parse_bundle_public(bundle: &[u8]) -> Result<BundleParts> {
 // Conversion into the portable Page / Document model
 // ---------------------------------------------------------------------------
 
-/// Convert an `.ntb` document into a list of portable [`Page`] objects,
-/// one per page slice.
+/// Convert an `.ntb` document into a list of portable [`Page`] objects.
 ///
-/// When the notebook contains page definitions (nf=2), the first page's height
-/// is used for pagination; otherwise `page_h` is the fallback.
+/// Pagination groups entities by their Create-op page SeqId (falling back to
+/// Y-slicing when page ids are absent); each page uses its CreatePage
+/// dimensions (or A4). Strokes are emitted with their decoded cubic-Bézier
+/// paths (sampled to polylines). A 1-record stroke (moveto only) degenerates
+/// to a zero-length mark at its anchor. Stroke colours come from the element
+/// colour field (`0xAABBGGRR`) and default to opaque black.
 ///
-/// Strokes are emitted with their decoded cubic-Bézier paths (sampled to
-/// polylines). A 1-record stroke (moveto only) degenerates to a zero-length
-/// mark at its anchor. Stroke colours come from the element colour field
-/// (`0xAABBGGRR`) and default to opaque black.
-///
-/// Shapes are emitted as [`ShapeEl`] rectangles/ellipses sized from the f5
-/// geometry vector, or as 2-point [`Item::Stroke`] lines when the vector
-/// encodes a line delta (see [`NtbShape`]). Shape outlines are stroked, not
-/// filled, because no fill colour was found in the samples.
+/// Shapes map their geometry onto the portable IR: Lines become 2-point
+/// strokes (or sampled cubics when control points are present); NormalShape
+/// boxes become ellipses or rectangles at the top-left origin; Polygons
+/// become polygon shapes. Fill colours (when present) are applied.
 pub fn to_pages(doc: &NtbDocument, page_h: f32) -> Vec<Page> {
-    let effective_h = doc.pages.first().map(|p| p.height).unwrap_or(page_h);
-    let (page_w, page_h) = doc
-        .pages
-        .first()
-        .map(|p| (p.width, p.height))
-        .unwrap_or((NTB_PAGE_W, page_h));
-    paginate(doc, effective_h)
+    let page_h = if page_h > 0.0 { page_h } else { NTB_PAGE_H };
+    paginate(doc, page_h)
         .into_iter()
         .enumerate()
         .map(|(i, np)| {
@@ -836,54 +1409,296 @@ pub fn to_pages(doc: &NtbDocument, page_h: f32) -> Vec<Page> {
             Page {
                 uuid: format!("ntb-p{i:04}"),
                 items,
-                width: page_w,
-                height: page_h,
+                width: np.width,
+                height: np.height,
             }
         })
         .collect()
 }
 
 const BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+const TRANSPARENT: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
 
-/// Map an [`NtbShape`] onto the portable IR. Lines become a 2-point stroke
-/// (same dash convention as handwriting); closed shapes become a [`ShapeEl`]
-/// whose bbox starts at the anchor with the vector's dims as w/h.
+/// Map an [`NtbShape`] onto the portable IR.
 fn shape_to_item(s: &NtbShape) -> Item {
-    let rgba = s.color.map(rgba_from_u32).unwrap_or(BLACK);
-    let width = if s.width.is_finite() && s.width > 0.0 {
-        s.width
+    let stroke_rgba = s.color.map(rgba_from_u32).unwrap_or(BLACK);
+    let fill_rgba = s.fill.map(rgba_from_u32).unwrap_or(TRANSPARENT);
+    let width = if s.border_width.is_finite() && s.border_width > 0.0 {
+        s.border_width
     } else {
         1.0
     };
-    if s.vector_len == 12 || s.vector_len == 14 {
-        return Item::Stroke(Stroke {
-            points: vec![[s.anchor_x, s.anchor_y], [s.anchor_x + s.dx, s.anchor_y + s.dy]],
+    match &s.geom {
+        NtbShapeGeom::Line { x1, y1, x2, y2, c1, c2 } => {
+            // Cubic when both controls present; straight otherwise.
+            let points = match (c1, c2) {
+                (Some(c1), Some(c2)) => sample_cubic([*x1, *y1], *c1, *c2, [*x2, *y2]),
+                _ => vec![[*x1, *y1], [*x2, *y2]],
+            };
+            Item::Stroke(Stroke {
+                points,
+                width,
+                rgba: stroke_rgba,
+                dash: None,
+                parented: false,
+            })
+        }
+        NtbShapeGeom::Box { x, y, w, h, ellipse } => Item::Shape(ShapeEl {
+            kind: if *ellipse { ShapeKind::Ellipse } else { ShapeKind::Rect },
+            x: *x,
+            y: *y,
+            w: w.abs(),
+            h: h.abs(),
+            points: Vec::new(),
+            rotation: s.rotation,
+            fill: fill_rgba,
+            stroke: stroke_rgba,
             width,
-            rgba,
             dash: None,
-            parented: false,
-        });
+            radius: 0.0,
+            uuid: None,
+            from_f9: false,
+        }),
+        NtbShapeGeom::Polygon { points } => Item::Shape(ShapeEl {
+            kind: ShapeKind::Polygon,
+            x: points.first().map(|p| p[0]).unwrap_or(0.0),
+            y: points.first().map(|p| p[1]).unwrap_or(0.0),
+            w: 0.0,
+            h: 0.0,
+            points: points.clone(),
+            rotation: s.rotation,
+            fill: fill_rgba,
+            stroke: stroke_rgba,
+            width,
+            dash: None,
+            radius: 0.0,
+            uuid: None,
+            from_f9: false,
+        }),
     }
-    // n = 8: ellipse when the two dims are near-equal, otherwise rectangle.
-    let kind = if (s.dx - s.dy).abs() <= 0.05 * s.dx.abs().max(s.dy.abs()).max(1.0) {
-        ShapeKind::Ellipse
-    } else {
-        ShapeKind::Rect
-    };
-    Item::Shape(ShapeEl {
-        kind,
-        x: s.anchor_x,
-        y: s.anchor_y,
-        w: s.dx.abs(),
-        h: s.dy.abs(),
-        points: Vec::new(),
-        rotation: 0.0,
-        fill: [0.0, 0.0, 0.0, 0.0],
-        stroke: rgba,
-        width,
-        dash: None,
-        radius: 0.0,
-        uuid: None,
-        from_f9: false,
-    })
+}
+
+/// Sample a cubic Bézier into a polyline (same step count as stroke paths).
+fn sample_cubic(p0: [f32; 2], c1: [f32; 2], c2: [f32; 2], p3: [f32; 2]) -> Vec<[f32; 2]> {
+    let mut pts = Vec::with_capacity(BEZIER_SAMPLES + 1);
+    pts.push(p0);
+    for i in 1..=BEZIER_SAMPLES {
+        let t = i as f32 / BEZIER_SAMPLES as f32;
+        let u = 1.0 - t;
+        let (ur, ut) = (u * u, t * t);
+        let x = u * ur * p0[0] + 3.0 * ur * t * c1[0] + 3.0 * u * ut * c2[0] + t * ut * p3[0];
+        let y = u * ur * p0[1] + 3.0 * ur * t * c1[1] + 3.0 * u * ut * c2[1] + t * ut * p3[1];
+        pts.push([x, y]);
+    }
+    pts
+}
+
+// ---------------------------------------------------------------------------
+// Tests (pure helpers + synthetic fold fixtures)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f16_roundtrip_simple() {
+        // 1.0 = 0x3C00
+        assert!((f16_to_f32(0x3C00) - 1.0).abs() < 1e-6);
+        // 0.0
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+        // -2.0 = 0xC000
+        assert!((f16_to_f32(0xC000) + 2.0).abs() < 1e-6);
+        // infinity
+        assert!(f16_to_f32(0x7C00).is_infinite());
+        // NaN
+        assert!(f16_to_f32(0x7E00).is_nan());
+    }
+
+    #[test]
+    fn rgba_layout() {
+        // 0xAABBGGRR with LE bytes R,G,B,A.
+        let [r, g, b, a] = rgba_from_u32(0xFF1515B5);
+        assert_eq!((r * 255.0) as u8, 0xB5);
+        assert_eq!((g * 255.0) as u8, 0x15);
+        assert_eq!((b * 255.0) as u8, 0x15);
+        assert_eq!((a * 255.0) as u8, 0xFF);
+    }
+
+    #[test]
+    fn trailer_scan_counts_records() {
+        // Two 19-byte records with valid trailers.
+        let mut blob = vec![0u8; 38];
+        blob[14..19].copy_from_slice(&POINT_TRAILER);
+        blob[33..38].copy_from_slice(&POINT_TRAILER);
+        assert_eq!(scan_trailers(&blob, 0), 2);
+        // Broken trailer at record 1 → only 1.
+        blob[33] = 1;
+        assert_eq!(scan_trailers(&blob, 0), 1);
+        // Shifted header: valid records start at offset 3.
+        let mut shifted = vec![0u8; 3 + 19];
+        shifted[3 + 14..3 + 19].copy_from_slice(&POINT_TRAILER);
+        assert_eq!(scan_trailers(&shifted, 0), 0);
+        assert_eq!(scan_trailers(&shifted, 3), 1);
+    }
+
+    #[test]
+    fn decode_recovers_shifted_header() {
+        // One record with a 3-byte shifted header: the aligned scan fails,
+        // the fallback finds it.
+        let mut blob = vec![0xAAu8; 3 + 19];
+        // Trailer at the shifted record's +14.
+        blob[3 + 14..3 + 19].copy_from_slice(&POINT_TRAILER);
+        // End point (record 0 bytes 8..12) = (0, 0) halves.
+        // (already zero)
+        let (count, points) = decode_stroke_points(&blob, 0, 10.0, 20.0);
+        assert_eq!(count, 1);
+        assert_eq!(points, vec![[10.0, 20.0]]);
+    }
+
+    #[test]
+    fn shape_line_absolute_points() {
+        // Synthetic Line definition: origin (10, 20), start (0, 0), end (5, 5).
+        // Build a minimal table by hand is complex; instead test the geometry
+        // mapping indirectly via shape_to_item on a constructed NtbShape.
+        let s = NtbShape {
+            page: None,
+            geom: NtbShapeGeom::Line {
+                x1: 10.0,
+                y1: 20.0,
+                x2: 15.0,
+                y2: 25.0,
+                c1: None,
+                c2: None,
+            },
+            rotation: 0.0,
+            color: Some(0xFF000000),
+            fill: None,
+            border_width: 1.0,
+        };
+        let item = shape_to_item(&s);
+        match item {
+            Item::Stroke(st) => {
+                assert_eq!(st.points, vec![[10.0, 20.0], [15.0, 25.0]]);
+            }
+            other => panic!("expected stroke, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shape_box_becomes_ellipse() {
+        let s = NtbShape {
+            page: None,
+            geom: NtbShapeGeom::Box {
+                x: 10.0,
+                y: 20.0,
+                w: 30.0,
+                h: 40.0,
+                ellipse: true,
+            },
+            rotation: 0.0,
+            color: Some(0xFF000000),
+            fill: Some(0xFFFFFFFF),
+            border_width: 2.0,
+        };
+        let item = shape_to_item(&s);
+        match item {
+            Item::Shape(sh) => {
+                assert_eq!(sh.kind, ShapeKind::Ellipse);
+                assert_eq!(sh.x, 10.0);
+                assert_eq!(sh.y, 20.0);
+                assert_eq!(sh.w, 30.0);
+                assert_eq!(sh.h, 40.0);
+                let [r, _g, _b, a] = sh.fill;
+                assert_eq!((r * 255.0) as u8, 0xFF);
+                assert_eq!((a * 255.0) as u8, 0xFF);
+            }
+            other => panic!("expected shape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shift_box_origin() {
+        let mut geom = NtbShapeGeom::Box { x: 1.0, y: 2.0, w: 3.0, h: 4.0, ellipse: true };
+        shift_shape_origin(&mut geom, 10.0, 20.0);
+        match geom {
+            NtbShapeGeom::Box { x, y, .. } => {
+                assert_eq!(x, 10.0);
+                assert_eq!(y, 20.0);
+            }
+            other => panic!("expected box, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paginate_splits_by_y() {
+        let mk = |y: f32| NtbStroke {
+            page: None,
+            anchor_x: 0.0,
+            anchor_y: y,
+            width: 1.0,
+            point_count: 1,
+            points: vec![],
+            color: None,
+            tool: None,
+            style: None,
+            audio_duration_ms: None,
+        };
+        let doc = NtbDocument {
+            meta: NtbMeta::default(),
+            strokes: vec![mk(100.0), mk(900.0), mk(1700.0)],
+            pages: vec![],
+            texts: vec![],
+            shapes: vec![],
+            manifest: vec![],
+            thumbnail: None,
+            assets: vec![],
+        };
+        let pages = paginate(&doc, 841.89);
+        assert_eq!(pages.len(), 3);
+        assert_eq!(pages[0].strokes.len(), 1);
+        assert_eq!(pages[1].strokes.len(), 1);
+        assert_eq!(pages[2].strokes.len(), 1);
+    }
+
+    #[test]
+    fn paginate_groups_by_page_id() {
+        let mk = |page: PageId, y: f32| NtbStroke {
+            page: Some(page),
+            anchor_x: 0.0,
+            anchor_y: y,
+            width: 1.0,
+            point_count: 1,
+            points: vec![],
+            color: None,
+            tool: None,
+            style: None,
+            audio_duration_ms: None,
+        };
+        // Two pages; strokes interleaved in creation order.
+        let p0: PageId = (0, 1, 0);
+        let p1: PageId = (0, 2, 0);
+        let doc = NtbDocument {
+            meta: NtbMeta::default(),
+            strokes: vec![mk(p0, 10.0), mk(p1, 20.0), mk(p0, 30.0)],
+            pages: vec![
+                NtbPageDef { id: p0, width: 595.28, height: 841.89 },
+                NtbPageDef { id: p1, width: 100.0, height: 200.0 },
+            ],
+            texts: vec![],
+            shapes: vec![],
+            manifest: vec![],
+            thumbnail: None,
+            assets: vec![],
+        };
+        let pages = paginate(&doc, 841.89);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].strokes.len(), 2);
+        assert_eq!(pages[1].strokes.len(), 1);
+        // Dimensions from CreatePage defs.
+        assert_eq!(pages[0].width, 595.28);
+        assert_eq!(pages[0].height, 841.89);
+        assert_eq!(pages[1].width, 100.0);
+        assert_eq!(pages[1].height, 200.0);
+    }
 }

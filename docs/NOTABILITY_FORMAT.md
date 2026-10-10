@@ -368,6 +368,44 @@ rather than user shapes**.
 The reader **rejects** these elements (vector count ∉ {8,12,14}). Semantics
 unverified — do not emit them until decoded. See open problem 5.
 
+### 4.8 Page SeqIds and pagination — VERIFIED
+
+Each CreateInk/CreateShape payload carries **f0 = page SeqId** (df struct,
+12 bytes, aligned: `site u16 @0`, `pad 2 @2`, `timestamp u32 @4`,
+`index u32 @8`). CreatePage carries the same SeqId at f0 (its *location*),
+which is how page dimensions bind to ink groups.
+
+**SeqId layout** (from the web-app `createSeqId` builder): `prep(4, 12)`,
+then `writeInt32(index)`, `writeInt32(timestamp)`, `pad(2)`,
+`writeInt16(site)` — i.e. little-endian with the site in the low 2 bytes
+and 2 bytes of padding before the timestamp. Reading as packed
+`(u16, u32, u32)` is wrong; the correct read is aligned as above.
+
+**Pagination** groups live strokes/shapes by their final page SeqId
+(first-appearance order across the op log). Dimensions come from the
+matching CreatePage background (by location SeqId), defaulting to A4
+(595.28 × 841.89). This replaces the old Y-slice approximation, which
+collapsed multi-page notebooks onto one page because pages share a local
+coordinate space (each page's Y restarts near 0).
+
+`ModifyPositions` (payloadType 24) entries carry f1 = page SeqId and f2 =
+origin; the fold applies both, so strokes moved between pages after
+creation land on the correct page.
+
+Observed live page groups (aligned SeqId layout, after deletes):
+
+| sample | page groups | CreatePage defs | notes |
+| --- | --- | --- | --- |
+| G1 | 10 | 8 | A4 pages; some groups share CreatePage |
+| B1 | 6 | 3 | mixed sizes |
+| E1 | 9 | 4 | A4 pages |
+| D1 | 5 | 0 | no CreatePage (A4 fallback) |
+| P1 | 3 | 4 | includes landscape 842×595 |
+
+PDF exports of the same notebooks report different page counts (stale
+exports from earlier notebook states); the thumbnail (embedded in the
+`.ntb`) is the ground truth for page 1 and matches the grouped render.
+
 ## 5. `index/ios/*.fb` — FlatBuffers, OCR side-car
 
 Filenames track content: `HandwritingIndex` is present in every notebook,
@@ -392,9 +430,11 @@ handwriting on the corresponding thumbnails (§4.5). Shapes fare as well as
 before: ellipse/rect/line classification from the f5 vector (§4.2) is decoded
 and emitted as portable-IR shapes with colour + width.
 
-Page geometry: `.ntb` notebooks are continuous-scroll; the matching PDF export
-paginates at the paper height from the first nf=2 page definition (A4 841.89 pt
-when absent). `ntb::paginate()` splits strokes/shapes by Y using that height.
+Page geometry: each page carries its own local coordinate space (Y restarts
+near 0). Pagination groups entities by their final page SeqId (§4.8) and
+takes dimensions from the matching CreatePage background (A4 fallback).
+`ntb::paginate()` implements this; the old Y-slice approximation remains as
+a fallback for entities without page ids.
 
 Page size is carried on the portable IR (`Page.width/height`). `.ntb` pages
 use their nf=2 dimensions (fallback A4 595.28×841.89); GoodNotes pages keep
@@ -430,51 +470,53 @@ parser. Verified against all 9 sample notebooks (Notability 16.12.5):
 
 Public API:
 
-- `ntb::open(path)` → `NtbDocument` (meta + strokes + shapes + assets)
+- `ntb::open(path)` → `NtbDocument` (meta + live strokes + live shapes +
+  page defs + assets). The fold applies the CRDT op log in order: creates
+  insert, modifies patch (origin/colour/width/path/page), deletes remove;
+  only live entities are emitted.
 - `ntb::parse_bundle_public(bytes)` → same, from an in-memory `noteBundle`
-- `ntb::paginate(doc, page_h)` → `Vec<NtbPage>` (strokes + shapes split by Y)
+- `ntb::paginate(doc, page_h)` → `Vec<NtbPage>` (groups by page SeqId when
+  every entity carries one — dimensions from CreatePage defs; falls back to
+  Y-slicing at `page_h` otherwise)
 - `ntb::to_pages(doc, page_h)` → `Vec<Page>` (portable IR items with true
-  page dimensions; strokes emitted as decoded Bézier polylines — a lone
+  per-page dimensions; strokes emitted as decoded Bézier polylines — a lone
   moveto degenerates to a 2-point zero-length segment; shapes →
-  ellipse/rect/line; colours via `rgba_from_u32` with alpha)
+  ellipse/rect/line with fill; colours via `rgba_from_u32` with alpha)
 
-Anchor fields are `(X, Y)` (thumbnail-overlay verified; see §4.3). Point paths
-are f16 cubic-Béziers offset by the anchor and sampled at 12 steps per cubic
-(§4.4); `decode_stroke_points()` in `src/ntb.rs` is the reference
-implementation. The convert pipeline dispatches `.ntb` files via `is_ntb()`;
-assets are loaded into the document attachment map. Example: `cargo run --bin
-oblyx -- -f svg,pdf ntb/Eth1.ntb`.
+Stroke/shape tables carry tool (Pen/Pencil/Highlighter/Tape) and style
+(VariableWidth/FixedWidth/Dash/Dots) enums; shape definitions decode as
+Line / Polygon / NormalShape with top-left origin and optional fill
+(§4.2 web-schema notes in the source). Anchor fields are `(X, Y)`
+(thumbnail-overlay verified). Point paths are f16 cubic-Béziers offset by
+the anchor and sampled at 12 steps per cubic (§4.4);
+`decode_stroke_points()` in `src/ntb.rs` is the reference implementation.
+The convert pipeline dispatches `.ntb` files via `is_ntb()`; assets are
+loaded into the document attachment map. Example: `cargo run --bin oblyx
+-- -f svg,pdf ntb/Eth1.ntb`.
 
 ## 9. Open problems
 
 1. **Typed text** (4.2, nf=8) — no user-typed text exists in any of the 9
    samples; noteBundles contain only UUIDs, MIME types, and asset-title
    fragments. If the feature exists, its storage is undiscovered.
-2. **Shape position convention** (4.2) — anchor (X, Y) and dims are decoded
-   and render plausibly on the thumbnail, but top-left vs centre placement
-   is unconfirmed (0/4 sampled shapes matched PDF line segments).
-3. **nf=12 f11 fill colour** (4.2) — second colour likely means fill; kept
-   transparent until semantics are confirmed against a rendered shape.
-4. **Rejected nf=11/12 elements** (4.7) — negative-i32 header resolves to a
-   shared table (grid spacing 36.0 in B1); consistent with import grid/table
-   marks. Decode fully before emitting.
-5. **nf=1 purpose** — single u32 field (0, 4, or hash). Wrapper envelope matches
+2. **Shape position convention** (4.2) — web schema confirms top-left origin
+   for CreateShape; Line/Polygon points are origin-relative. Verified in the
+   reader; residual risk is low.
+3. **Rejected nf=11/12 elements** (4.7) — negative-i32 header resolves to a
+   shared table (grid spacing 36.0 in B1); now decoded as CreateShape Line
+   entities (grid marks). Double-draw vs paper flair background unconfirmed.
+4. **nf=1 purpose** — single u32 field (0, 4, or hash). Wrapper envelope matches
    strokes. Possibly annotations or degenerate strokes.
-6. **nf=4, 7, 13** — undecoded.
-7. **f15 u32 in strokes** — matches neither point count nor byte length;
-   purpose unknown.
-8. **u16 width hint in point records** — constant f16 1.0 for Type A, varying
-   for Type B; likely a per-point width/pressure scale (multiplies the table
-   f8 base width) but unused by the renderer today — unconfirmed.
-9. **Non-standard trailers** — 2 G1 strokes have a trailer other than
-   `00 3c ff 00 00` and yield 0 records under the trailer scan; layout
-   `(32,24,0,0,23,22,0,18,12,8,…)`. Currently filtered out.
-10. **Mixed paper sizes** — B1/F1 carry non-A4 first page defs (651×407,
-    455×571); pagination uses the first def's height for all slices. Cumulative
-    per-def pagination is unimplemented (samples keep all ink within one or
-    two slices either way).
-11. **No device validation** — no Notability/GoodNotes round-trip has been
-    performed; any future writer must be validated on a real device.
+5. **nf=4, 7, 13** — undecoded payload types (not in the known enum).
+6. **u16 width hint in point records** — constant f16 1.0 for FixedWidth
+   style, varying for VariableWidth; likely a per-point width/pressure scale
+   (multiplies the table f8 base width) but unused by the renderer today.
+7. **Non-standard trailers** — 2 G1 strokes have a non-standard header;
+   the decoder falls back to shifted-alignment trailer scans (§4.4).
+8. **P1 live count** — Rust reports 514 live strokes vs 505 from the
+   Python fold (minor discrepancy, unresolved).
+9. **No device validation** — no Notability/GoodNotes round-trip has been
+   performed; any future writer must be validated on a real device.
 
-Point coordinate encoding (former open problem 1) is **solved** — see §4.4
-(f16 cubic-Bézier records, trailer-scan count, anchor-relative paths).
+Point coordinate encoding, shape schema, fill colour, CRDT delete/modify
+folding, and page-id pagination are **solved** — see §4.4, §4.2, §4.8.

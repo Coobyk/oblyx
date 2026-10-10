@@ -66,11 +66,15 @@ fn main() -> anyhow::Result<()> {
         );
         let total_pts: usize = doc.strokes.iter().map(|s| s.point_count).sum();
         println!("  total point records = {total_pts}");
+        let n_audio: usize = doc.strokes.iter().filter(|s| s.audio_duration_ms.is_some()).count();
+        let n_tool: usize = doc.strokes.iter().filter(|s| s.tool.is_some()).count();
+        let n_style: usize = doc.strokes.iter().filter(|s| s.style.is_some()).count();
+        println!("  with audio_duration={n_audio} tool={n_tool} style={n_style}");
         // First few strokes
         for s in doc.strokes.iter().take(5) {
             println!(
-                "    anchor=({:6.1},{:6.1}) w={:.3} n={}",
-                s.anchor_x, s.anchor_y, s.width, s.point_count
+                "    anchor=({:6.1},{:6.1}) w={:.3} n={} tool={:?} style={:?} audio={:?}",
+                s.anchor_x, s.anchor_y, s.width, s.point_count, s.tool, s.style, s.audio_duration_ms
             );
         }
     }
@@ -96,37 +100,42 @@ fn main() -> anyhow::Result<()> {
 
     // Shape stats
     if !doc.shapes.is_empty() {
-        let mut kinds: std::collections::HashMap<(&str, u8), usize> = Default::default();
+        let mut kinds: std::collections::HashMap<&str, usize> = Default::default();
         for s in &doc.shapes {
-            let kind = match s.vector_len {
-                8 => {
-                    if (s.dx - s.dy).abs() <= 0.05 * s.dx.abs().max(s.dy.abs()).max(1.0) {
-                        "ellipse"
-                    } else {
-                        "rect"
-                    }
-                }
-                _ => "line",
+            let kind = match &s.geom {
+                oblyx::ntb::NtbShapeGeom::Line { .. } => "line",
+                oblyx::ntb::NtbShapeGeom::Box { ellipse: true, .. } => "ellipse",
+                oblyx::ntb::NtbShapeGeom::Box { ellipse: false, .. } => "rect",
+                oblyx::ntb::NtbShapeGeom::Polygon { .. } => "polygon",
             };
-            *kinds.entry((kind, s.subtype)).or_insert(0) += 1;
+            *kinds.entry(kind).or_insert(0) += 1;
         }
         println!("  shapes:");
         let mut ks: Vec<_> = kinds.into_iter().collect();
         ks.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
-        for ((kind, subtype), count) in ks {
-            println!("    {kind} subtype={subtype} × {count}");
+        for (kind, count) in ks {
+            println!("    {kind} × {count}");
         }
+        let n_fill = doc.shapes.iter().filter(|s| s.fill.is_some()).count();
+        println!("    with fill: {n_fill}");
         for s in doc.shapes.iter().take(8) {
+            let geom_desc = match &s.geom {
+                oblyx::ntb::NtbShapeGeom::Line { x1, y1, x2, y2, .. } => {
+                    format!("({x1:.1},{y1:.1})->({x2:.1},{y2:.1})")
+                }
+                oblyx::ntb::NtbShapeGeom::Box { x, y, w, h, .. } => {
+                    format!("({x:.1},{y:.1}) {w:.1}×{h:.1}")
+                }
+                oblyx::ntb::NtbShapeGeom::Polygon { points } => {
+                    format!("{} pts", points.len())
+                }
+            };
             println!(
-                "    anchor=({:6.1},{:6.1}) d=({:6.1},{:6.1}) n={} w={:.3} sub={} colour={:?}",
-                s.anchor_x,
-                s.anchor_y,
-                s.dx,
-                s.dy,
-                s.vector_len,
-                s.width,
-                s.subtype,
-                s.color.map(|v| format!("{v:#010x}"))
+                "    {geom_desc} w={:.3} rot={:.1} colour={:?} fill={:?}",
+                s.border_width,
+                s.rotation,
+                s.color.map(|v| format!("{v:#010x}")),
+                s.fill.map(|v| format!("{v:#010x}"))
             );
         }
     }
