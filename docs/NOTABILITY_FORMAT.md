@@ -6,7 +6,8 @@ be relied on.
 
 Samples used for verification were personal notebooks; they are **not** part of
 this repository and no content derived from them is committed here. The probe
-tooling (`tools/ntb_probe.py`) reads a path given on the command line.
+tooling (`cargo run --example ntb_probe -- <path>`) reads a path given on the
+command line.
 
 Not affiliated with or endorsed by Notability or Notefile.
 
