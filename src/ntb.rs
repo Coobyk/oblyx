@@ -527,14 +527,18 @@ pub fn parse_bundle_public(bundle: &[u8]) -> Result<BundleParts> {
 // ---------------------------------------------------------------------------
 
 /// Convert an `.ntb` document into a list of portable [`Page`] objects,
-/// one per `page_h` slice.
+/// one per page slice.
+///
+/// When the notebook contains page definitions (nf=2), the first page's height
+/// is used for pagination; otherwise `page_h` is the fallback.
 ///
 /// Strokes are emitted as 2-point horizontal dashes at their anchor position,
 /// because the intra-stroke path geometry is not yet decoded (see module
 /// docs). The dash length equals the stroke width, so the page layout is
 /// preserved as a field of position-weighted marks.
 pub fn to_pages(doc: &NtbDocument, page_h: f32) -> Vec<Page> {
-    paginate(doc, page_h)
+    let effective_h = doc.pages.first().map(|p| p.height).unwrap_or(page_h);
+    paginate(doc, effective_h)
         .into_iter()
         .enumerate()
         .map(|(i, np)| {

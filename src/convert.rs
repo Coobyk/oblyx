@@ -657,11 +657,16 @@ fn load_ntb_pages(
     };
     crate::vlog!(
         1,
-        "{label}: ntb has {} stroke(s), {} asset(s), version {}",
+        "{label}: ntb has {} stroke(s), {} page def(s), {} text(s), {} asset(s), version {}",
         ntb_doc.strokes.len(),
+        ntb_doc.pages.len(),
+        ntb_doc.texts.len(),
         ntb_doc.assets.len(),
         ntb_doc.meta.version
     );
+    if let Some(pd) = ntb_doc.pages.first() {
+        crate::vlog!(1, "{label}: page size {:.0}×{:.0} pt", pd.width, pd.height);
+    }
     let pages = crate::ntb::to_pages(&ntb_doc, crate::ntb::NTB_PAGE_H);
     crate::vlog!(1, "{label}: paginated into {} page(s)", pages.len());
     let mut doc = Document::empty();
