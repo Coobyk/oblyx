@@ -245,20 +245,59 @@ schemas are not yet decoded.
 
 ## 6. Conversion implications
 
-For rendering (`→` SVG/PDF/PNG) the format is tractable **once the point
-coordinate encoding is solved**: stroke anchors, widths, and counts are decoded;
-only the intra-stroke path geometry is missing.
+### 6.1 Rendering (`→` SVG/PDF/PNG)
 
-For **editable** export (`→` `.ntb` or `→` `.goodnotes`) the format must be
-*understood*, not merely read, and additionally must be validated by round-tripping
-through the real applications. No writer should be considered correct until it
-has been opened and re-saved by Notability / GoodNotes on a device.
+The format is **partially tractable today**: stroke anchors, widths, and counts
+are decoded; only the intra-stroke path geometry is missing. The Rust reader
+(`src/ntb.rs`) therefore emits each stroke as a 2-point horizontal dash at its
+anchor position — a placeholder that preserves page layout but does not
+reproduce the ink. Full render fidelity is blocked on the coordinate encoding
+(§4.4).
 
-## 7. Open problems
+Page geometry: `.ntb` notebooks are continuous-scroll; the matching PDF export
+paginates at A4 height (841.89 pt). `ntb::paginate()` splits strokes by Y
+coordinate using a caller-supplied page height.
 
-1. **Point coordinate encoding** (4.4) — the blocker for rendering. The three
-   f32s per point have a velocity-envelope pattern but do not integrate to the
-   PDF path. May require inspecting the Notability app binary or SDK.
+### 6.2 Editable export (`→` `.ntb` or `→` `.goodnotes`)
+
+The format must be *understood*, not merely read, and additionally must be
+validated by round-tripping through the real applications. No writer should be
+considered correct until it has been opened and re-saved by Notability /
+GoodNotes on a device.
+
+## 7. Rust reader — IMPLEMENTED
+
+`src/ntb.rs` provides a schema-less FlatBuffer walker and a `.ntb` container
+parser. Verified against all 9 sample notebooks (Notability 16.12.5):
+
+| sample | strokes | point records |
+| --- | --- | --- |
+| B1 | 561 | 16 744 |
+| Cambridge | 13 | 321 |
+| D1 | 1 102 | 21 229 |
+| E1 | 1 485 | 31 430 |
+| Eth1 | 220 | 4 035 |
+| F1 | 1 301 | 20 790 |
+| G1 | 1 790 | 46 343 |
+| M1 | 1 | 54 |
+| P1 | 631 | 18 059 |
+
+Public API:
+
+- `ntb::open(path)` → `NtbDocument` (meta + strokes + assets)
+- `ntb::parse_bundle_public(bytes)` → same, from an in-memory `noteBundle`
+- `ntb::paginate(doc, page_h)` → `Vec<NtbPage>` (strokes split by Y)
+- `ntb::to_pages(doc, page_h)` → `Vec<Page>` (portable IR items)
+
+The convert pipeline dispatches `.ntb` files via `is_ntb()`; assets are loaded
+into the document attachment map. Example: `cargo run --bin oblyx -- -f svg,pdf
+ntb/Eth1.ntb`.
+
+## 8. Open problems
+
+1. **Point coordinate encoding** (4.4) — the blocker for render fidelity. The
+   three f32s per point have a velocity-envelope pattern but do not integrate
+   to the PDF path. May require inspecting the Notability app binary or SDK.
 2. **Non-stroke element types** (4.2, nf ≠ 16) — text, images, shapes, PDF-page
    references are all undecoded.
 3. **Colour field** — the `00 ff 01` byte-run appears in stroke headers but its
@@ -266,3 +305,9 @@ has been opened and re-saved by Notability / GoodNotes on a device.
 4. **f15 u32** — matches neither point count nor byte length; purpose unknown.
 5. **u16 in points** — constant f16 1.0 for Type A, varying for Type B; likely
    pressure or timestamp, unconfirmed.
+6. **Page-size mismatch** — renderers use GoodNotes page constants (1091×1543);
+   `.ntb` coordinates are A4-height. Strokes appear in the upper portion of
+   the canvas. A proper fix needs a page-size-aware renderer or a coordinate
+   scale at load time.
+7. **No device validation** — no Notability/GoodNotes round-trip has been
+   performed; any future writer must be validated on a real device.
