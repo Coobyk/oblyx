@@ -100,16 +100,16 @@ The inner table's field count (`nf`) determines the element type:
 
 | inner nf | count (Eth1) | type | key fields |
 | --- | --- | --- | --- |
-| 16 | 220 | **handwriting stroke** (§4.3) | f1 anchor, f8 width, f9 points |
-| 12 | 19 | **shape / drawing** | f1 f32 Y, f5 vector, f9 colour, f10 width, f11 u32 |
+| 16 | 220 | **handwriting stroke** (§4.3) | f1 anchor, f7 colour, f8 width, f9 points |
+| 12 | 19 | **shape / drawing** (§4.2) | f1 anchor, f5 vector, f9 colour, f10 width, f11 fill? |
 | 4 | 16 | unknown | f1 u32 small, f3 u8 |
 | 1 | 13 | lightweight element / annotation | f0 u32 (0, 4, or hash) |
-| 15 | 7 | **shape / drawing** | f1 f32 Y, f5 vector, f9 colour, f10 width, f14 f32 |
+| 15 | 7 | **shape / drawing** (§4.2) | f1 anchor, f5 vector, f7 colour, f8 width |
 | 7 | 3 | unknown | f0 vector n=1, f5 u8, f6 u32 |
-| 8 | 1 | **text box** | f4 string (font name, e.g. `"Inter"`), f5 f32 (font size) |
+| 8 | 1 | **style record** — font "Inter", size 14 | f4 string (font), f5 f32 (size) |
 | 2 | 1 | **page definition** | f1 vector: [width, height, …] in points |
 | 13 | 1 | unknown | f0 vector n=1, f12 vector n=2 |
-| 11 | 1 | **shape / drawing** | f1 f32 Y, f9 colour, f10 width |
+| 11 | 1 | **shape / drawing** (§4.2) | f1 anchor, f5 vector, f9/f10 colour |
 
 **nf=2 (page definition):** The f1 vector's first two f32s are the page width
 and height in points. Verified across samples:
@@ -124,18 +124,35 @@ and height in points. Verified across samples:
 | P1 | 6 | 842 × 595 | A4 landscape |
 | Cambridge, D1, M1 | 0 | — | continuous-scroll |
 
-**nf=8 (text box):** f4 is a FlatBuffer string holding the font family
-(e.g. `"Inter"`). f5 is an f32 font size (e.g. `14.0`). f3 is a u8 flag
-(bold?). The actual text characters are stored elsewhere (not in the element
-table); f1 is a vector of packed u32s, possibly glyph or layout data.
+**nf=8 (style record):** f4 is a FlatBuffer string holding a font family
+(e.g. `"Inter"`), f5 an f32 size (e.g. `14.0`), f3 a u8 flag (bold?).
+Elem 0 is the *document-level* default style; the same table also appears
+per pen. **No typed text exists in any of the 9 samples** — the actual
+text characters (if any) are stored elsewhere (see open problem 2).
 
-**nf=11 / 12 / 15 (shapes):** All three share a common structure:
-- f1: f32, page Y coordinate (same range as stroke anchors)
-- f9: u32 colour, e.g. `0xFF000000` (RGBA bytes `00 00 00 FF` = black)
-- f10: f32 width (e.g. 0.7751, matching stroke widths)
-- f11 (nf=12): u32, e.g. `0xFFFFFFFF` (second colour / fill?)
-- f14 (nf=15): f32, another dimension (e.g. 1.746)
-- f5 (nf=12, nf=15): vector, possibly point coordinates (contents undecoded)
+**nf=11 / 12 / 15 (shapes) — DECODED:**
+
+- f1: struct 2×f32 `(Y, X)` — absolute page anchor, same layout as strokes.
+- f5: uoffset → vector of f32s holding the geometry (table below).
+- f4: u8 subtype (1 and 3 observed; 1 ↔ line-like vectors, 3 ↔ closed).
+- colour: layout-driven (§4.6) — nf=15 → f7; nf=11 → f9 (f10 when f9 is
+  not a colour); nf=12 → f9 or f7. Never a field scan — f0/f4 hold noise
+  u32s with a valid-looking alpha byte.
+- width: first plausible f32 (0.01..100) among f8/f9/f10 that is not the
+  colour (e.g. 0.7751, 1.163, 1.550, 3.100 — the same base-width presets
+  as strokes).
+- f11 (nf=12 only): second colour, likely fill — left unused for now
+  (fill renders transparent); semantics unconfirmed.
+
+| vector len | dims | classification |
+| --- | --- | --- |
+| 8 | `(v0, v1)` | near-equal → ellipse; else → rectangle |
+| 12 | `(v0, v1)` | line (2-pt stroke from anchor to anchor+dims) |
+| 14 | header at v0; dims `(v1, v2)` | line |
+
+Position convention (top-left vs centre of bbox) is **not** confirmed —
+see open problem 3. Element counts: B1 4, D1 2, E1 4, Eth1 2, F1 3,
+G1 4, M1 1, P1 4, Cambridge 0 (24 shapes total).
 
 **nf=1 (lightweight element):** Single f0 u32 field with values `0`, `4`, or
 a hash-like constant. The wrapper's f5 matches stroke-like table sizes
@@ -165,6 +182,7 @@ Decoded fields (offsets differ per subtype; shown for Type A → Type B):
 | field | Type A off | Type B off | type | meaning |
 | --- | --- | --- | --- | --- |
 | f1 | 24 | 20 | struct 2×f32 | **stroke anchor (Y, X)** — absolute page coords, Y increases downward |
+| f7 | 19 | 16 | u32 | **stroke colour** `0xAABBGGRR` (§4.6); f5 is noise (low byte always `0x01`) |
 | f8 | 12 | 12 | f32 | **stroke width** in points |
 | f9 | 8 | 8 | uoffset | points to the point-data blob at `tp + tsize` |
 | f15 | 4 | 4 | u32 | id-like, varies per stroke |
@@ -267,6 +285,58 @@ Matching PDFs were used as an oracle. Findings:
   confirming the anchor is the stroke's page position.
 - Point-count and bbox-extent comparisons between .ntb and PDF do **not**
   correlate, because the point coordinates themselves are undecoded.
+- The 24 decoded shapes could **not** be isolated as distinct PDF segments:
+  under every transform tried (raw, y-flipped with H=841.89), 0/4 sampled
+  shapes matched a PDF line segment. Either the position convention or the
+  dims semantics is off; shapes are mostly template/annotation marks over
+  imported-PDF thumbnails, so they may not export as vector ink at all.
+
+### 4.6 Colour encoding — VERIFIED
+
+A colour is a single u32 whose on-disk byte order is **R, G, B, A**, so it
+reads as `0xAABBGGRR` in little-endian:
+
+- Proof: ntb `0xff1515b5` appears where the matching PDF draws `#b51515`
+  (E1 ×1, G1 ×3, P1 ×1); the reversed interpretation `#1515b5` never occurs
+  in any of the 9 PDFs.
+- **Alpha byte**: `0xFF` = opaque ink. `0x6B` (107 ≈ 42 %) = **highlighter**
+  — PDF-confirmed: `0x6bff6f00`→`#006fff`, `0x6bff9cb0`→`#b09cff`,
+  `0x6b00ffff`→`#ffff00`, `0x6bdec714`→`#14c7de`, `0x6b17ffa9`→`#a9ff17`,
+  `0x6b0fc4f1`→`#f1c40f`.
+- **Strokes**: colour is always at **f7** (both subtypes). f5 holds
+  noise-like u32s whose low byte is always `0x01` (`0x8d41ac01`, …) — do
+  not mistake them for colours by scanning fields.
+- **Shapes**: colour at f7/f9/f10 depending on nf (§4.2) — a field scan
+  false-positives on f0/f4 noise (`0xfffedc01`).
+- `rgba_from_u32()` in `src/ntb.rs` performs the conversion; the reader
+  accepts alpha `0xFF` and `0x6B` and rejects other patterns.
+
+Example stroke colour histograms (after the f7 fix; `0x6b…` = highlighter):
+
+| sample | top colours |
+| --- | --- |
+| E1 | black 1361, `#b09cff` 32, `#b51515` 21, `#622d90` 15, `#14c7de` 14, `#006fff` 13, `#a9ff17` 11, `#f1c40f` 9 |
+| G1 | black 1704, `#b09cff` 23, `#b51515` 18, `#ed3624` 17, white 17, `#1749b3` 10 |
+| P1 | black 619, `#ffff00` 6, `#8c54d0` 3, `#f5bdb6` 2, `#f1c40f` 1 |
+| B1 | black 557, `#14c7de` 3, `#b09cff` 1 |
+
+### 4.7 Rejected nf=11/12 elements — NOT DECODED (intentionally skipped)
+
+Many nf=11/12 elements share the shape layout (f1 anchor and f9/f10
+colour/width are readable in-table) but their f5 vector's **first slot is a
+negative i32**, not a count. For every such element,
+`landing + |i32|` is a constant per notebook (e.g. B1 401860), suggesting
+an encoded offset/delta rather than geometry. The u32 values at +4/+8 look
+like sane dims but form repeating 18/36-multiple grid patterns.
+
+Counts: B1 40, D1 10, E1 181, G1 121, P1 108. Colours include red and
+purple in E1 (`0xff902d62`, `0xff1515b5`) and grays. Thumbnails show the
+affected notebooks are grid-paper pages (B1), imported PDF worksheets
+(D1), and template pages with ruled tables (E1) — the grid-like geometry
+is consistent with table/grid artifacts of imports rather than user shapes.
+
+The reader **rejects** these elements (vector count ∉ {8,12,14}). Semantics
+unverified — do not emit them until decoded. See open problem 5.
 
 ## 5. `index/ios/*.fb` — FlatBuffers, OCR side-car
 
@@ -290,7 +360,8 @@ are decoded; only the intra-stroke path geometry is missing. The Rust reader
 (`src/ntb.rs`) therefore emits each stroke as a 2-point horizontal dash at its
 anchor position — a placeholder that preserves page layout but does not
 reproduce the ink. Full render fidelity is blocked on the coordinate encoding
-(§4.4).
+(§4.4). Shapes fare better: ellipse/rect/line classification from the f5 vector
+(§4.2) is decoded and emitted as portable-IR shapes with colour + width.
 
 Page geometry: `.ntb` notebooks are continuous-scroll; the matching PDF export
 paginates at A4 height (841.89 pt). `ntb::paginate()` splits strokes by Y
@@ -308,24 +379,25 @@ GoodNotes on a device.
 `src/ntb.rs` provides a schema-less FlatBuffer walker and a `.ntb` container
 parser. Verified against all 9 sample notebooks (Notability 16.12.5):
 
-| sample | strokes | point records |
-| --- | --- | --- |
-| B1 | 561 | 16 744 |
-| Cambridge | 13 | 321 |
-| D1 | 1 102 | 21 229 |
-| E1 | 1 485 | 31 430 |
-| Eth1 | 220 | 4 035 |
-| F1 | 1 301 | 20 790 |
-| G1 | 1 790 | 46 343 |
-| M1 | 1 | 54 |
-| P1 | 631 | 18 059 |
+| sample | strokes | point records | shapes |
+| --- | --- | --- | --- |
+| B1 | 561 | 16 744 | 4 |
+| Cambridge | 13 | 321 | 0 |
+| D1 | 1 102 | 21 229 | 2 |
+| E1 | 1 485 | 31 430 | 4 |
+| Eth1 | 220 | 4 035 | 2 |
+| F1 | 1 301 | 20 790 | 3 |
+| G1 | 1 790 | 46 343 | 4 |
+| M1 | 1 | 54 | 1 |
+| P1 | 631 | 18 059 | 4 |
 
 Public API:
 
-- `ntb::open(path)` → `NtbDocument` (meta + strokes + assets)
+- `ntb::open(path)` → `NtbDocument` (meta + strokes + shapes + assets)
 - `ntb::parse_bundle_public(bytes)` → same, from an in-memory `noteBundle`
-- `ntb::paginate(doc, page_h)` → `Vec<NtbPage>` (strokes split by Y)
-- `ntb::to_pages(doc, page_h)` → `Vec<Page>` (portable IR items)
+- `ntb::paginate(doc, page_h)` → `Vec<NtbPage>` (strokes + shapes split by Y)
+- `ntb::to_pages(doc, page_h)` → `Vec<Page>` (portable IR items; shapes →
+  ellipse/rect/line, strokes coloured via `rgba_from_u32` with alpha)
 
 The convert pipeline dispatches `.ntb` files via `is_ntb()`; assets are loaded
 into the document attachment map. Example: `cargo run --bin oblyx -- -f svg,pdf
@@ -336,23 +408,27 @@ ntb/Eth1.ntb`.
 1. **Point coordinate encoding** (4.4) — the blocker for render fidelity. The
    three f32s per point have a velocity-envelope pattern but do not integrate
    to the PDF path. May require inspecting the Notability app binary or SDK.
-2. **Text content location** (4.2, nf=8) — font name and size are decoded, but
-   the actual text characters are stored elsewhere (not in the element table).
-   Possibly in assets/ or a separate string table.
-3. **Shape geometry** (4.2, nf=11/12/15) — Y position, colour, and width are
-   decoded, but the f5 vectors (point coordinates?) are undecoded.
-4. **Colour encoding** — f9 = `0xFF000000` interpreted as RGBA bytes
-   `00 00 00 FF` (black). Needs verification with coloured notebooks.
-5. **nf=1 purpose** — single u32 field (0, 4, or hash). Wrapper envelope matches
+2. **Text content location** (4.2, nf=8) — only font name and size are
+   decoded; no typed text exists in any sample. The actual characters are
+   stored elsewhere (possibly assets/ or a separate string table).
+3. **Shape position convention** (4.2) — anchor (Y, X) and dims are decoded,
+   but top-left vs centre placement is unconfirmed: 0/4 sampled shapes
+   matched PDF line segments under any transform tried.
+4. **nf=12 f11 fill colour** (4.2) — second colour likely means fill; kept
+   transparent until semantics are confirmed against a rendered shape.
+5. **Rejected nf=11/12 elements** (4.7) — negative-i32 vector header with
+   `landing+|i32|` constant per notebook; grid/table-like dims. Possibly
+   table/grid artifacts of PDF imports; decode before emitting.
+6. **nf=1 purpose** — single u32 field (0, 4, or hash). Wrapper envelope matches
    strokes. Possibly annotations or degenerate strokes.
-6. **nf=4, 7, 13** — undecoded.
-7. **f15 u32 in strokes** — matches neither point count nor byte length;
+7. **nf=4, 7, 13** — undecoded.
+8. **f15 u32 in strokes** — matches neither point count nor byte length;
    purpose unknown.
-8. **u16 in points** — constant f16 1.0 for Type A, varying for Type B; likely
+9. **u16 in points** — constant f16 1.0 for Type A, varying for Type B; likely
    pressure or timestamp, unconfirmed.
-9. **Page-size mismatch** — renderers use GoodNotes page constants (1091×1543);
-   `.ntb` coordinates are page-relative (e.g. A4 596×842). Strokes appear in
-   the upper portion of the canvas. A proper fix needs a page-size-aware
-   renderer or a coordinate scale at load time using nf=2 dimensions.
-10. **No device validation** — no Notability/GoodNotes round-trip has been
+10. **Page-size mismatch** — renderers use GoodNotes page constants (1091×1543);
+    `.ntb` coordinates are page-relative (e.g. A4 596×842). Strokes appear in
+    the upper portion of the canvas. A proper fix needs a page-size-aware
+    renderer or a coordinate scale at load time using nf=2 dimensions.
+11. **No device validation** — no Notability/GoodNotes round-trip has been
     performed; any future writer must be validated on a real device.
