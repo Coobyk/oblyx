@@ -520,8 +520,14 @@ pub fn convert_job_sink(
     let label = job.label();
     crate::vlog!(1, "opening {label}");
 
-    // Load pages + document, dispatching on file type.
-    let (doc, pages) = if is_ntb(&job.file) {
+    // Load pages + document, dispatching on file type. For zip-archive
+    // members the extension lives on the member name, not the outer zip.
+    let effective = job
+        .member
+        .as_deref()
+        .map(Path::new)
+        .unwrap_or(&job.file);
+    let (doc, pages) = if is_ntb(effective) {
         load_ntb_pages(job, options)?
     } else {
         load_goodnotes_pages(job, options, &progress)?
