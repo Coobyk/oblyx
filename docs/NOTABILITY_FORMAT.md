@@ -228,21 +228,26 @@ Corrected stroke/point totals (all 9 samples, 5-byte-trailer model):
 The three f32 values per point are **not** page coordinates and **not** simple
 deltas. Observed behaviour:
 
-- Values start near zero, grow to a peak (up to ~10⁶ in long strokes), then
-  decay back toward zero — a velocity-envelope / two-envelope pattern.
-- `cumsum(x, y)` does **not** reproduce the PDF vector path shape (monotonic
-  growth vs. the PDF's back-and-forth letterforms).
+- Values start near zero, grow **exponentially** (each successive point is
+  ~2–10× the previous in magnitude), reaching ~10¹³ in long strokes. The sign
+  is negative for most points (sign bit set).
+- The u32 reinterpretation of these f32 bit patterns appears monotonically
+  increasing — but this is an **artifact**: for negative f32 values, larger
+  magnitude ⇒ larger u32 bit pattern. Not fixed-point coordinates.
+- `cumsum(x, y)` does **not** reproduce the PDF vector path shape.
 - No constant scale factor relates cumsum extents to PDF extents across
   strokes.
-- Raw values are not absolute positions (they jump from ~0 to ~10⁶ and back).
 - The u16 field is constant 15360 (f16 = 1.0) for Type A and varies ~14681–15401
   for Type B — possibly pressure or a timestamp delta, but unconfirmed.
 
-Hypotheses tried and rejected: fixed-point reinterpretation, log-encoding,
-sqrt-encoding, velocity × constant-dt integration, bfloat16 pairs.
+Hypotheses tried and rejected: fixed-point reinterpretation (u32/2^k for
+k=16,20,24,28), log-encoding, sqrt-encoding, velocity × constant-dt integration,
+velocity × z-as-dt integration, bfloat16 pairs, running average, trapezoidal
+integration, scale-normalized cumsum, z-as-altitude segmentation.
 
 The stroke **anchor** (f1 = Y, X) is confirmed absolute page position; only the
-intra-stroke path geometry is unsolved.
+intra-stroke path geometry is unsolved. May require inspecting the Notability
+app binary or SDK.
 
 ### 4.5 PDF comparison — anchors confirmed, paths not
 
