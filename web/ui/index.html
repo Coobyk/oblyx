@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#17191c" media="(prefers-color-scheme: dark)" />
-    <meta name="description" content="Convert Goodnotes notebooks to PDF or SVG in your browser." />
+    <meta name="description" content="Convert Goodnotes and Notability notebooks to PDF or SVG in your browser." />
     <title>oblyx</title>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="stylesheet" href="/style.css" />
@@ -16,10 +16,10 @@
 
       <section class="converter" aria-label="Goodnotes converter">
         <label class="dropzone" id="dropzone" for="notebook-file" tabindex="0">
-          <input id="notebook-file" type="file" accept=".goodnotes,.zip,application/zip" />
+          <input id="notebook-file" type="file" accept=".goodnotes,.ntb,.zip,application/zip" />
           <span class="upload-icon" aria-hidden="true">↑</span>
           <span class="drop-title" id="drop-title">Choose a notebook</span>
-          <span class="drop-hint" id="drop-hint">.goodnotes or .zip</span>
+          <span class="drop-hint" id="drop-hint">.goodnotes, .ntb, or .zip</span>
         </label>
 
         <div class="file-row" id="file-row" hidden>
