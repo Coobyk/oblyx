@@ -1,4 +1,5 @@
 import { createReadStream, existsSync, statSync } from "node:fs"
+import { execSync } from "node:child_process"
 import { extname, resolve, sep } from "node:path"
 import { defineConfig, type Plugin } from "vite"
 
@@ -40,8 +41,31 @@ function serveRuntime(): Plugin {
   }
 }
 
+function buildStamp(): Plugin {
+  let stamp = ""
+  return {
+    name: "oblyx-build-stamp",
+    buildStart() {
+      const date = new Date().toISOString().replace("T", " ").slice(0, 19)
+      let commit = "dev"
+      try {
+        commit = execSync("git rev-parse --short HEAD", { cwd: import.meta.dirname })
+          .toString()
+          .trim()
+      } catch {}
+      stamp = `${date} UTC · commit ${commit}`
+    },
+    transformIndexHtml(html) {
+      return html.replace(
+        "</body>",
+        `    <footer class="build-stamp">${stamp}</footer>\n  </body>`,
+      )
+    },
+  }
+}
+
 export default defineConfig({
-  plugins: [serveRuntime()],
+  plugins: [serveRuntime(), buildStamp()],
   build: {
     outDir: "../www",
     emptyOutDir: false,
