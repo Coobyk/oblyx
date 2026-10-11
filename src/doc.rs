@@ -182,6 +182,7 @@ pub struct TextBox {
     pub bold: bool,
 }
 
+#[derive(Debug, Clone)]
 pub struct Page {
     pub uuid: String,
     pub items: Vec<Item>,
