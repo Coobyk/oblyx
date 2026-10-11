@@ -64,6 +64,7 @@ struct ArchEntry {
 
 thread_local! {
     static DOC: RefCell<Option<Document>> = const { RefCell::new(None) };
+    static JOBS: RefCell<Vec<(String, u64)>> = const { RefCell::new(Vec::new()) };
     static OUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static ARCHIVE: RefCell<Option<zip::ZipArchive<Cursor<Vec<u8>>>>> =
         const { RefCell::new(None) };
@@ -161,16 +162,16 @@ fn is_ntb_bytes(data: &[u8]) -> bool {
 fn open_ntb(data: Vec<u8>) -> i32 {
     match parse_ntb(data) {
         Ok((doc, pages)) => {
-            let jobs = doc.pdf_raster_jobs();
+            let raster_jobs = doc.pdf_raster_jobs();
             let mut json = format!("{{\"pages\":{},\"jobs\":[", pages.len());
-            for (i, (att, page)) in jobs.iter().enumerate() {
+            for (i, (att, page)) in raster_jobs.iter().enumerate() {
                 if i > 0 {
                     json.push(',');
                 }
                 json.push_str(&format!("[\"{att}\",{page}]"));
             }
             json.push_str("]}");
-            JOBS.with(|j| *j.borrow_mut() = jobs);
+            JOBS.with(|j| *j.borrow_mut() = raster_jobs);
             DOC.with(|d| *d.borrow_mut() = Some(doc));
             NTB_PAGES.with(|p| *p.borrow_mut() = Some(pages));
             set_out(json.into_bytes())
