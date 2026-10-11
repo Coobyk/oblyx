@@ -29,7 +29,7 @@ function withInput(bytes, fn) {
 async function init() {
   // Query string is the wasm hash. worker.js revalidates; the wasm file is
   // cached, so a new worker must not keep calling exports the cached module lacks.
-  const resp = await fetch("oblyx_web.wasm?v=fd6bfc977021");
+  const resp = await fetch("oblyx_web.wasm?v=0dfd17bfb59a");
   if (!resp.ok) throw new Error(`wasm download failed: HTTP ${resp.status}`);
   const imports = {
     oblyx: {
@@ -61,7 +61,7 @@ self.onmessage = (e) => {
         const rc = withInput(new Uint8Array(msg.buffer), (p, n) => W.oblyx_open(p, n));
         if (rc !== 0) throw new Error(outText());
         const meta = JSON.parse(outText());
-        postMessage({ type: "opened", pages: meta.pages });
+        postMessage({ type: "opened", pages: meta.pages, jobs: meta.jobs });
         break;
       }
       case "open_archive": {
@@ -75,7 +75,7 @@ self.onmessage = (e) => {
         const rc = W.oblyx_open_entry(msg.index);
         if (rc !== 0) throw new Error(outText());
         const meta = JSON.parse(outText());
-        postMessage({ type: "opened", pages: meta.pages });
+        postMessage({ type: "opened", pages: meta.pages, jobs: meta.jobs });
         break;
       }
       case "set_member": {
@@ -88,7 +88,7 @@ self.onmessage = (e) => {
         const rc = withInput(new Uint8Array(msg.buffer), (p, n) => W.oblyx_open_member(p, n));
         if (rc !== 0) throw new Error(outText());
         const meta = JSON.parse(outText());
-        postMessage({ type: "opened", pages: meta.pages });
+        postMessage({ type: "opened", pages: meta.pages, jobs: meta.jobs });
         break;
       }
       case "begin_archive": {
@@ -102,6 +102,21 @@ self.onmessage = (e) => {
         if (rc !== 0) throw new Error(outText());
         const bytes = outBytes();
         postMessage({ type: "done", buffer: bytes.buffer }, [bytes.buffer]);
+        break;
+      }
+      case "attachment": {
+        const rc = withInput(enc.encode(msg.uuid), (p, n) => W.oblyx_attachment(p, n));
+        if (rc !== 0) throw new Error(outText());
+        const bytes = outBytes();
+        postMessage({ type: "attachment", uuid: msg.uuid, buffer: bytes.buffer }, [bytes.buffer]);
+        break;
+      }
+      case "raster": {
+        const rc = withInput(new Uint8Array(msg.buffer), (p, n) =>
+          W.oblyx_set_raster(msg.index, p, n),
+        );
+        if (rc !== 0) throw new Error(outText());
+        postMessage({ type: "rastered" });
         break;
       }
       case "convert": {

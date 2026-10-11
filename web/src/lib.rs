@@ -54,7 +54,7 @@ fn report(phase: u32, done: u32, total: u32) {
     unsafe { progress(phase, done, total) };
 }
 
-/// One `.goodnotes` member of the opened zip archive.
+/// One `.goodnotes` or `.ntb` member of the opened zip archive.
 #[derive(Clone)]
 struct ArchEntry {
     member: String,
@@ -70,6 +70,8 @@ thread_local! {
     static ENTRIES: RefCell<Vec<ArchEntry>> = const { RefCell::new(Vec::new()) };
     static CURRENT: RefCell<Option<ArchEntry>> = const { RefCell::new(None) };
     static SINK: RefCell<Option<ZipSink<Cursor<Vec<u8>>>>> = const { RefCell::new(None) };
+    /// Pre-built pages from a `.ntb` (None for GoodNotes, which uses `decode_page`).
+    static NTB_PAGES: RefCell<Option<Vec<Page>>> = const { RefCell::new(None) };
 }
 
 fn set_out(bytes: Vec<u8>) -> i32 {
@@ -132,6 +134,11 @@ pub extern "C" fn oblyx_open(ptr: *mut u8, len: usize) -> i32 {
 }
 
 fn open_doc(data: Vec<u8>) -> i32 {
+    // Detect .ntb: a zip containing noteBundle.
+    if is_ntb_bytes(&data) {
+        return open_ntb(data);
+    }
+    NTB_PAGES.with(|p| *p.borrow_mut() = None);
     match Document::from_bytes(data) {
         Ok(doc) => {
             let json = format!("{{\"pages\":{}}}", doc.pages.len());
@@ -140,6 +147,103 @@ fn open_doc(data: Vec<u8>) -> i32 {
         }
         Err(e) => fail(format!("could not open notebook: {e:#}")),
     }
+}
+
+/// A `.ntb` is a zip whose `noteBundle` member holds the CRDT op log.
+fn is_ntb_bytes(data: &[u8]) -> bool {
+    let mut cursor = Cursor::new(data);
+    zip::ZipArchive::new(&mut cursor)
+        .map(|mut z| z.by_name("noteBundle").is_ok())
+        .unwrap_or(false)
+}
+
+/// Parse a `.ntb` from raw bytes and store the resulting document + pages.
+fn open_ntb(data: Vec<u8>) -> i32 {
+    match parse_ntb(data) {
+        Ok((doc, pages)) => {
+            let jobs = doc.pdf_raster_jobs();
+            let mut json = format!("{{\"pages\":{},\"jobs\":[", pages.len());
+            for (i, (att, page)) in jobs.iter().enumerate() {
+                if i > 0 {
+                    json.push(',');
+                }
+                json.push_str(&format!("[\"{att}\",{page}]"));
+            }
+            json.push_str("]}");
+            JOBS.with(|j| *j.borrow_mut() = jobs);
+            DOC.with(|d| *d.borrow_mut() = Some(doc));
+            NTB_PAGES.with(|p| *p.borrow_mut() = Some(pages));
+            set_out(json.into_bytes())
+        }
+        Err(e) => fail(format!("could not open Notability notebook: {e}")),
+    }
+}
+
+/// Parse `.ntb` bytes into a `Document` + pre-built `Page`s, binding PDF
+/// backgrounds. Mirrors the native `load_ntb_pages` path.
+fn parse_ntb(bytes: Vec<u8>) -> Result<(Document, Vec<Page>), String> {
+    use std::io::Read as _;
+    let mut z = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("ntb zip: {e}"))?;
+    let mut bundle = Vec::new();
+    z.by_name("noteBundle")
+        .and_then(|mut f| f.read_to_end(&mut bundle).map_err(|e| e.into()))
+        .map_err(|e| format!("noteBundle: {e}"))?;
+    let mut assets = Vec::new();
+    for i in 0..z.len() {
+        let entry = z.by_index(i).map_err(|e| format!("zip entry {i}: {e}"))?;
+        let name = entry.name().to_string();
+        if name.starts_with("assets/") {
+            let mut buf = Vec::new();
+            let mut entry = entry;
+            entry
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("read {name}: {e}"))?;
+            assets.push((name, buf));
+        }
+    }
+    let (meta, strokes, pages, texts, shapes) =
+        oblyx::ntb::parse_bundle_public(&bundle).map_err(|e| format!("parse bundle: {e}"))?;
+    let ntb_doc = oblyx::ntb::NtbDocument {
+        meta,
+        strokes,
+        pages,
+        texts,
+        shapes,
+        manifest: Vec::new(),
+        thumbnail: None,
+        assets,
+    };
+    let pages = oblyx::ntb::to_pages(&ntb_doc, oblyx::ntb::NTB_PAGE_H);
+    let mut doc = Document::empty();
+    let mut hash_to_key: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (name, bytes) in &ntb_doc.assets {
+        let key = name.rsplit('/').next().unwrap_or(name).to_string();
+        if let Some(hex) = name
+            .rsplit('/')
+            .next()
+            .and_then(|f| f.split('.').next())
+            .filter(|h| h.len() == 128 && h.chars().all(|c| c.is_ascii_hexdigit()))
+        {
+            hash_to_key.insert(hex.to_ascii_lowercase(), key.clone());
+        }
+        doc.insert_attachment(key, bytes.clone());
+    }
+    for page in &pages {
+        let bg = page.uuid.split_once('#').and_then(|(_, rest)| {
+            let (h, p) = rest.split_once(':')?;
+            let n: u64 = p.parse().ok()?;
+            Some((h.to_string(), n))
+        });
+        if let Some((hash_hex, pdf_page)) = bg
+            && let Some(key) = hash_to_key.get(&hash_hex)
+        {
+            doc.set_page_cfg(&page.uuid, key.clone(), Some(pdf_page));
+        }
+    }
+    // Backgrounds are injected later in oblyx_convert once JS has rendered
+    // the PDF pages via pdf.js and stored them with oblyx_set_raster.
+    Ok((doc, pages))
 }
 
 /// Parse a `.zip` full of notebooks and start a fresh output archive.
@@ -269,16 +373,28 @@ pub extern "C" fn oblyx_convert(fmt: u32) -> i32 {
         let Some(doc) = doc_ref.as_ref() else {
             return fail("no document".into());
         };
-        let total = doc.pages.len() as u32;
-        // Sequential on purpose: rayon's thread pool cannot run on wasm.
-        let mut pages = Vec::with_capacity(doc.pages.len());
-        for (i, src) in doc.pages.iter().enumerate() {
-            match doc.decode_page(src, false, DPI) {
-                Ok(page) => pages.push(page),
-                Err(e) => return fail(format!("decode page {}: {e:#}", src.uuid)),
+        // .ntb pages are pre-built by to_pages; GoodNotes pages come from decode_page.
+        let ntb_pages = NTB_PAGES.with(|p| p.borrow().clone());
+        let total = if let Some(ref np) = ntb_pages {
+            np.len() as u32
+        } else {
+            doc.pages.len() as u32
+        };
+        let mut pages = if let Some(np) = ntb_pages {
+            np
+        } else {
+            let mut pages = Vec::with_capacity(doc.pages.len());
+            for (i, src) in doc.pages.iter().enumerate() {
+                match doc.decode_page(src, false, DPI) {
+                    Ok(page) => pages.push(page),
+                    Err(e) => return fail(format!("decode page {}: {e:#}", src.uuid)),
+                }
+                report(PHASE_DECODE, i as u32 + 1, total);
             }
-            report(PHASE_DECODE, i as u32 + 1, total);
-        }
+            pages
+        };
+        // Inject PDF backgrounds from js-rendered rasters (no-op if none).
+        doc.inject_pdf_backgrounds(&mut pages, DPI);
         let archived = SINK.with(|s| s.borrow().is_some());
         match fmt {
             0 => {
