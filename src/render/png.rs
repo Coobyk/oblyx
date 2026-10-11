@@ -7,8 +7,8 @@ use tiny_skia::{
 };
 
 use crate::doc::{
-    Background, Document, FillPathEl, ImageEl, Item, PAGE_H, PAGE_W, Page, PathEl, ShapeEl,
-    ShapeKind, Sticky, Stroke as StrokeData, TextBox,
+    Background, Document, FillPathEl, ImageEl, Item, Page, PathEl, ShapeEl, ShapeKind, Sticky,
+    Stroke as StrokeData, TextBox,
 };
 use crate::geom;
 use crate::render::text::draw_text_line;
@@ -23,7 +23,7 @@ fn decode_jpeg(bytes: &[u8]) -> Option<RgbaImage> {
     let mut dec = jpeg_decoder::Decoder::new(Cursor::new(bytes));
     let raw = dec.decode().ok()?;
     let format = dec.info()?.pixel_format;
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    let mut rgba = Vec::with_capacity((w as usize) * (h as usize) * 4);
     match format {
         jpeg_decoder::PixelFormat::RGB24 => {
             for px in raw.chunks_exact(3) {
@@ -61,7 +61,7 @@ fn decode_png(bytes: &[u8]) -> Option<RgbaImage> {
     buf.truncate(info.buffer_size());
     let (w, h) = (info.width, info.height);
     let ct = reader.output_color_type().0;
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    let mut rgba = Vec::with_capacity((w as usize) * (h as usize) * 4);
     match ct {
         png::ColorType::Rgb => {
             for px in buf.chunks_exact(3) {
@@ -194,8 +194,10 @@ fn draw_stroke(pm: &mut Pixmap, st: &StrokeData, scale: f32) {
     let Some(path) = pb.finish() else {
         return;
     };
-    let mut paint = Paint::default();
-    paint.anti_alias = true;
+    let mut paint = Paint {
+        anti_alias: true,
+        ..Default::default()
+    };
     if st.rgba[3] < 0.95 {
         paint.blend_mode = BlendMode::Multiply;
     }
@@ -228,8 +230,10 @@ fn draw_sticky(pm: &mut Pixmap, st: &Sticky, scale: f32) {
     let Some(rect) = tiny_skia::Rect::from_xywh(x, y, w, h) else {
         return;
     };
-    let mut paint = Paint::default();
-    paint.anti_alias = true;
+    let mut paint = Paint {
+        anti_alias: true,
+        ..Default::default()
+    };
     paint.set_color_rgba8(
         (st.rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8,
         (st.rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8,
@@ -253,8 +257,10 @@ fn draw_text(pm: &mut Pixmap, t: &TextBox, scale: f32) {
 }
 
 fn color_paint(rgba: [f32; 4]) -> Paint<'static> {
-    let mut paint = Paint::default();
-    paint.anti_alias = true;
+    let mut paint = Paint {
+        anti_alias: true,
+        ..Default::default()
+    };
     paint.set_color_rgba8(
         (rgba[0].clamp(0.0, 1.0) * 255.0).round() as u8,
         (rgba[1].clamp(0.0, 1.0) * 255.0).round() as u8,
@@ -501,8 +507,8 @@ fn draw_fill_path(pm: &mut Pixmap, fp: &FillPathEl, scale: f32) {
 }
 
 pub fn page_to_png(page: &Page, doc: &Document, scale: f32) -> Result<Vec<u8>> {
-    let w = (PAGE_W * scale).round().max(1.0) as u32;
-    let h = (PAGE_H * scale).round().max(1.0) as u32;
+    let w = (page.width * scale).round().max(1.0) as u32;
+    let h = (page.height * scale).round().max(1.0) as u32;
     let mut pm = Pixmap::new(w, h).context("create pixmap")?;
     pm.fill(tiny_skia::Color::WHITE);
 
@@ -521,8 +527,6 @@ pub fn page_to_png(page: &Page, doc: &Document, scale: f32) -> Result<Vec<u8>> {
                     crate::vlog!(1, "asset {}: attachment missing, skipped", im.attachment);
                 }
             }
-            // PDF page backgrounds are embedded only in PDF output for now.
-            Item::PdfBackground(_) => {}
             Item::Sticky(st) => draw_sticky(&mut pm, st, scale),
             Item::Text(t) => draw_text(&mut pm, t, scale),
             Item::Background(bg) => draw_background(&mut pm, bg, scale),

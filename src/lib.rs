@@ -5,6 +5,7 @@ pub mod geom;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod mem;
+pub mod ntb;
 pub mod paper;
 pub mod pb;
 mod pdfinput;

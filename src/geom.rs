@@ -14,6 +14,12 @@ pub fn smooth(pts: &[[f32; 2]], max_gap: f32) -> Vec<Seg> {
     if pts.len() < 2 {
         return out;
     }
+    // A 2-point path is a single segment (shape lines, straight strokes);
+    // gap-splitting would discard both endpoints as 1-point runs.
+    if pts.len() == 2 {
+        out.push(Seg::Line(pts[1]));
+        return out;
+    }
 
     let mut run_start = 0usize;
     let mut i = 1;
@@ -51,5 +57,36 @@ fn emit_run(run: &[[f32; 2]], out: &mut Vec<Seg>) {
             p2[1] - (next[1] - p1[1]) / 6.0,
         ];
         out.push(Seg::Curve(c1, c2, p2));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_point_far_line_is_not_dropped() {
+        // Shape lines (e.g. highlight underlines) are 2-point paths with
+        // endpoints far beyond MAX_GAP; they must still emit one segment.
+        let pts = [[180.0, 288.0], [320.0, 288.0]];
+        let segs = smooth(&pts, MAX_GAP);
+        assert_eq!(segs.len(), 1);
+        match &segs[0] {
+            Seg::Line(p) => assert_eq!(*p, [320.0, 288.0]),
+            Seg::Curve(..) => panic!("expected a straight line segment"),
+        }
+    }
+
+    #[test]
+    fn multi_point_gap_split_still_works() {
+        // Three points with a large gap between the 2nd and 3rd: the first
+        // run (2 points) emits a line; the trailing 1-point run is dropped.
+        let pts = [[0.0, 0.0], [10.0, 0.0], [500.0, 0.0]];
+        let segs = smooth(&pts, MAX_GAP);
+        assert_eq!(segs.len(), 1);
+        match &segs[0] {
+            Seg::Line(p) => assert_eq!(*p, [10.0, 0.0]),
+            Seg::Curve(..) => panic!("expected a straight line segment"),
+        }
     }
 }

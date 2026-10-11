@@ -276,14 +276,10 @@ fn run(src: &[u8], mw: f32, mh: f32, out: &mut Vec<Rect>) {
             i += 1;
             while i < src.len() {
                 let c = src[i];
-                if c.is_ascii_digit() || c == b'.' {
-                    i += 1;
-                } else if (c == b'+' || c == b'-')
+                let is_exp_sign = (c == b'+' || c == b'-')
                     && i > start
-                    && (src[i - 1] == b'e' || src[i - 1] == b'E')
-                {
-                    i += 1;
-                } else if c == b'e' || c == b'E' {
+                    && (src[i - 1] == b'e' || src[i - 1] == b'E');
+                if c.is_ascii_digit() || c == b'.' || c == b'e' || c == b'E' || is_exp_sign {
                     i += 1;
                 } else {
                     break;

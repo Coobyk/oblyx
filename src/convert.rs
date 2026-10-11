@@ -67,6 +67,10 @@ pub fn is_goodnotes(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("goodnotes"))
 }
 
+pub fn is_ntb(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("ntb"))
+}
+
 pub fn is_zip(path: &Path) -> bool {
     path.extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
@@ -136,7 +140,7 @@ pub fn zip_member_layout(name: &str) -> Option<(Option<PathBuf>, String)> {
         }
     }
     let file = parts.pop()?;
-    if !is_goodnotes(Path::new(file)) {
+    if !is_goodnotes(Path::new(file)) && !is_ntb(Path::new(file)) {
         return None;
     }
     let stem = Path::new(file).file_stem()?.to_string_lossy().into_owned();
@@ -160,7 +164,7 @@ fn walk_dir(dir: &Path, out: &mut Vec<InputFile>) -> Result<()> {
         let path = entry.path();
         if path.is_dir() {
             walk_dir(&path, out)?;
-        } else if is_goodnotes(&path) {
+        } else if is_goodnotes(&path) || is_ntb(&path) {
             out.push(InputFile::from_path(path));
         }
     }
@@ -203,7 +207,7 @@ pub fn collect_inputs(inputs: &[PathBuf]) -> Result<Vec<InputFile>> {
         let meta = std::fs::metadata(input).with_context(|| format!("stat {}", input.display()))?;
         if meta.is_dir() {
             walk_dir(input, &mut files)?;
-        } else if is_goodnotes(input) {
+        } else if is_goodnotes(input) || is_ntb(input) {
             files.push(InputFile::from_path(input.clone()));
         } else if is_zip(input) {
             collect_zip(input, &mut files)?;
@@ -515,31 +519,20 @@ pub fn convert_job_sink(
     let started = Instant::now();
     let label = job.label();
     crate::vlog!(1, "opening {label}");
-    let doc = match &job.member {
-        Some(member) => Document::from_bytes(read_zip_member(&job.file, member)?)?,
-        None => Document::open(&job.file)?,
+
+    // Load pages + document, dispatching on file type. For zip-archive
+    // members the extension lives on the member name, not the outer zip.
+    let effective = job
+        .member
+        .as_deref()
+        .map(Path::new)
+        .unwrap_or(&job.file);
+    let (doc, pages) = if is_ntb(effective) {
+        load_ntb_pages(job, options)?
+    } else {
+        load_goodnotes_pages(job, options, &progress)?
     };
-    if doc.schema != 0 && doc.schema != 35 {
-        eprintln!(
-            "{label}: warning: unexpected schema {} (expected 35)",
-            doc.schema
-        );
-    }
-    crate::vlog!(
-        1,
-        "{label}: index has {} page(s), {} attachment(s)",
-        doc.pages.len(),
-        doc.attachments.len()
-    );
-    crate::vlog!(1, "{label}: decoding page(s)");
-    let pages = decode_pages_with(
-        &doc,
-        options.page.as_deref(),
-        options.include_deleted,
-        options.dpi,
-        &progress,
-    )?;
-    crate::vlog!(1, "{label}: decoded {} page(s)", pages.len());
+
     let scale = (options.dpi / 72.0).max(0.1);
     let mut written = 0usize;
 
@@ -612,6 +605,158 @@ pub fn convert_job_sink(
         pages: pages.len(),
         written,
         took: started.elapsed(),
+    })
+}
+
+/// Load a `.goodnotes` notebook and decode its pages.
+fn load_goodnotes_pages(
+    job: &Job,
+    options: &ConvertOptions,
+    progress: &(impl Fn(JobProgress) + Sync),
+) -> Result<(Document, Vec<Page>)> {
+    let label = job.label();
+    let doc = match &job.member {
+        Some(member) => Document::from_bytes(read_zip_member(&job.file, member)?)?,
+        None => Document::open(&job.file)?,
+    };
+    if doc.schema != 0 && doc.schema != 35 {
+        eprintln!(
+            "{label}: warning: unexpected schema {} (expected 35)",
+            doc.schema
+        );
+    }
+    crate::vlog!(
+        1,
+        "{label}: index has {} page(s), {} attachment(s)",
+        doc.pages.len(),
+        doc.attachments.len()
+    );
+    crate::vlog!(1, "{label}: decoding page(s)");
+    let pages = decode_pages_with(
+        &doc,
+        options.page.as_deref(),
+        options.include_deleted,
+        options.dpi,
+        progress,
+    )?;
+    crate::vlog!(1, "{label}: decoded {} page(s)", pages.len());
+    Ok((doc, pages))
+}
+
+/// Load a `.ntb` (Notability cloud) notebook and convert it to pages.
+///
+/// Strokes are emitted as anchor-positioned dashes because the intra-stroke
+/// path geometry is not yet decoded. Asset files are loaded into the
+/// document's attachment map.
+fn load_ntb_pages(
+    job: &Job,
+    options: &ConvertOptions,
+) -> Result<(Document, Vec<Page>)> {
+    let label = job.label();
+    let ntb_doc = match &job.member {
+        Some(member) => {
+            // .ntb is itself a zip; parse from the containing archive's member.
+            let bytes = read_zip_member(&job.file, member)?;
+            parse_ntb_bytes(&bytes)?
+        }
+        None => crate::ntb::open(&job.file)?,
+    };
+    crate::vlog!(
+        1,
+        "{label}: ntb has {} stroke(s), {} shape(s), {} page def(s), {} text(s), {} asset(s), version {}",
+        ntb_doc.strokes.len(),
+        ntb_doc.shapes.len(),
+        ntb_doc.pages.len(),
+        ntb_doc.texts.len(),
+        ntb_doc.assets.len(),
+        ntb_doc.meta.version
+    );
+    if let Some(pd) = ntb_doc.pages.first() {
+        crate::vlog!(1, "{label}: page size {:.0}×{:.0} pt", pd.width, pd.height);
+    }
+    let mut pages = crate::ntb::to_pages(&ntb_doc, crate::ntb::NTB_PAGE_H);
+    crate::vlog!(1, "{label}: paginated into {} page(s)", pages.len());
+    let mut doc = Document::empty();
+    // Map asset hash (hex of the 64-byte content hash) -> attachment key.
+    let mut hash_to_key: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (name, bytes) in &ntb_doc.assets {
+        let key = name.rsplit('/').next().unwrap_or(name).to_string();
+        // The zip member name is `assets/<hex>.pdf`; the hex (before the
+        // extension) is the 64-byte content hash used in page UUIDs.
+        if let Some(hex) = name
+            .rsplit('/')
+            .next()
+            .and_then(|f| f.split('.').next())
+            .filter(|h| h.len() == 128 && h.chars().all(|c| c.is_ascii_hexdigit()))
+        {
+            hash_to_key.insert(hex.to_ascii_lowercase(), key.clone());
+        }
+        doc.insert_attachment(key, bytes.clone());
+    }
+    // Wire PDF backgrounds: page UUIDs from `to_pages` encode
+    // `ntb-pNNNN#<hexhash>:<pdf_page>` when a background was recorded.
+    let mut bg_bound = 0usize;
+    for page in &pages {
+        let bg = page.uuid.split_once('#').and_then(|(_, rest)| {
+            let (h, p) = rest.split_once(':')?;
+            let n: u64 = p.parse().ok()?;
+            Some((h.to_string(), n))
+        });
+        if let Some((hash_hex, pdf_page)) = bg
+            && let Some(key) = hash_to_key.get(&hash_hex)
+        {
+            doc.set_page_cfg(&page.uuid, key.clone(), Some(pdf_page));
+            bg_bound += 1;
+        }
+    }
+    if bg_bound > 0 {
+        crate::vlog!(1, "{label}: bound {bg_bound} page(s) to PDF backgrounds");
+        doc.inject_pdf_backgrounds(&mut pages, options.dpi);
+    }
+    Ok((doc, pages))
+}
+
+/// Parse an `.ntb` from in-memory bytes (for zip-archive members).
+fn parse_ntb_bytes(bytes: &[u8]) -> Result<crate::ntb::NtbDocument> {
+    use std::io::Read as _;
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec()))
+        .context("ntb zip open")?;
+    let mut manifest = Vec::new();
+    if let Ok(mut f) = z.by_name("manifest.json") {
+        f.read_to_end(&mut manifest)?;
+    }
+    let mut thumbnail = None;
+    if let Ok(mut f) = z.by_name("thumbnail.png") {
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        thumbnail = Some(buf);
+    }
+    let mut bundle = Vec::new();
+    z.by_name("noteBundle")?
+        .read_to_end(&mut bundle)
+        .context("noteBundle missing")?;
+    let mut assets = Vec::new();
+    for i in 0..z.len() {
+        let entry = z.by_index(i)?;
+        let name = entry.name().to_string();
+        if name.starts_with("assets/") {
+            let mut buf = Vec::new();
+            let mut entry = entry;
+            entry.read_to_end(&mut buf)?;
+            assets.push((name, buf));
+        }
+    }
+    let (meta, strokes, pages, texts, shapes) = crate::ntb::parse_bundle_public(&bundle)?;
+    Ok(crate::ntb::NtbDocument {
+        meta,
+        strokes,
+        pages,
+        texts,
+        shapes,
+        manifest,
+        thumbnail,
+        assets,
     })
 }
 
