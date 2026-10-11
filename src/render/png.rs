@@ -23,7 +23,7 @@ fn decode_jpeg(bytes: &[u8]) -> Option<RgbaImage> {
     let mut dec = jpeg_decoder::Decoder::new(Cursor::new(bytes));
     let raw = dec.decode().ok()?;
     let format = dec.info()?.pixel_format;
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    let mut rgba = Vec::with_capacity((w as usize) * (h as usize) * 4);
     match format {
         jpeg_decoder::PixelFormat::RGB24 => {
             for px in raw.chunks_exact(3) {
@@ -61,7 +61,7 @@ fn decode_png(bytes: &[u8]) -> Option<RgbaImage> {
     buf.truncate(info.buffer_size());
     let (w, h) = (info.width, info.height);
     let ct = reader.output_color_type().0;
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    let mut rgba = Vec::with_capacity((w as usize) * (h as usize) * 4);
     match ct {
         png::ColorType::Rgb => {
             for px in buf.chunks_exact(3) {

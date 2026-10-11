@@ -375,8 +375,11 @@ unverified — do not emit them until decoded. See open problem 5.
 
 Each CreateInk/CreateShape payload carries **f0 = page SeqId** (df struct,
 12 bytes, aligned: `site u16 @0`, `pad 2 @2`, `timestamp u32 @4`,
-`index u32 @8`). CreatePage carries the same SeqId at f0 (its *location*),
-which is how page dimensions bind to ink groups.
+`index u32 @8`). CreatePage's **entity id** (its own SeqId, not f0) plus
+**pageCount** (payload f2, default 1) creates N sibling pages with ids
+`(site, ts, 0)`, …, `(site, ts, N-1)` — this matches Notability Web's
+`bv.init(metadata.id.site, metadata.id.timestamp, pageInPayload)`. The
+payload's **location** field (f0) is a *background target* (see §4.9).
 
 **SeqId layout** (from the web-app `createSeqId` builder): `prep(4, 12)`,
 then `writeInt32(index)`, `writeInt32(timestamp)`, `pad(2)`,
@@ -388,18 +391,30 @@ and 2 bytes of padding before the timestamp. Reading as packed
 Page sequence follows the CreatePage defs in first-appearance order; only
 pages that carry live ink are emitted (bare CreatePage ops often mark
 scratch/deleted pages whose content was removed later). Dimensions come
-from the matching CreatePage background (by location SeqId), defaulting
-to A4 (595.28 × 841.89). This replaces the old Y-slice approximation,
-which collapsed multi-page notebooks onto one page because pages share a
-local coordinate space (each page's Y restarts near 0).
+from the matching CreatePage background, defaulting to A4 (595.28 ×
+841.89). This replaces the old Y-slice approximation, which collapsed
+multi-page notebooks onto one page because pages share a local coordinate
+space (each page's Y restarts near 0).
 
-CreatePage ops come in two shapes: *full* (f0 location SeqId + f1
-background with f3 size) and *bare* (f0 SeqId only, no background). Bare
-creates still register the page id — later full creates for the same id
-merge in the dimensions (first-appearance order preserved; a later bare
-re-create never clears recorded dims). D1/Eth1 consist only of bare
-creates, so their defs carry unknown dims and fall back to A4 (which
-matches their PDF exports).
+CreatePage ops come in two shapes: *full* (f1 background with f3 size) and
+*bare* (no background). Bare creates still register the page id — later
+full creates for the same id merge in the dimensions (first-appearance
+order preserved; a later bare re-create never clears recorded dims).
+D1/Eth1 consist only of bare creates, so their defs carry unknown dims and
+fall back to A4 (which matches their PDF exports).
+
+**Location-target background binding.** A full CreatePage with a
+location (f0) also binds its background to that existing page id. For
+single-page creates (pageCount==1) this is a *strong* binding — always
+applied (iOS "set background on an existing page": the ink stays on the
+location page, and a later CreatePage updates it). For multi-page imports
+(pageCount>1) the binding is *weak*: applied only when the import's
+entity pages carry no strokes (the ink stayed on the location page, as in
+E1's Dick-Beyer case) and the target has no stronger background. This
+avoids breaking G1's grid-notes page, whose ink lives on a location page
+of a multi-page import whose entity pages also carry ink. A later
+single-page "set background" op with the *same* asset hash preserves an
+existing pdf_page > 1 rather than resetting it to 1.
 
 `ModifyPositions` (payloadType 24) entries carry f1 = page SeqId and f2 =
 origin; the fold applies both, so strokes moved between pages after
@@ -438,9 +453,14 @@ PageBackground.f1          → nested table (nf=6)
   nested other fields      → unknown / unused by the reader
 ```
 
-**CreatePage payload f2** is a u32: the **1-based PDF page index**
-within that asset (default 1 when absent). Together with the hash this
-yields the full background binding: `assets/<hash hex>.pdf`, page N.
+**CreatePage payload f2** is a u32: the **pageCount** — how many sibling
+pages the op creates (default 1 when absent). The sibling pages share the
+background; their 1-based index within the asset is `idx + 1` for page
+`(site, ts, idx)`. The payload's **location** field (f0) additionally
+binds the background to an existing page id (see §4.2 pagination): single-
+page creates bind strongly (always), multi-page imports bind weakly (only
+when the import's entity pages carry no strokes). Together with the hash
+this yields the full background binding: `assets/<hash hex>.pdf`, page N.
 
 Verified counts of CreatePage defs carrying an asset hash:
 
@@ -610,7 +630,18 @@ loaded into the document attachment map. Example: `cargo run --bin oblyx
 11. **D1/Eth1 background structure** — both have `assets/` members but
     zero CreatePage defs with a nested PageBackground; their binding
     mechanism (if any) is unexamined.
+12. **G1 duplicate pages** — pages `(0,4754,0)`, `(0,4755,0)`,
+    `(0,4906,0)`, `(0,4907,0)` carry the same ink as the textbook pages
+    but are created by single-page ops with f2 absent (pdf_page defaults
+    to 1). Likely CRDT re-import artifacts; the correct pdf_page for the
+    second copies is not encoded in the ops.
+13. **E1 grid-template backgrounds** — pages `(0,2566,0)` and
+    `(0,4139,0)` carry ink on a grid-template paper but no CreatePage
+    provides the grid asset via entity or location; their binding
+    mechanism is unknown (possibly a paper-style enum rather than an
+    asset hash).
 
 Point coordinate encoding, shape schema, fill colour, CRDT delete/modify
-folding, page-id pagination, and PDF background asset binding are
-**solved** — see §4.4, §4.2, §4.8, §4.9.
+folding, page-id pagination, CreatePage pageCount/location semantics, and
+PDF background asset binding are **solved** — see §4.4, §4.2, §4.8,
+§4.9.

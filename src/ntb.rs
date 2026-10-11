@@ -171,7 +171,7 @@ const DEL_F0_DELETES: usize = 0; // vector of sf structs
 const DEL_F1_UNDELETES: usize = 1; // vector of sf structs
 
 // CreatePage payload field indices.
-const PAGE_F0_LOCATION: usize = 0; // df SeqId (matches ink/shape f0 page ids)
+const PAGE_F0_LOCATION: usize = 0; // df SeqId — insert-after reference for page ordering
 const PAGE_F1_BACKGROUND: usize = 1; // uoffset to PageBackground table
 
 // PageBackground table field indices.
@@ -182,7 +182,11 @@ const BG_F3_SIZE: usize = 3; // vf struct 2×f32 (width, height), inline
 const NESTED_F0_INNER: usize = 0; // uoffset to inner table holding the hash
 
 // CreatePage payload field indices (beyond f0 location / f1 background).
-const PAGE_F2_PDF_PAGE: usize = 2; // u32, 1-based page index within the PDF asset
+// f2 is pageCount (u32, default 1): one CreatePage with pageCount=N creates
+// pages (site, ts, 0..N-1) sharing one background. Verified against Notability
+// Web's ProcessStroke worker (`pE.init({location, background, pageCount, ...})`
+// and `for (let r of Kn(0, e.pageCount())) { new kk(metadata, payload, r) }`).
+const PAGE_F2_PAGE_COUNT: usize = 2; // u32, number of pages to create (default 1)
 
 /// Constant 5-byte trailer ending each 19-byte point record.
 const POINT_TRAILER: [u8; 5] = [0x00, 0x3c, 0xff, 0x00, 0x00];
@@ -192,12 +196,12 @@ const POINT_STRIDE: usize = 19;
 const BEZIER_SAMPLES: usize = 12;
 
 /// Entity id: `(site, timestamp)` from an op's f0 sf struct.
-type EntityId = (u16, u32);
+pub type EntityId = (u16, u32);
 
 /// Page id: `(site, timestamp, index)` from a df SeqId struct (12 bytes,
 /// aligned: `site u16 @0`, `pad 2 @2`, `timestamp u32 @4`, `index u32 @8`).
 /// Matches CreateInk/CreateShape f0 and CreatePage f0 (location).
-type PageId = (u16, u32, u32);
+pub type PageId = (u16, u32, u32);
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -234,13 +238,31 @@ pub struct NtbStroke {
     pub audio_duration_ms: Option<i32>,
 }
 
-/// A page definition from a CreatePage op. `id` is the CreatePage f0 location
-/// SeqId matching ink/shape page ids. `width`/`height` are the background size
-/// in points when present; `0×0` means the page was created bare (no
-/// background recorded) and pagination falls back to A4. `asset_hash` is the
-/// 64-byte content hash of the background PDF/image (from the PageBackground
-/// nested table) when a background is present; `pdf_page` is the 1-based page
-/// index within that asset (CreatePage payload f2, defaulting to 1).
+/// A page definition derived from a CreatePage op.
+///
+/// iOS `.ntb` CreatePage semantics (reverse-engineered from the op log +
+/// Notability Web's ProcessStroke worker):
+///
+/// - The op's **entity id** `(site, ts)` plus `pageCount` (payload f2,
+///   default 1) creates N pages with ids `(site, ts, 0)`, …,
+///   `(site, ts, N-1)`, all sharing one background. This matches the web
+///   worker's
+///   `bv.init(metadata.id.site, metadata.id.timestamp, pageInPayload)`.
+/// - The payload's **location** field (f0) is additionally used as a
+///   *background target*: when present and single-page (pageCount==1), the
+///   background is also bound to that existing page id. This is how iOS "set
+///   background on an existing page" works — the ink stays on the location
+///   page, and a later CreatePage with a background updates it.
+/// - For multi-page imports (pageCount>1) the location is an insert-after
+///   ordering ref. A weak fallback is kept (`weak=true`) and applied only
+///   when the import's entity pages carry no ink (i.e. the ink stayed on the
+///   location page, as in E1's Dick-Beyer case) and the target has no strong
+///   background. This avoids breaking G1's grid-notes page, whose ink lives
+///   on the location page but whose entity pages also carry ink.
+///
+/// `width`/`height` are the background size in points when present; `0×0`
+/// means bare. `asset_hash` is the 64-byte content hash of the background
+/// PDF/image. `pdf_page` is the 1-based index within that asset.
 #[derive(Debug, Clone)]
 pub struct NtbPageDef {
     pub id: PageId,
@@ -250,6 +272,12 @@ pub struct NtbPageDef {
     pub asset_hash: Option<[u8; 64]>,
     /// 1-based page index within the background asset PDF.
     pub pdf_page: u64,
+    /// Weak location-target background: applied only when the import's entity
+    /// pages carry no ink and the target has no stronger background.
+    pub weak: bool,
+    /// For weak defs, the CreatePage entity id `(site, ts)` whose sibling
+    /// pages are checked for ink before applying the weak background.
+    pub entity: Option<EntityId>,
 }
 
 impl Default for NtbPageDef {
@@ -260,6 +288,8 @@ impl Default for NtbPageDef {
             height: 0.0,
             asset_hash: None,
             pdf_page: 1,
+            weak: false,
+            entity: None,
         }
     }
 }
@@ -596,8 +626,15 @@ fn fold_op(
             apply_deletes(b, payload_pos, &pf, fold)?;
         }
         PT_CREATE_PAGE => {
-            if let Some(pd) = parse_create_page(b, payload_pos, &pf)? {
-                upsert_page(pages, pd);
+            if let Some(entity) = id {
+                let (entity_pages, location_target) =
+                    parse_create_page(b, payload_pos, &pf, entity)?;
+                for pd in entity_pages {
+                    upsert_page(pages, pd);
+                }
+                if let Some(target) = location_target {
+                    upsert_page(pages, target);
+                }
             }
         }
         _ => {
@@ -815,57 +852,84 @@ fn apply_deletes(b: &Buf, tp: usize, fields: &[u16], fold: &mut Fold) -> Result<
     Ok(())
 }
 
-/// Parse a CreatePage op: f0 location SeqId + optional f1 → PageBackground →
-/// nested asset-ref (64-byte hash) + f3 size. A bare CreatePage (f0 present,
-/// f1/size absent) registers the page with unknown dims (`0×0`); a later
-/// CreatePage with a background updates the dims (see [`upsert_page`]).
-/// Payload f2, when present, is the 1-based PDF page index within the asset.
-fn parse_create_page(b: &Buf, tp: usize, fields: &[u16]) -> Result<Option<NtbPageDef>> {
-    let f0 = Buf::field_off(fields, PAGE_F0_LOCATION);
-    let Some(id) = read_page_id(b, tp, f0) else {
-        return Ok(None);
+/// Parse a CreatePage op. Returns `(entity_pages, location_target)`:
+///
+/// - `entity_pages`: one [`NtbPageDef`] per created page, ids
+///   `(entity.site, entity.ts, 0..pageCount-1)`, all sharing the background.
+/// - `location_target`: `Some((page_id, width, height, asset_hash, pdf_page))`
+///   when the payload carries a location (f0) *and* a background — the
+///   background should also be bound to that existing page id.
+fn parse_create_page(
+    b: &Buf,
+    tp: usize,
+    fields: &[u16],
+    entity: EntityId,
+) -> Result<(Vec<NtbPageDef>, Option<NtbPageDef>)> {
+    let page_count = {
+        let f2 = Buf::field_off(fields, PAGE_F2_PAGE_COUNT);
+        if f2 != 0 {
+            let v = b.u32(tp + f2).unwrap_or(1);
+            (1..=10_000).contains(&v) as usize * v as usize
+        } else {
+            1
+        }
     };
-    let unknown = NtbPageDef {
-        id,
+    let bare = |idx: u32| NtbPageDef {
+        id: (entity.0, entity.1, idx),
         width: 0.0,
         height: 0.0,
         asset_hash: None,
         pdf_page: 1,
-    };
-    let f2 = Buf::field_off(fields, PAGE_F2_PDF_PAGE);
-    let pdf_page = if f2 != 0 {
-        let v = b.u32(tp + f2).unwrap_or(1);
-        if (1..=100_000).contains(&v) { v as u64 } else { 1 }
-    } else {
-        1
+        weak: false,
+        entity: None,
     };
     let f1 = Buf::field_off(fields, PAGE_F1_BACKGROUND);
     if f1 == 0 {
-        return Ok(Some(unknown));
+        return Ok(((0..page_count as u32).map(bare).collect(), None));
     }
     let bg = b.follow(tp + f1)?;
     let (_bs, _bt, bf) = b.table(bg)?;
     let f3 = Buf::field_off(&bf, BG_F3_SIZE);
     if f3 == 0 {
-        return Ok(Some(unknown));
+        return Ok(((0..page_count as u32).map(bare).collect(), None));
     }
     let width = b.f32(bg + f3)?;
     let height = b.f32(bg + f3 + 4)?;
     if !width.is_finite() || !height.is_finite() || width < 50.0 || height < 50.0
         || width > 10_000.0 || height > 10_000.0
     {
-        return Ok(Some(unknown));
+        return Ok(((0..page_count as u32).map(bare).collect(), None));
     }
-    // Asset hash: PageBackground.f1 → nested table.f0 → inner table with the
-    // 64-byte content hash stored inline at the field's absolute position.
     let asset_hash = read_asset_hash(b, bg, &bf);
-    Ok(Some(NtbPageDef {
-        id,
-        width,
-        height,
-        asset_hash,
-        pdf_page,
-    }))
+    let pages: Vec<NtbPageDef> = (0..page_count as u32)
+        .map(|idx| NtbPageDef {
+            id: (entity.0, entity.1, idx),
+            width,
+            height,
+            asset_hash,
+            pdf_page: idx as u64 + 1,
+            weak: false,
+            entity: None,
+        })
+        .collect();
+    // Location target: iOS "set background on an existing page". Single-page
+    // (pageCount==1) targets are strong (always applied). Multi-page targets
+    // are weak: applied only when the import's entity pages carry no ink
+    // (E1 Dick-Beyer) and the target has no strong background — G1's
+    // grid-notes page is protected because its entity pages DO carry ink.
+    let location_target = {
+        let f0 = Buf::field_off(fields, PAGE_F0_LOCATION);
+        read_page_id(b, tp, f0).map(|loc_id| NtbPageDef {
+            id: loc_id,
+            width,
+            height,
+            asset_hash,
+            pdf_page: page_count as u64,
+            weak: page_count > 1,
+            entity: if page_count > 1 { Some(entity) } else { None },
+        })
+    };
+    Ok((pages, location_target))
 }
 
 /// Read the 64-byte background asset hash from a PageBackground table.
@@ -904,9 +968,14 @@ fn read_asset_hash(b: &Buf, bg: usize, bf: &[u16]) -> Option<[u8; 64]> {
 }
 
 /// Insert or merge a page def: one entry per id, first-appearance order.
-/// A later def with valid dims (`>0`) updates the existing entry's size and
-/// asset hash; a bare def (`0×0`) never clears dims or an asset already
-/// recorded.
+///
+/// Merge rules:
+/// - Strong defs (entity-page creates, single-page location targets) always
+///   update dims and asset hash.
+/// - Weak defs (multi-page location targets) carry their asset hash on the
+///   def (for paginate to consult) but `paginate_by_page_id` skips binding
+///   it at group-creation time; the weak pass applies it later, only when
+///   the import's entity pages carry no ink.
 fn upsert_page(pages: &mut Vec<NtbPageDef>, def: NtbPageDef) {
     if let Some(existing) = pages.iter_mut().find(|p| p.id == def.id) {
         if def.width > 0.0 && def.height > 0.0 {
@@ -914,8 +983,26 @@ fn upsert_page(pages: &mut Vec<NtbPageDef>, def: NtbPageDef) {
             existing.height = def.height;
         }
         if def.asset_hash.is_some() {
-            existing.asset_hash = def.asset_hash;
-            existing.pdf_page = def.pdf_page;
+            if def.weak {
+                // Weak never overrides a strong background already bound.
+                if existing.weak || existing.asset_hash.is_none() {
+                    existing.asset_hash = def.asset_hash;
+                    existing.pdf_page = def.pdf_page;
+                    existing.weak = true;
+                    existing.entity = def.entity;
+                }
+            } else if existing.asset_hash == def.asset_hash && existing.pdf_page > 1 {
+                // Same asset, page already indexed (multi-page import set
+                // pdf_page=2). A later single-page "set background" op with
+                // the same asset must not reset it to page 1.
+                existing.weak = false;
+                existing.entity = def.entity;
+            } else {
+                existing.asset_hash = def.asset_hash;
+                existing.pdf_page = def.pdf_page;
+                existing.weak = false;
+                existing.entity = def.entity;
+            }
         }
     } else {
         pages.push(def);
@@ -1429,7 +1516,9 @@ fn paginate_by_page_id(doc: &NtbDocument, fallback_h: f32) -> Vec<NtbPage> {
                 shapes: Vec::new(),
                 width: w,
                 height: h,
-                asset_hash: def.asset_hash,
+                // Weak location-target defs carry a hash on the def for the
+                // conditional pass below; do not bind it here.
+                asset_hash: if def.weak { None } else { def.asset_hash },
                 pdf_page: def.pdf_page,
             },
         );
@@ -1467,6 +1556,34 @@ fn paginate_by_page_id(doc: &NtbDocument, fallback_h: f32) -> Vec<NtbPage> {
         });
         if let Some(p) = groups.get_mut(&id) {
             p.shapes.push(s.clone());
+        }
+    }
+    // Apply weak location-target backgrounds: only when the import's entity
+    // pages carry no ink (the ink stayed on the location page, E1 Dick-Beyer)
+    // and the target page has ink but no background. G1's grid-notes page is
+    // protected because its entity pages DO carry ink.
+    for def in &doc.pages {
+        if !def.weak || def.asset_hash.is_none() {
+            continue;
+        }
+        let Some(entity) = def.entity else { continue };
+        let siblings_have_ink = doc.pages.iter().any(|d| {
+            d.id.0 == entity.0
+                && d.id.1 == entity.1
+                && groups
+                    .get(&d.id)
+                    .map(|p| !p.strokes.is_empty())
+                    .unwrap_or(false)
+        });
+        if siblings_have_ink {
+            continue;
+        }
+        if let Some(p) = groups.get_mut(&def.id)
+            && p.asset_hash.is_none()
+            && (!p.strokes.is_empty() || !p.shapes.is_empty())
+        {
+            p.asset_hash = def.asset_hash;
+            p.pdf_page = def.pdf_page;
         }
     }
     let mut out: Vec<NtbPage> = order
