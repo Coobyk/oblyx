@@ -91,9 +91,13 @@ function memberLayout(name) {
         parts.push(part);
     }
     const file = parts.pop();
-    if (!file || !file.toLowerCase().endsWith(".goodnotes"))
+    if (!file)
         return null;
-    return { sub: parts.join("/"), stem: file.slice(0, -".goodnotes".length) };
+    const lower = file.toLowerCase();
+    const ext = lower.endsWith(".ntb") ? ".ntb" : lower.endsWith(".goodnotes") ? ".goodnotes" : null;
+    if (!ext)
+        return null;
+    return { sub: parts.join("/"), stem: file.slice(0, -ext.length) };
 }
 // `Blob.arrayBuffer()` fails above 2 GB (NotReadableError). Read ranges instead.
 async function listZip(blob) {
@@ -141,7 +145,7 @@ async function listZip(blob) {
     }
     entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     if (!entries.length)
-        throw new Error("No .goodnotes files found in this zip.");
+        throw new Error("No .goodnotes or .ntb files found in this zip.");
     return entries;
 }
 async function readMember(blob, entry) {
@@ -238,7 +242,7 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
         const pages = meta.pages ?? 1;
         const single = fmt === 1 && pages <= 1;
         const ext = fmt === 0 ? "pdf" : single ? "svg" : "zip";
-        const base = name.replace(/\.goodnotes$/i, "");
+        const base = name.replace(/\.(goodnotes|ntb)$/i, "");
         return [fileOf(`${base}.${ext}`, buffer)];
     }
     catch (err) {

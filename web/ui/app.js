@@ -71,8 +71,8 @@ function reset() {
 function selectFile(file) {
   if (!file) return
   const isZip = /\.zip$/i.test(file.name)
-  if (!isZip && !/\.goodnotes$/i.test(file.name)) {
-    showError("Choose a .goodnotes file or .zip archive.")
+  if (!isZip && !/\.goodnotes$/i.test(file.name) && !/\.ntb$/i.test(file.name)) {
+    showError("Choose a .goodnotes, .ntb file, or .zip archive.")
     return
   }
 
@@ -80,7 +80,8 @@ function selectFile(file) {
   showError()
   selectedFile = file
   fileName.textContent = file.name
-  fileSize.textContent = `${formatSize(file.size)} · ${isZip ? "ZIP archive" : "Goodnotes notebook"}`
+  const kind = isZip ? "ZIP archive" : file.name.endsWith(".ntb") ? "Notability notebook" : "Goodnotes notebook"
+  fileSize.textContent = `${formatSize(file.size)} · ${kind}`
   dropzone.hidden = true
   fileRow.hidden = false
   options.hidden = false
