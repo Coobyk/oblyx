@@ -1,7 +1,13 @@
 // Node smoke test for the raw-WASM oblyx build:
 //   node test.mjs <oblyx_web.wasm> <file.goodnotes> <pdf|svg> <out-path>
 // Prints open metadata and progress lines; writes the converted artifact.
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile, mkdtemp, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const run = promisify(execFile);
 
 const [wasmPath, inputPath, fmtArg, outPath] = process.argv.slice(2);
 if (!wasmPath || !inputPath || !fmtArg || !outPath) {
@@ -42,7 +48,36 @@ if (rc !== 0) {
   process.exit(1);
 }
 const meta = JSON.parse(new TextDecoder().decode(out()));
-console.log(`pages=${meta.pages}`);
+console.log(`pages=${meta.pages} raster_jobs=${meta.jobs.length}`);
+
+// PDF output embeds backgrounds as Form XObjects and needs none of this.
+// SVG output rasterizes them through pdf.js; pdftoppm here is equivalent, so
+// the result can be byte-compared against a native CLI conversion.
+if (meta.jobs.length > 0 && fmt !== 0) {
+  const dir = await mkdtemp(join(tmpdir(), "oblyx-test-"));
+  try {
+    for (const [i, [att, page]] of meta.jobs.entries()) {
+      const pdf = withInput(new TextEncoder().encode(att), (p, n) => {
+        const rc = E.oblyx_attachment(p, n);
+        if (rc !== 0) throw new Error(new TextDecoder().decode(out()));
+        return out();
+      });
+      const pdfPath = join(dir, `att-${i}.pdf`);
+      await writeFile(pdfPath, pdf);
+      const base = join(dir, `att-${i}-p${page}`);
+      await run("pdftoppm", [
+        "-f", String(page), "-l", String(page), "-r", "144",
+        "-singlefile", "-jpeg", "-jpegopt", "quality=85", pdfPath, base,
+      ]);
+      const jpg = new Uint8Array(await readFile(`${base}.jpg`));
+      const rc = withInput(jpg, (p, n) => E.oblyx_set_raster(i, p, n));
+      if (rc !== 0) throw new Error(new TextDecoder().decode(out()));
+    }
+    console.log(`injected ${meta.jobs.length} raster(s) via pdftoppm`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
 
 const t0 = Date.now();
 const rc2 = E.oblyx_convert(fmt);

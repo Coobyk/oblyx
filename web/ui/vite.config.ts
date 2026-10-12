@@ -13,7 +13,7 @@ const runtimeTypes: Record<string, string> = {
   ".woff2": "font/woff2",
 }
 
-// worker.js and the wasm module stay next to the Pages output.
+// worker.js, the wasm module, and pdf.js stay next to the Pages output.
 function serveRuntime(): Plugin {
   return {
     name: "oblyx-runtime",
@@ -24,7 +24,8 @@ function serveRuntime(): Plugin {
           url === "/worker.js" ||
           url === "/oblyx_web.wasm" ||
           url === "/favicon.svg" ||
-          url.startsWith("/assets/")
+          url.startsWith("/assets/") ||
+          url.startsWith("/pdfjs/")
         if (!allowed) {
           next()
           return

@@ -1,8 +1,17 @@
 // Node smoke test for the raw-WASM oblyx zip-archive flow:
 //   node test-zip.mjs <oblyx_web.wasm> <batch.zip> <pdf|svg> <out-path.zip>
 // Opens the archive, converts every notebook into a single packed zip
-// (the web app's "One .zip" mode) and writes it.
-import { readFile, writeFile } from "node:fs/promises";
+// (the web app's "One .zip" mode) and writes it. For SVG output it rasterizes
+// pending background jobs with pdftoppm, exactly like test.mjs, so the result
+// can be byte-compared against a native CLI conversion. PDF output embeds
+// backgrounds as vector Form XObjects and needs none of it.
+import { readFile, writeFile, mkdtemp, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const run = promisify(execFile);
 
 const [wasmPath, zipPath, fmtArg, outPath] = process.argv.slice(2);
 if (!wasmPath || !zipPath || !fmtArg || !outPath) {
@@ -59,7 +68,33 @@ for (const [idx, entry] of entries.entries()) {
     process.exit(1);
   }
   const meta = JSON.parse(dec.decode(out()));
-  console.log(`[${idx + 1}/${entries.length}] ${entry.path}: pages=${meta.pages}`);
+  console.log(`[${idx + 1}/${entries.length}] ${entry.path}: pages=${meta.pages} raster_jobs=${meta.jobs.length}`);
+
+  if (meta.jobs.length > 0 && fmt !== 0) {
+    const dir = await mkdtemp(join(tmpdir(), "oblyx-zip-test-"));
+    try {
+      for (const [i, [att, page]] of meta.jobs.entries()) {
+        const pdf = withInput(new TextEncoder().encode(att), (p, n) => {
+          const rc = E.oblyx_attachment(p, n);
+          if (rc !== 0) throw new Error(dec.decode(out()));
+          return out();
+        });
+        const pdfPath = join(dir, `att-${i}.pdf`);
+        await writeFile(pdfPath, pdf);
+        const base = join(dir, `att-${i}-p${page}`);
+        await run("pdftoppm", [
+          "-f", String(page), "-l", String(page), "-r", "144",
+          "-singlefile", "-jpeg", "-jpegopt", "quality=85", pdfPath, base,
+        ]);
+        const jpg = new Uint8Array(await readFile(`${base}.jpg`));
+        const rc = withInput(jpg, (p, n) => E.oblyx_set_raster(i, p, n));
+        if (rc !== 0) throw new Error(dec.decode(out()));
+      }
+      console.log(`  injected ${meta.jobs.length} raster(s) via pdftoppm`);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
 
   const rcConv = E.oblyx_convert(fmt);
   if (rcConv !== 0) {

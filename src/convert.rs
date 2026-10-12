@@ -454,16 +454,14 @@ pub fn decode_pages(
     doc: &Document,
     filter: Option<&str>,
     include_deleted: bool,
-    dpi: f32,
 ) -> Result<Vec<Page>> {
-    decode_pages_with(doc, filter, include_deleted, dpi, &|_| {})
+    decode_pages_with(doc, filter, include_deleted, &|_| {})
 }
 
 pub fn decode_pages_with(
     doc: &Document,
     filter: Option<&str>,
     include_deleted: bool,
-    dpi: f32,
     progress: &(dyn Fn(JobProgress) + Sync),
 ) -> Result<Vec<Page>> {
     let filter_upper = filter.map(|f| f.to_ascii_uppercase());
@@ -481,7 +479,7 @@ pub fn decode_pages_with(
         .par_iter()
         .map(|src| {
             let page = doc
-                .decode_page(src, include_deleted, dpi)
+                .decode_page(src, include_deleted)
                 .with_context(|| format!("decode page {}", src.uuid))?;
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             progress(JobProgress::Decode { done: n, total });
@@ -528,7 +526,7 @@ pub fn convert_job_sink(
         .map(Path::new)
         .unwrap_or(&job.file);
     let (doc, pages) = if is_ntb(effective) {
-        load_ntb_pages(job, options)?
+        load_ntb_pages(job)?
     } else {
         load_goodnotes_pages(job, options, &progress)?
     };
@@ -560,7 +558,7 @@ pub fn convert_job_sink(
                 pages
                     .par_iter()
                     .map(|page| {
-                        let svg = page_to_svg(page, &doc);
+                        let svg = page_to_svg(page, &doc, options.dpi);
                         sink.write(
                             &job.root,
                             &path.join(format!("{}.svg", page.uuid)),
@@ -636,7 +634,6 @@ fn load_goodnotes_pages(
         &doc,
         options.page.as_deref(),
         options.include_deleted,
-        options.dpi,
         progress,
     )?;
     crate::vlog!(1, "{label}: decoded {} page(s)", pages.len());
@@ -648,10 +645,7 @@ fn load_goodnotes_pages(
 /// Strokes are emitted as anchor-positioned dashes because the intra-stroke
 /// path geometry is not yet decoded. Asset files are loaded into the
 /// document's attachment map.
-fn load_ntb_pages(
-    job: &Job,
-    options: &ConvertOptions,
-) -> Result<(Document, Vec<Page>)> {
+fn load_ntb_pages(job: &Job) -> Result<(Document, Vec<Page>)> {
     let label = job.label();
     let ntb_doc = match &job.member {
         Some(member) => {
@@ -712,7 +706,7 @@ fn load_ntb_pages(
     }
     if bg_bound > 0 {
         crate::vlog!(1, "{label}: bound {bg_bound} page(s) to PDF backgrounds");
-        doc.inject_pdf_backgrounds(&mut pages, options.dpi);
+        doc.inject_pdf_backgrounds(&mut pages);
     }
     Ok((doc, pages))
 }

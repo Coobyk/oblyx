@@ -1,5 +1,19 @@
 // Browser-side driver for worker.js. The worker owns the WASM module.
 const MB = 1024 * 1024;
+// pdf.js is loaded lazily: only SVG output needs it. PDF output embeds notebook
+// backgrounds as vector Form XObjects and never rasterizes anything.
+let pdfjsPromise = null;
+function loadPdfJs() {
+    if (!pdfjsPromise) {
+        const href = "/pdfjs/pdf.min.mjs";
+        pdfjsPromise = import(/* @vite-ignore */ href).then((lib) => {
+            const pdf = lib;
+            pdf.GlobalWorkerOptions.workerSrc = "/pdfjs/pdf.worker.min.mjs";
+            return pdf;
+        });
+    }
+    return pdfjsPromise;
+}
 let worker = null;
 let waiter = null;
 let onWorkerProgress = null;
@@ -56,6 +70,56 @@ const expect = (type) => new Promise((resolve, reject) => {
 });
 export function prewarm() {
     ensureWorker();
+}
+let rasterCanvas = null;
+let rasterCtx = null;
+const RENDER_TIMEOUT_MS = 180000;
+function prepareCanvas(w, h) {
+    if (!rasterCanvas) {
+        rasterCanvas = document.createElement("canvas");
+        rasterCanvas.addEventListener("contextlost", () => {
+            rasterCanvas = null;
+            rasterCtx = null;
+        });
+        rasterCtx = rasterCanvas.getContext("2d", { alpha: false });
+    }
+    if (rasterCanvas.width !== w || rasterCanvas.height !== h) {
+        rasterCanvas.width = w;
+        rasterCanvas.height = h;
+    }
+    rasterCtx.fillStyle = "#ffffff";
+    rasterCtx.fillRect(0, 0, w, h);
+    return rasterCtx;
+}
+async function renderPdfPage(pdfDoc, pageNum) {
+    const page = await pdfDoc.getPage(pageNum);
+    // scale 2 → 144 dpi, the DPI the WASM module keys its rasters at.
+    const viewport = page.getViewport({ scale: 2 });
+    const w = Math.max(1, Math.round(viewport.width));
+    const h = Math.max(1, Math.round(viewport.height));
+    prepareCanvas(w, h);
+    let timer = 0;
+    try {
+        // pdf.js 6 renders into a `canvas`, not a `canvasContext`; passing the
+        // context makes the render promise never settle.
+        await Promise.race([
+            page.render({ canvas: rasterCanvas, viewport }).promise,
+            new Promise((_, reject) => {
+                timer = window.setTimeout(() => {
+                    rasterCanvas = null;
+                    rasterCtx = null;
+                    reject(new Error(`rendering page ${pageNum} timed out — try again`));
+                }, RENDER_TIMEOUT_MS);
+            }),
+        ]);
+    }
+    finally {
+        window.clearTimeout(timer);
+    }
+    const blob = await new Promise((res, rej) => rasterCanvas.toBlob((b) => (b ? res(b) : rej(new Error("JPEG encode failed"))), "image/jpeg", 0.92));
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    page.cleanup();
+    return bytes;
 }
 function mimeFor(name) {
     if (/\.pdf$/i.test(name))
@@ -174,6 +238,53 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
         onProgress({ label, pct });
     };
     await ensureWorker();
+    async function renderRasters(meta, prefix) {
+        // fmt 0 (PDF) embeds backgrounds as vector Form XObjects — no rasters.
+        if (fmt === 0 || !meta.jobs?.length)
+            return;
+        const pdfjsLib = await loadPdfJs();
+        const p = prefix ? `${prefix} — ` : "";
+        const byAtt = new Map();
+        meta.jobs.forEach(([att, page], i) => {
+            if (!byAtt.has(att))
+                byAtt.set(att, []);
+            byAtt.get(att).push({ i, page });
+        });
+        const total = meta.jobs.length;
+        let done = 0;
+        set(prefix ? `${p}rendering backgrounds 1/${total}` : `Rendering backgrounds 1/${total}`, 0, total);
+        for (const [att, jobs] of byAtt) {
+            const attP = expect("attachment");
+            worker.postMessage({ type: "attachment", uuid: att });
+            const { buffer } = await attP;
+            // Let pdf.js own its worker: a hand-built PDFWorker never settles
+            // its render promises under pdf.js 6. One document, one worker,
+            // released by destroy() below.
+            const loading = pdfjsLib.getDocument({ data: buffer, isEvalSupported: false });
+            try {
+                let timer = 0;
+                const pdfDoc = await Promise.race([
+                    loading.promise,
+                    new Promise((_, reject) => {
+                        timer = window.setTimeout(() => {
+                            reject(new Error("reading the background PDF timed out — try again"));
+                        }, RENDER_TIMEOUT_MS);
+                    }),
+                ]).finally(() => window.clearTimeout(timer));
+                for (const { i, page } of jobs) {
+                    const jpg = await renderPdfPage(pdfDoc, page);
+                    done++;
+                    set(prefix ? `${p}rendering backgrounds ${done}/${total}` : `Rendering backgrounds ${done}/${total}`, done, total);
+                    const acked = expect("rastered");
+                    worker.postMessage({ type: "raster", index: i, buffer: jpg.buffer }, [jpg.buffer]);
+                    await acked;
+                }
+            }
+            finally {
+                await loading.destroy?.();
+            }
+        }
+    }
     async function convertCurrent(label) {
         const p = label ? `${label} — ` : "";
         const phaseLabel = {
@@ -209,7 +320,8 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
                     const openedP = expect("opened");
                     const buf = copyBytes(raw);
                     worker.postMessage({ type: "open_member", buffer: buf }, [buf]);
-                    await openedP;
+                    const memberMeta = await openedP;
+                    await renderRasters(memberMeta, label);
                     await convertCurrent(label);
                 }
                 else {
@@ -217,6 +329,7 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
                     const buf = copyBytes(raw);
                     worker.postMessage({ type: "open", buffer: buf }, [buf]);
                     const meta = await openedP;
+                    await renderRasters(meta, label);
                     const buffer = await convertCurrent(label);
                     results.push(fileOf(entryOutputName(entry, meta.pages ?? 1, fmt), buffer));
                 }
@@ -238,6 +351,7 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
         const openedP = expect("opened");
         worker.postMessage({ type: "open", buffer: buf }, [buf]);
         const meta = await openedP;
+        await renderRasters(meta, "");
         const buffer = await convertCurrent("");
         const pages = meta.pages ?? 1;
         const single = fmt === 1 && pages <= 1;

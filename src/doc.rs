@@ -47,6 +47,9 @@ pub struct Document {
     /// Paper rectangles per background attachment, parsed once and shared
     /// across every page (backgrounds can be a 300 MB PDF).
     paper_cache: Mutex<HashMap<usize, Arc<PaperRects>>>,
+    /// Page sizes in PDF points per (attachment ptr, pdf page), parsed once so
+    /// background placement never re-reads a multi-hundred-MB PDF.
+    page_size_cache: Mutex<HashMap<(usize, u64), (f32, f32)>>,
     /// Temp copies of PDF attachments for pdftoppm, keyed by attachment
     /// pointer so aliased attachment uuids share one file.
     pdf_temps: Mutex<HashMap<usize, PathBuf>>,
@@ -76,6 +79,9 @@ impl Drop for Document {
 pub enum Item {
     Stroke(Stroke),
     Image(ImageEl),
+    /// A PDF attachment page placed as the notebook background. PDF output
+    /// embeds it as a vector Form XObject; SVG/PNG rasterize it on demand.
+    PdfBackground(PdfBgEl),
     Sticky(Sticky),
     Text(TextBox),
     Shape(ShapeEl),
@@ -160,6 +166,23 @@ pub struct ImageEl {
     /// Inline image data (rasterized PDF page) when the bytes are not part of
     /// the shared document attachment map.
     pub bytes: Option<Arc<Vec<u8>>>,
+}
+
+/// A page of a PDF attachment placed as a background on a notebook page.
+#[derive(Debug, Clone)]
+pub struct PdfBgEl {
+    /// Key of the source PDF in [`Document::attachments`].
+    pub attachment: String,
+    /// 1-based page index inside that PDF.
+    pub pdf_page: u64,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Source page size in PDF points (viewer orientation) — the aspect the
+    /// placement rect was fitted from.
+    pub src_w: f32,
+    pub src_h: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +316,7 @@ impl Document {
             attachments: HashMap::new(),
             page_cfg: HashMap::new(),
             paper_cache: Mutex::new(HashMap::new()),
+            page_size_cache: Mutex::new(HashMap::new()),
             pdf_temps: Mutex::new(HashMap::new()),
             raster_cache: Mutex::new(HashMap::new()),
             temp_tag: 0,
@@ -316,49 +340,88 @@ impl Document {
         );
     }
 
-    /// Inject PDF background rasters into already-built pages (the `.ntb`
-    /// path, where pages come from `ntb::to_pages` rather than `decode_page`).
-    /// For each page whose UUID is bound via [`set_page_cfg`], rasterizes the
-    /// attachment's PDF page and inserts it as a background [`Item::Image`].
-    /// Returns the number of pages that received a background.
-    pub fn inject_pdf_backgrounds(&self, pages: &mut [Page], dpi: f32) -> usize {
+    /// Fit a PDF attachment page into a notebook page of `page_w × page_h`,
+    /// centred. The aspect comes from the PDF's own page boxes (in points), so
+    /// no rasterization is required to place it.
+    fn place_background(
+        &self,
+        attachment: &str,
+        pdf_page: u64,
+        page_w: f32,
+        page_h: f32,
+    ) -> Option<PdfBgEl> {
+        let att = self.attachments.get(attachment)?;
+        if !att.starts_with(b"%PDF-") {
+            return None;
+        }
+        let (pw, ph) = self.cached_page_size(att, pdf_page)?;
+        let s = (page_w / pw).min(page_h / ph);
+        let (w, h) = (pw * s, ph * s);
+        Some(PdfBgEl {
+            attachment: attachment.to_string(),
+            pdf_page,
+            x: (page_w - w) / 2.0,
+            y: (page_h - h) / 2.0,
+            w,
+            h,
+            src_w: pw,
+            src_h: ph,
+        })
+    }
+
+    /// Page size in PDF points, parsed once per (attachment, page).
+    fn cached_page_size(&self, att: &Arc<Vec<u8>>, pdf_page: u64) -> Option<(f32, f32)> {
+        let key = (Arc::as_ptr(att) as usize, pdf_page);
+        if let Some(hit) = self
+            .page_size_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied()
+        {
+            return Some(hit);
+        }
+        let size = pdfinput::page_size(att, pdf_page)?;
+        self.page_size_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, size);
+        Some(size)
+    }
+
+    /// JPEG raster of a background PDF page for SVG/PNG output at `dpi`.
+    /// Serves a caller-supplied raster (JavaScript on the web) when one was
+    /// stored with [`set_page_raster`], otherwise runs `pdftoppm`.
+    pub fn background_raster(
+        &self,
+        attachment: &str,
+        pdf_page: u64,
+        dpi: f32,
+    ) -> Option<Arc<Vec<u8>>> {
+        let att = self.attachments.get(attachment)?;
+        self.raster_page(att, pdf_page, dpi)
+    }
+
+    /// Inject PDF backgrounds into already-built pages (the `.ntb` path, where
+    /// pages come from `ntb::to_pages` rather than `decode_page`). For each
+    /// page whose UUID is bound via [`set_page_cfg`], inserts the attachment's
+    /// PDF page as a vector [`Item::PdfBackground`]. Returns the number of
+    /// pages that received a background.
+    pub fn inject_pdf_backgrounds(&self, pages: &mut [Page]) -> usize {
         let mut n = 0;
         for page in pages.iter_mut() {
             let Some(cfg) = self.page_cfg.get(&page.uuid) else {
                 continue;
             };
-            let Some(att) = self.attachments.get(&cfg.attachment) else {
-                continue;
-            };
             let Some(pdf_page) = cfg.pdf_page else {
                 continue;
             };
-            if !att.starts_with(b"%PDF-") {
-                continue;
-            }
-            let Some(bytes) = self.raster_page(att, pdf_page, dpi) else {
+            let Some(bg) =
+                self.place_background(&cfg.attachment, pdf_page, page.width, page.height)
+            else {
                 continue;
             };
-            let (pw, ph) = match pdfinput::jpeg_size(&bytes) {
-                Some((pw, ph)) => (pw as f32, ph as f32),
-                None => continue,
-            };
-            // Scale the PDF page to fit the notebook page, centred.
-            let (page_w, page_h) = (page.width, page.height);
-            let s = (page_w / pw).min(page_h / ph);
-            let (w, h) = (pw * s, ph * s);
-            page.items.insert(
-                0,
-                Item::Image(ImageEl {
-                    attachment: format!("pdf:{}:{pdf_page}", cfg.attachment),
-                    x: (page_w - w) / 2.0,
-                    y: (page_h - h) / 2.0,
-                    w,
-                    h,
-                    from_frame: false,
-                    bytes: Some(bytes),
-                }),
-            );
+            page.items.insert(0, Item::PdfBackground(bg));
             n += 1;
         }
         n
@@ -444,6 +507,7 @@ impl Document {
             attachments,
             page_cfg,
             paper_cache: Mutex::new(HashMap::new()),
+            page_size_cache: Mutex::new(HashMap::new()),
             pdf_temps: Mutex::new(HashMap::new()),
             raster_cache: Mutex::new(HashMap::new()),
             temp_tag: DOC_TAG.fetch_add(1, Ordering::Relaxed),
@@ -502,12 +566,17 @@ impl Document {
 
     /// Unique `(attachment uuid, 1-based PDF page)` pairs whose pages show a
     /// PDF background — the work list a caller must rasterize before decoding
-    /// (pdftoppm on native, pdf.js in the browser).
-    pub fn pdf_raster_jobs(&self) -> Vec<(String, u64)> {
+    /// (pdftoppm on native, pdf.js in the browser). `uuids` are the page
+    /// uuids in display order: Notability notebooks pre-build their pages, so
+    /// the [`Document`]'s own page index does not describe them.
+    pub fn pdf_raster_jobs<'a>(
+        &self,
+        uuids: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<(String, u64)> {
         let mut seen: HashSet<(String, u64)> = HashSet::new();
         let mut jobs = Vec::new();
-        for page in &self.pages {
-            let Some(cfg) = self.page_cfg.get(&page.uuid) else {
+        for uuid in uuids {
+            let Some(cfg) = self.page_cfg.get(uuid) else {
                 continue;
             };
             let Some(att) = self.attachments.get(&cfg.attachment) else {
@@ -568,7 +637,7 @@ impl Document {
         rects
     }
 
-    pub fn decode_page(&self, src: &PageSource, include_deleted: bool, dpi: f32) -> Result<Page> {
+    pub fn decode_page(&self, src: &PageSource, include_deleted: bool) -> Result<Page> {
         let recs = records(&src.data)?;
         let parsed: Vec<Vec<Field<'_>>> = recs.iter().map(|r| parse(r)).collect::<Result<_>>()?;
 
@@ -673,37 +742,10 @@ impl Document {
         }
 
         if let Some(cfg) = self.page_cfg.get(&src.uuid)
-            && let Some(att) = self.attachments.get(&cfg.attachment)
             && let Some(pdf_page) = cfg.pdf_page
-            && att.starts_with(b"%PDF-")
-            && let Some(bytes) = self.raster_page(att, pdf_page, dpi)
+            && let Some(bg) = self.place_background(&cfg.attachment, pdf_page, PAGE_W, PAGE_H)
         {
-            match pdfinput::jpeg_size(&bytes) {
-                Some((pw, ph)) => {
-                    let (pw, ph) = (pw as f32, ph as f32);
-                    let s = (PAGE_W / pw).min(PAGE_H / ph);
-                    let (w, h) = (pw * s, ph * s);
-                    out.insert(
-                        0,
-                        Item::Image(ImageEl {
-                            attachment: format!("pdf:{}:{pdf_page}", cfg.attachment),
-                            x: (PAGE_W - w) / 2.0,
-                            y: (PAGE_H - h) / 2.0,
-                            w,
-                            h,
-                            from_frame: false,
-                            bytes: Some(bytes),
-                        }),
-                    );
-                }
-                None => {
-                    crate::vlog!(
-                        1,
-                        "page {}: raster of pdf page {pdf_page} unreadable",
-                        src.uuid
-                    );
-                }
-            }
+            out.insert(0, Item::PdfBackground(bg));
         }
         if let Some(cfg) = self.page_cfg.get(&src.uuid)
             && let Some(att) = self.attachments.get(&cfg.attachment)

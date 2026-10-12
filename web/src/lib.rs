@@ -142,7 +142,18 @@ fn open_doc(data: Vec<u8>) -> i32 {
     NTB_PAGES.with(|p| *p.borrow_mut() = None);
     match Document::from_bytes(data) {
         Ok(doc) => {
-            let json = format!("{{\"pages\":{}}}", doc.pages.len());
+            // Background pages that SVG/PNG must rasterize through pdf.js.
+            // PDF output embeds them as Form XObjects and ignores this list.
+            let jobs = doc.pdf_raster_jobs(doc.pages.iter().map(|p| p.uuid.as_str()));
+            let mut json = format!("{{\"pages\":{},\"jobs\":[", doc.pages.len());
+            for (i, (att, page)) in jobs.iter().enumerate() {
+                if i > 0 {
+                    json.push(',');
+                }
+                json.push_str(&format!("[\"{att}\",{page}]"));
+            }
+            json.push_str("]}");
+            JOBS.with(|j| *j.borrow_mut() = jobs);
             DOC.with(|d| *d.borrow_mut() = Some(doc));
             set_out(json.into_bytes())
         }
@@ -162,7 +173,7 @@ fn is_ntb_bytes(data: &[u8]) -> bool {
 fn open_ntb(data: Vec<u8>) -> i32 {
     match parse_ntb(data) {
         Ok((doc, pages)) => {
-            let raster_jobs = doc.pdf_raster_jobs();
+            let raster_jobs = doc.pdf_raster_jobs(pages.iter().map(|p| p.uuid.as_str()));
             let mut json = format!("{{\"pages\":{},\"jobs\":[", pages.len());
             for (i, (att, page)) in raster_jobs.iter().enumerate() {
                 if i > 0 {
@@ -363,6 +374,39 @@ pub extern "C" fn oblyx_open_entry(index: u32) -> i32 {
     }
 }
 
+/// OUT becomes the raw bytes of a PDF attachment (fed to pdf.js).
+#[unsafe(no_mangle)]
+pub extern "C" fn oblyx_attachment(ptr: *mut u8, len: usize) -> i32 {
+    let uuid = String::from_utf8_lossy(&take_input(ptr, len)).into_owned();
+    let bytes = DOC.with(|d| {
+        d.borrow()
+            .as_ref()
+            .and_then(|doc| doc.attachments.get(&uuid).map(|b| (**b).clone()))
+    });
+    match bytes {
+        Some(b) => set_out(b),
+        None => fail(format!("unknown attachment {uuid}")),
+    }
+}
+
+/// Store a pdf.js-rendered JPEG for job `index` (order from `oblyx_open`).
+/// SVG/PNG output rasterizes PDF backgrounds; PDF output embeds them as Form
+/// XObjects and never asks for these.
+#[unsafe(no_mangle)]
+pub extern "C" fn oblyx_set_raster(index: u32, ptr: *mut u8, len: usize) -> i32 {
+    let jpeg = take_input(ptr, len);
+    let Some(job) = JOBS.with(|j| j.borrow().get(index as usize).cloned()) else {
+        return fail(format!("no raster job {index}"));
+    };
+    DOC.with(|d| match d.borrow().as_ref() {
+        Some(doc) => match doc.set_page_raster(&job.0, job.1, DPI, jpeg) {
+            Ok(()) => set_out(Vec::new()),
+            Err(e) => fail(format!("store raster: {e:#}")),
+        },
+        None => fail("no document".into()),
+    })
+}
+
 /// Decode every page, then render. For a single notebook OUT becomes the PDF
 /// (fmt 0) or SVG (fmt 1, zip if the notebook has more than one page). Inside
 /// an archive run the bytes are written into the pending zip instead and OUT
@@ -386,7 +430,7 @@ pub extern "C" fn oblyx_convert(fmt: u32) -> i32 {
         } else {
             let mut pages = Vec::with_capacity(doc.pages.len());
             for (i, src) in doc.pages.iter().enumerate() {
-                match doc.decode_page(src, false, DPI) {
+                match doc.decode_page(src, false) {
                     Ok(page) => pages.push(page),
                     Err(e) => return fail(format!("decode page {}: {e:#}", src.uuid)),
                 }
@@ -395,7 +439,7 @@ pub extern "C" fn oblyx_convert(fmt: u32) -> i32 {
             pages
         };
         // Inject PDF backgrounds from js-rendered rasters (no-op if none).
-        doc.inject_pdf_backgrounds(&mut pages, DPI);
+        doc.inject_pdf_backgrounds(&mut pages);
         let archived = SINK.with(|s| s.borrow().is_some());
         match fmt {
             0 => {
@@ -422,7 +466,7 @@ pub extern "C" fn oblyx_convert(fmt: u32) -> i32 {
                     };
                     for (i, page) in pages.iter().enumerate() {
                         let target = archive_svg_path(&entry, &page.uuid);
-                        let svg = page_to_svg(page, doc);
+                        let svg = page_to_svg(page, doc, DPI);
                         if let Err(e) = write_archive(&target, svg.into_bytes()) {
                             return fail(e);
                         }
@@ -488,7 +532,7 @@ pub extern "C" fn oblyx_pack_zip() -> i32 {
 
 fn render_svg(pages: &[Page], doc: &Document, total: u32) -> Result<Vec<u8>, String> {
     if let [page] = pages {
-        return Ok(page_to_svg(page, doc).into_bytes());
+        return Ok(page_to_svg(page, doc, DPI).into_bytes());
     }
     let mut buf = Cursor::new(Vec::new());
     let mut zipw = zip::ZipWriter::new(&mut buf);
@@ -497,7 +541,7 @@ fn render_svg(pages: &[Page], doc: &Document, total: u32) -> Result<Vec<u8>, Str
     for (i, page) in pages.iter().enumerate() {
         zipw.start_file(format!("page-{:03}.svg", i + 1), opts)
             .map_err(|e| format!("zip: {e}"))?;
-        zipw.write_all(page_to_svg(page, doc).as_bytes())
+        zipw.write_all(page_to_svg(page, doc, DPI).as_bytes())
             .map_err(|e| format!("zip: {e}"))?;
         report(PHASE_RENDER, i as u32 + 1, total);
     }

@@ -39,7 +39,23 @@ fn escape_xml(s: &str) -> String {
     out
 }
 
-pub fn page_to_svg(page: &Page, doc: &Document) -> String {
+/// Emit an `<image>` element carrying already-encoded raster bytes.
+fn push_image(s: &mut String, bytes: &[u8], rect: [f32; 4], kind: &str, label: &str) {
+    let [x, y, w, h] = rect;
+    let Some(mime) = image_mime(bytes) else {
+        crate::vlog!(1, "{kind} {label}: unsupported mime, skipped");
+        return;
+    };
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    crate::vlog!(1, "embed {kind} {label}: {} bytes", bytes.len());
+    let _ = write!(
+        s,
+        "<image x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\" \
+         href=\"data:{mime};base64,{b64}\"/>"
+    );
+}
+
+pub fn page_to_svg(page: &Page, doc: &Document, dpi: f32) -> String {
     let mut s = String::with_capacity(64 * 1024);
     let (pw, ph) = (page.width, page.height);
     let _ = write!(
@@ -99,17 +115,32 @@ pub fn page_to_svg(page: &Page, doc: &Document) -> String {
                     crate::vlog!(1, "asset {}: attachment missing, skipped", im.attachment);
                     continue;
                 };
-                let Some(mime) = image_mime(&bytes) else {
-                    crate::vlog!(1, "asset {}: unsupported mime, skipped", im.attachment);
+                push_image(
+                    &mut s,
+                    &bytes,
+                    [im.x, im.y, im.w, im.h],
+                    "asset",
+                    &im.attachment,
+                );
+            }
+            Item::PdfBackground(bg) => {
+                // SVG cannot embed PDF content, so rasterize the background
+                // page on demand (cached; JavaScript-supplied on the web).
+                let Some(bytes) = doc.background_raster(&bg.attachment, bg.pdf_page, dpi) else {
+                    crate::vlog!(
+                        1,
+                        "background {}:{}: raster unavailable, skipped",
+                        bg.attachment,
+                        bg.pdf_page
+                    );
                     continue;
                 };
-                let b64 = base64::engine::general_purpose::STANDARD.encode(bytes.as_ref());
-                crate::vlog!(1, "embed asset {}: {} bytes", im.attachment, bytes.len());
-                let _ = write!(
-                    s,
-                    "<image x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" \
-                     href=\"data:{mime};base64,{b64}\"/>",
-                    im.x, im.y, im.w, im.h
+                push_image(
+                    &mut s,
+                    &bytes,
+                    [bg.x, bg.y, bg.w, bg.h],
+                    "background",
+                    &format!("{}:{}", bg.attachment, bg.pdf_page),
                 );
             }
             Item::Sticky(st) => {

@@ -527,6 +527,30 @@ pub fn page_to_png(page: &Page, doc: &Document, scale: f32) -> Result<Vec<u8>> {
                     crate::vlog!(1, "asset {}: attachment missing, skipped", im.attachment);
                 }
             }
+            Item::PdfBackground(bg) => {
+                // PNG cannot embed PDF content: rasterize the background page
+                // on demand (cached; JavaScript-supplied on the web).
+                let Some(bytes) = doc.background_raster(&bg.attachment, bg.pdf_page, scale * 72.0)
+                else {
+                    crate::vlog!(
+                        1,
+                        "background {}:{}: raster unavailable, skipped",
+                        bg.attachment,
+                        bg.pdf_page
+                    );
+                    continue;
+                };
+                let el = ImageEl {
+                    attachment: bg.attachment.clone(),
+                    x: bg.x,
+                    y: bg.y,
+                    w: bg.w,
+                    h: bg.h,
+                    from_frame: false,
+                    bytes: None,
+                };
+                draw_image(&mut pm, &el, &bytes, scale);
+            }
             Item::Sticky(st) => draw_sticky(&mut pm, st, scale),
             Item::Text(t) => draw_text(&mut pm, t, scale),
             Item::Background(bg) => draw_background(&mut pm, bg, scale),
