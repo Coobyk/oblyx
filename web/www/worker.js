@@ -29,7 +29,7 @@ function withInput(bytes, fn) {
 async function init() {
   // Query string is the wasm hash. worker.js revalidates; the wasm file is
   // cached, so a new worker must not keep calling exports the cached module lacks.
-  const resp = await fetch("oblyx_web.wasm?v=ad32d26e1188");
+  const resp = await fetch("oblyx_web.wasm?v=a9d82b44786a");
   if (!resp.ok) throw new Error(`wasm download failed: HTTP ${resp.status}`);
   const imports = {
     oblyx: {

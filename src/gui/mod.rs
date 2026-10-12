@@ -192,8 +192,8 @@ impl ConverterView {
     fn pick_files(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let picked = cx.background_spawn(async move {
             rfd::FileDialog::new()
-                .set_title("Add GoodNotes notebooks or zip archives")
-                .add_filter("GoodNotes notebooks", &["goodnotes", "zip"])
+                .set_title("Add GoodNotes/Notability notebooks or zip archives")
+                .add_filter("Notebooks", &["goodnotes", "ntb", "zip"])
                 .pick_files()
         });
         self.picker = Some(cx.spawn(async move |this, cx| {

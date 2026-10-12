@@ -408,13 +408,16 @@ and 2 bytes of padding before the timestamp. Reading as packed
 `(u16, u32, u32)` is wrong; the correct read is aligned as above.
 
 **Pagination** groups live strokes/shapes by their final page SeqId.
-Page sequence follows the CreatePage defs in first-appearance order; only
-pages that carry live ink are emitted (bare CreatePage ops often mark
-scratch/deleted pages whose content was removed later). Dimensions come
-from the matching CreatePage background, defaulting to A4 (595.28 ×
-841.89). This replaces the old Y-slice approximation, which collapsed
-multi-page notebooks onto one page because pages share a local coordinate
-space (each page's Y restarts near 0).
+Page sequence follows the CreatePage defs in first-appearance order; pages
+that carry live ink are emitted, as are sibling pages of a multi-page
+import when any sibling carries ink (E1's two-page Facts-B import
+annotates only page 1, but the GT export still shows page 2). Bare
+CreatePage ops with no ink and no ink-bearing import siblings are dropped
+— they often mark scratch/deleted pages. Dimensions come from the
+matching CreatePage background, defaulting to A4 (595.28 × 841.89). This
+replaces the old Y-slice approximation, which collapsed multi-page
+notebooks onto one page because pages share a local coordinate space
+(each page's Y restarts near 0).
 
 CreatePage ops come in two shapes: *full* (f1 background with f3 size) and
 *bare* (no background). Bare creates still register the page id — later
@@ -423,18 +426,25 @@ order preserved; a later bare re-create never clears recorded dims).
 D1/Eth1 consist only of bare creates, so their defs carry unknown dims and
 fall back to A4 (which matches their PDF exports).
 
-**Location-target background binding.** A full CreatePage with a
-location (f0) also binds its background to that existing page id. For
-single-page creates (pageCount==1) this is a *strong* binding — always
-applied (iOS "set background on an existing page": the ink stays on the
-location page, and a later CreatePage updates it). For multi-page imports
-(pageCount>1) the binding is *weak*: applied only when the import's
-entity pages carry no strokes (the ink stayed on the location page, as in
-E1's Dick-Beyer case) and the target has no stronger background. This
-avoids breaking G1's grid-notes page, whose ink lives on a location page
-of a multi-page import whose entity pages also carry ink. A later
-single-page "set background" op with the *same* asset hash preserves an
-existing pdf_page > 1 rather than resetting it to 1.
+**Location-target background binding.** A single-page CreatePage
+(pageCount==1) with a location (f0) also binds its background to that
+existing page — but only when the target is a **root page** (created by
+the notebook's initial CreatePage op, which has no location of its own).
+This is how iOS "set background on the initial blank page" works: the ink
+stays on the root page, and a later single-page CreatePage updates it.
+Non-root pages (which carry their own location) never receive this
+binding — E1's Spider-Man page (0,1430,0) must stay on grid paper even
+though a later Two-Sides import references it as its insert-after
+location. Multi-page imports (pageCount>1) use the location purely for
+ordering and never bind a background onto it. A later single-page "set
+background" op with the *same* asset hash preserves an existing
+pdf_page > 1 rather than resetting it to 1.
+
+**Grid paper.** Notability's default paper style is an 18 pt grid
+(rgb 163,183,211, 0.5 pt lines, white fill). It is *not* stored per-page;
+it applies to any page with no PDF/image background. The renderer draws
+it as coloured rects (`Item::Background`) so PNG/SVG/PDF output matches
+the GT exports' built-in grid pages.
 
 `ModifyPositions` (payloadType 24) entries carry f1 = page SeqId and f2 =
 origin; the fold applies both, so strokes moved between pages after
@@ -446,7 +456,7 @@ Observed live page groups (aligned SeqId layout, after deletes):
 | --- | --- | --- | --- |
 | G1 | 10 | 13 | A4 pages; bare+full creates merge |
 | B1 | 6 | 8 | mixed sizes (651×407, 768×1024, A4) |
-| E1 | 9 | 6 | A4 pages |
+| E1 | 10 | 6 | A4 pages; sibling emission adds (0,1872,1) |
 | D1 | 5 | 3 | bare creates only (A4 fallback) |
 | P1 | 3 | 5 | includes landscape 842×595 |
 
@@ -477,10 +487,12 @@ PageBackground.f1          → nested table (nf=6)
 pages the op creates (default 1 when absent). The sibling pages share the
 background; their 1-based index within the asset is `idx + 1` for page
 `(site, ts, idx)`. The payload's **location** field (f0) additionally
-binds the background to an existing page id (see §4.2 pagination): single-
-page creates bind strongly (always), multi-page imports bind weakly (only
-when the import's entity pages carry no strokes). Together with the hash
-this yields the full background binding: `assets/<hash hex>.pdf`, page N.
+binds the background to an existing *root* page id (see §4.2 pagination):
+single-page creates bind to root pages only (the notebook's initial blank
+pages, created by the root CreatePage op with no location of its own);
+multi-page imports use the location purely for ordering. Together with the
+hash this yields the full background binding: `assets/<hash hex>.pdf`,
+page N.
 
 Verified counts of CreatePage defs carrying an asset hash:
 
@@ -658,19 +670,19 @@ loaded into the document attachment map. Example: `cargo run --bin oblyx
 10. **PageBackground inner-table extras** (§4.9) — s1/s2 small ints
     (88/92, 72/76) and the outer nf=6 fields beyond the hash/size are
     undecoded; only the content hash and file size are used.
-11. **D1/Eth1 background structure** — both have `assets/` members but
-    zero CreatePage defs with a nested PageBackground; their binding
-    mechanism (if any) is unexamined.
+11. ~~**D1/Eth1 background structure**~~ — resolved: both have `assets/`
+    members but zero CreatePage defs with a nested PageBackground; they
+    use Notability's built-in grid paper (§4.9), which is the default for
+    pages with no background asset.
 12. **G1 duplicate pages** — pages `(0,4754,0)`, `(0,4755,0)`,
     `(0,4906,0)`, `(0,4907,0)` carry the same ink as the textbook pages
     but are created by single-page ops with f2 absent (pdf_page defaults
     to 1). Likely CRDT re-import artifacts; the correct pdf_page for the
     second copies is not encoded in the ops.
-13. **E1 grid-template backgrounds** — pages `(0,2566,0)` and
-    `(0,4139,0)` carry ink on a grid-template paper but no CreatePage
-    provides the grid asset via entity or location; their binding
-    mechanism is unknown (possibly a paper-style enum rather than an
-    asset hash).
+13. ~~**E1 grid-template backgrounds**~~ — resolved: Notability's default
+    paper style is an 18 pt grid (rgb 163,183,211, 0.5 pt lines) applied
+    to any page with no background asset. It is not stored per-page; the
+    renderer draws it as `Item::Background` rects (§4.9).
 
 Point coordinate encoding, shape schema, fill colour, CRDT delete/modify
 folding, page-id pagination, CreatePage pageCount/location semantics, and

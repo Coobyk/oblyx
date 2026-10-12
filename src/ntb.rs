@@ -42,7 +42,8 @@ struct Buf<'a> {
 impl<'a> Buf<'a> {
     fn u32(&self, off: usize) -> Result<u32> {
         self.d
-            .get(off..off + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .get(off..off + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .context(format!("u32 @ {off}"))
     }
 
@@ -52,7 +53,8 @@ impl<'a> Buf<'a> {
 
     fn u16(&self, off: usize) -> Result<u16> {
         self.d
-            .get(off..off + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .get(off..off + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .context(format!("u16 @ {off}"))
     }
 
@@ -62,7 +64,8 @@ impl<'a> Buf<'a> {
 
     fn f32(&self, off: usize) -> Result<f32> {
         self.d
-            .get(off..off + 4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .get(off..off + 4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .context(format!("f32 @ {off}"))
     }
 
@@ -271,17 +274,19 @@ pub struct NtbStroke {
 ///   `(site, ts, N-1)`, all sharing one background. This matches the web
 ///   worker's
 ///   `bv.init(metadata.id.site, metadata.id.timestamp, pageInPayload)`.
-/// - The payload's **location** field (f0) is additionally used as a
-///   *background target*: when present and single-page (pageCount==1), the
-///   background is also bound to that existing page id. This is how iOS "set
-///   background on an existing page" works — the ink stays on the location
-///   page, and a later CreatePage with a background updates it.
-/// - For multi-page imports (pageCount>1) the location is an insert-after
-///   ordering ref. A weak fallback is kept (`weak=true`) and applied only
-///   when the import's entity pages carry no ink (i.e. the ink stayed on the
-///   location page, as in E1's Dick-Beyer case) and the target has no strong
-///   background. This avoids breaking G1's grid-notes page, whose ink lives
-///   on the location page but whose entity pages also carry ink.
+/// - The payload's **location** field (f0) is an insert-after reference for
+///   page ordering. When a single-page create (pageCount==1) carries both a
+///   location and a background, the background is *also* bound to that
+///   existing page — but only when the target is a **root page** (created by
+///   the notebook's initial CreatePage op with no location of its own). This
+///   is how iOS "set background on the initial blank page" works: the ink
+///   stays on the root page, and a later single-page CreatePage with a
+///   background updates it. Non-root pages (which carry their own location)
+///   never receive this binding — E1's Spider-Man page (0,1430,0) must stay
+///   on grid paper even though a later Two-Sides import references it as its
+///   insert-after location.
+/// - Multi-page imports (pageCount>1) use the location purely for ordering;
+///   they never bind a background onto the location page.
 ///
 /// `width`/`height` are the background size in points when present; `0×0`
 /// means bare. `asset_hash` is the 64-byte content hash of the background
@@ -295,11 +300,13 @@ pub struct NtbPageDef {
     pub asset_hash: Option<[u8; 64]>,
     /// 1-based page index within the background asset PDF.
     pub pdf_page: u64,
-    /// Weak location-target background: applied only when the import's entity
-    /// pages carry no ink and the target has no stronger background.
-    pub weak: bool,
-    /// For weak defs, the CreatePage entity id `(site, ts)` whose sibling
-    /// pages are checked for ink before applying the weak background.
+    /// True when the page was created by the notebook's root CreatePage op
+    /// (no location field). Root pages may receive single-page location
+    /// background bindings; non-root pages never do.
+    pub root: bool,
+    /// CreatePage entity id `(site, ts)` that created this page as part of a
+    /// (possibly multi-page) import. Used by pagination to emit sibling pages
+    /// of an import when any sibling carries ink.
     pub entity: Option<EntityId>,
 }
 
@@ -311,7 +318,7 @@ impl Default for NtbPageDef {
             height: 0.0,
             asset_hash: None,
             pdf_page: 1,
-            weak: false,
+            root: false,
             entity: None,
         }
     }
@@ -419,8 +426,7 @@ pub struct NtbDocument {
 
 /// Open a `.ntb` file from disk.
 pub fn open(path: &Path) -> Result<NtbDocument> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("open {}", path.display()))?;
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut zip = ZipArchive::new(Cursor::new(read_all(file)?))
         .with_context(|| format!("zip open {}", path.display()))?;
     parse_zip(&mut zip)
@@ -432,9 +438,7 @@ fn read_all(mut r: impl Read) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn parse_zip<R: std::io::Read + std::io::Seek>(
-    z: &mut ZipArchive<R>,
-) -> Result<NtbDocument> {
+fn parse_zip<R: std::io::Read + std::io::Seek>(z: &mut ZipArchive<R>) -> Result<NtbDocument> {
     let manifest = read_member(z, "manifest.json")?.unwrap_or_default();
     let thumbnail = read_member(z, "thumbnail.png")?;
     let bundle = read_member(z, "noteBundle")?.context("noteBundle missing")?;
@@ -526,8 +530,14 @@ fn parse_bundle(d: &[u8]) -> Result<BundleParts> {
         let off = root_pos + field(4);
         if d.len() >= off + 8 {
             meta.timestamp_ms = u64::from_le_bytes([
-                d[off], d[off + 1], d[off + 2], d[off + 3],
-                d[off + 4], d[off + 5], d[off + 6], d[off + 7],
+                d[off],
+                d[off + 1],
+                d[off + 2],
+                d[off + 3],
+                d[off + 4],
+                d[off + 5],
+                d[off + 6],
+                d[off + 7],
             ]);
         }
     }
@@ -655,7 +665,12 @@ fn fold_op(
                 for pd in entity_pages {
                     upsert_page(pages, pd);
                 }
-                if let Some(target) = location_target {
+                // Location-target background binding applies only to root
+                // pages (the notebook's initial blank pages). Non-root pages
+                // keep their own background (or grid paper).
+                if let Some(target) = location_target
+                    && pages.iter().any(|p| p.id == target.id && p.root)
+                {
                     upsert_page(pages, target);
                 }
             }
@@ -785,7 +800,14 @@ fn apply_shape_patch(b: &Buf, tp: usize, fields: &[u16], fold: &mut Fold) -> Res
 /// absolute points, so we translate by the delta from the current origin.
 fn shift_shape_origin(geom: &mut NtbShapeGeom, nx: f32, ny: f32) {
     match geom {
-        NtbShapeGeom::Line { x1, y1, x2, y2, c1, c2 } => {
+        NtbShapeGeom::Line {
+            x1,
+            y1,
+            x2,
+            y2,
+            c1,
+            c2,
+        } => {
             let dx = nx - *x1;
             let dy = ny - *y1;
             *x1 = nx;
@@ -897,14 +919,25 @@ fn parse_create_page(
             1
         }
     };
+    let f0 = Buf::field_off(fields, PAGE_F0_LOCATION);
+    let loc_id = read_page_id(b, tp, f0);
+    let root = loc_id.is_none();
+    // Sibling grouping applies only to real multi-page imports (with a
+    // location ref); the root import (no location) creates the default
+    // blank pages and must not force empty siblings to be emitted.
+    let sibling_entity = if page_count > 1 && loc_id.is_some() {
+        Some(entity)
+    } else {
+        None
+    };
     let bare = |idx: u32| NtbPageDef {
         id: (entity.0, entity.1, idx),
         width: 0.0,
         height: 0.0,
         asset_hash: None,
         pdf_page: 1,
-        weak: false,
-        entity: None,
+        root,
+        entity: sibling_entity,
     };
     let f1 = Buf::field_off(fields, PAGE_F1_BACKGROUND);
     if f1 == 0 {
@@ -918,8 +951,12 @@ fn parse_create_page(
     }
     let width = b.f32(bg + f3)?;
     let height = b.f32(bg + f3 + 4)?;
-    if !width.is_finite() || !height.is_finite() || width < 50.0 || height < 50.0
-        || width > 10_000.0 || height > 10_000.0
+    if !width.is_finite()
+        || !height.is_finite()
+        || width < 50.0
+        || height < 50.0
+        || width > 10_000.0
+        || height > 10_000.0
     {
         return Ok(((0..page_count as u32).map(bare).collect(), None));
     }
@@ -931,26 +968,27 @@ fn parse_create_page(
             height,
             asset_hash,
             pdf_page: idx as u64 + 1,
-            weak: false,
-            entity: None,
+            root,
+            entity: sibling_entity,
         })
         .collect();
-    // Location target: iOS "set background on an existing page". Single-page
-    // (pageCount==1) targets are strong (always applied). Multi-page targets
-    // are weak: applied only when the import's entity pages carry no ink
-    // (E1 Dick-Beyer) and the target has no strong background — G1's
-    // grid-notes page is protected because its entity pages DO carry ink.
-    let location_target = {
-        let f0 = Buf::field_off(fields, PAGE_F0_LOCATION);
-        read_page_id(b, tp, f0).map(|loc_id| NtbPageDef {
+    // Location target: iOS "set background on the initial blank page".
+    // Single-page creates (pageCount==1) bind the background onto the
+    // location page; the caller applies it only when that page is a root
+    // (see NtbPageDef::root). Multi-page imports use the location purely for
+    // ordering and never bind a background onto it.
+    let location_target = if page_count == 1 {
+        loc_id.map(|loc_id| NtbPageDef {
             id: loc_id,
             width,
             height,
             asset_hash,
-            pdf_page: page_count as u64,
-            weak: page_count > 1,
-            entity: if page_count > 1 { Some(entity) } else { None },
+            pdf_page: 1,
+            root: false,
+            entity: None,
         })
+    } else {
+        None
     };
     Ok((pages, location_target))
 }
@@ -992,13 +1030,10 @@ fn read_asset_hash(b: &Buf, bg: usize, bf: &[u16]) -> Option<[u8; 64]> {
 
 /// Insert or merge a page def: one entry per id, first-appearance order.
 ///
-/// Merge rules:
-/// - Strong defs (entity-page creates, single-page location targets) always
-///   update dims and asset hash.
-/// - Weak defs (multi-page location targets) carry their asset hash on the
-///   def (for paginate to consult) but `paginate_by_page_id` skips binding
-///   it at group-creation time; the weak pass applies it later, only when
-///   the import's entity pages carry no ink.
+/// Merge a page definition into the list. Strong defs (entity-page creates
+/// and root-page location targets) always update dims and asset hash. A later
+/// single-page "set background" op with the *same* asset hash preserves an
+/// existing pdf_page > 1 rather than resetting it to 1.
 fn upsert_page(pages: &mut Vec<NtbPageDef>, def: NtbPageDef) {
     if let Some(existing) = pages.iter_mut().find(|p| p.id == def.id) {
         if def.width > 0.0 && def.height > 0.0 {
@@ -1006,26 +1041,18 @@ fn upsert_page(pages: &mut Vec<NtbPageDef>, def: NtbPageDef) {
             existing.height = def.height;
         }
         if def.asset_hash.is_some() {
-            if def.weak {
-                // Weak never overrides a strong background already bound.
-                if existing.weak || existing.asset_hash.is_none() {
-                    existing.asset_hash = def.asset_hash;
-                    existing.pdf_page = def.pdf_page;
-                    existing.weak = true;
-                    existing.entity = def.entity;
-                }
-            } else if existing.asset_hash == def.asset_hash && existing.pdf_page > 1 {
+            if existing.asset_hash == def.asset_hash && existing.pdf_page > 1 {
                 // Same asset, page already indexed (multi-page import set
                 // pdf_page=2). A later single-page "set background" op with
                 // the same asset must not reset it to page 1.
-                existing.weak = false;
-                existing.entity = def.entity;
+                existing.entity = def.entity.or(existing.entity);
             } else {
                 existing.asset_hash = def.asset_hash;
                 existing.pdf_page = def.pdf_page;
-                existing.weak = false;
-                existing.entity = def.entity;
+                existing.entity = def.entity.or(existing.entity);
             }
+        } else if def.root {
+            existing.root = true;
         }
     } else {
         pages.push(def);
@@ -1065,7 +1092,11 @@ fn read_sf(b: &Buf, tp: usize, off: usize) -> Option<[f32; 2]> {
     }
     let x = b.f32(tp + off).ok()?;
     let y = b.f32(tp + off + 4).ok()?;
-    if x.is_finite() && y.is_finite() { Some([x, y]) } else { None }
+    if x.is_finite() && y.is_finite() {
+        Some([x, y])
+    } else {
+        None
+    }
 }
 
 /// Read an f32 field at `tp + off`. `None` when off == 0 or non-finite.
@@ -1334,7 +1365,12 @@ fn parse_stroke(b: &Buf, tp: usize, fields: &[u16]) -> Result<NtbStroke> {
 ///
 /// Points are returned in absolute page coordinates (anchor + relative),
 /// sampled at [`BEZIER_SAMPLES`] steps per curve segment.
-fn decode_stroke_points(d: &[u8], blob: usize, anchor_x: f32, anchor_y: f32) -> (usize, Vec<[f32; 2]>) {
+fn decode_stroke_points(
+    d: &[u8],
+    blob: usize,
+    anchor_x: f32,
+    anchor_y: f32,
+) -> (usize, Vec<[f32; 2]>) {
     // FlatBuffers byte vector: `u32` byte length, then that many bytes.
     let Some(lb) = d.get(blob..blob + 4) else {
         return (0, Vec::new());
@@ -1432,9 +1468,13 @@ fn decode_stroke_points(d: &[u8], blob: usize, anchor_x: f32, anchor_y: f32) -> 
                             let u = 1.0 - t;
                             let (ur, ut) = (u * u, t * t);
                             points.push([
-                                u * ur * cur[0] + 3.0 * ur * t * c1[0] + 3.0 * u * ut * c2[0]
+                                u * ur * cur[0]
+                                    + 3.0 * ur * t * c1[0]
+                                    + 3.0 * u * ut * c2[0]
                                     + t * ut * e[0],
-                                u * ur * cur[1] + 3.0 * ur * t * c1[1] + 3.0 * u * ut * c2[1]
+                                u * ur * cur[1]
+                                    + 3.0 * ur * t * c1[1]
+                                    + 3.0 * u * ut * c2[1]
                                     + t * ut * e[1],
                             ]);
                         }
@@ -1510,7 +1550,11 @@ fn read_path_point(d: &[u8], off: usize, precision: u8) -> Option<[f32; 2]> {
             f32::from_le_bytes([yb[0], yb[1], yb[2], yb[3]]),
         )
     };
-    if x.is_finite() && y.is_finite() { Some([x, y]) } else { None }
+    if x.is_finite() && y.is_finite() {
+        Some([x, y])
+    } else {
+        None
+    }
 }
 
 /// Convert an IEEE-754 binary16 bit pattern to `f32`.
@@ -1579,8 +1623,8 @@ pub fn paginate(doc: &NtbDocument, page_h: f32) -> Vec<NtbPage> {
     }
 
     // Page-id grouping when every entity carries one.
-    let all_have_ids = doc.strokes.iter().all(|s| s.page.is_some())
-        && doc.shapes.iter().all(|s| s.page.is_some());
+    let all_have_ids =
+        doc.strokes.iter().all(|s| s.page.is_some()) && doc.shapes.iter().all(|s| s.page.is_some());
     if all_have_ids {
         return paginate_by_page_id(doc, page_h);
     }
@@ -1617,14 +1661,21 @@ pub fn paginate(doc: &NtbDocument, page_h: f32) -> Vec<NtbPage> {
 
 /// Group by page SeqId. Page sequence follows the CreatePage defs
 /// (`doc.pages`, one entry per id in first-appearance order; `0×0` dims mean
-/// unknown → A4 fallback). Only pages that carry live ink (strokes or shapes)
-/// are emitted — bare CreatePage ops often mark scratch/deleted pages whose
-/// content was removed later. Entities whose page id has no CreatePage def are
-/// appended after the def pages (A4 fallback).
+/// unknown → A4 fallback). Pages that carry live ink (strokes or shapes) are
+/// emitted; so are sibling pages of a multi-page import when any sibling
+/// carries ink (E1's two-page Facts-B import annotates only page 1, but the
+/// GT export still shows page 2). Bare CreatePage ops with no ink and no
+/// ink-bearing import siblings are dropped — they often mark scratch/deleted
+/// pages. Entities whose page id has no CreatePage def are appended after the
+/// def pages (A4 fallback).
 fn paginate_by_page_id(doc: &NtbDocument, fallback_h: f32) -> Vec<NtbPage> {
     use std::collections::HashMap as Map;
 
-    let default_h = if fallback_h > 0.0 { fallback_h } else { NTB_PAGE_H };
+    let default_h = if fallback_h > 0.0 {
+        fallback_h
+    } else {
+        NTB_PAGE_H
+    };
     let a4_dims = (NTB_PAGE_W, default_h);
 
     let mut order: Vec<PageId> = Vec::new();
@@ -1646,9 +1697,7 @@ fn paginate_by_page_id(doc: &NtbDocument, fallback_h: f32) -> Vec<NtbPage> {
                 shapes: Vec::new(),
                 width: w,
                 height: h,
-                // Weak location-target defs carry a hash on the def for the
-                // conditional pass below; do not bind it here.
-                asset_hash: if def.weak { None } else { def.asset_hash },
+                asset_hash: def.asset_hash,
                 pdf_page: def.pdf_page,
             },
         );
@@ -1688,38 +1737,35 @@ fn paginate_by_page_id(doc: &NtbDocument, fallback_h: f32) -> Vec<NtbPage> {
             p.shapes.push(s.clone());
         }
     }
-    // Apply weak location-target backgrounds: only when the import's entity
-    // pages carry no ink (the ink stayed on the location page, E1 Dick-Beyer)
-    // and the target page has ink but no background. G1's grid-notes page is
-    // protected because its entity pages DO carry ink.
+    // Emit sibling pages of a multi-page import when any sibling carries ink.
+    let mut id_entity: Map<PageId, EntityId> = Map::new();
     for def in &doc.pages {
-        if !def.weak || def.asset_hash.is_none() {
-            continue;
+        if let Some(e) = def.entity {
+            id_entity.insert(def.id, e);
         }
-        let Some(entity) = def.entity else { continue };
-        let siblings_have_ink = doc.pages.iter().any(|d| {
-            d.id.0 == entity.0
-                && d.id.1 == entity.1
-                && groups
-                    .get(&d.id)
-                    .map(|p| !p.strokes.is_empty())
-                    .unwrap_or(false)
-        });
-        if siblings_have_ink {
-            continue;
-        }
-        if let Some(p) = groups.get_mut(&def.id)
-            && p.asset_hash.is_none()
-            && (!p.strokes.is_empty() || !p.shapes.is_empty())
+    }
+    let mut ink_entities: std::collections::HashSet<EntityId> = Default::default();
+    for (id, e) in &id_entity {
+        if groups
+            .get(id)
+            .map(|p| !p.strokes.is_empty() || !p.shapes.is_empty())
+            .unwrap_or(false)
         {
-            p.asset_hash = def.asset_hash;
-            p.pdf_page = def.pdf_page;
+            ink_entities.insert(*e);
         }
     }
     let mut out: Vec<NtbPage> = order
         .into_iter()
-        .filter_map(|id| groups.remove(&id))
-        .filter(|p| !p.strokes.is_empty() || !p.shapes.is_empty())
+        .filter_map(|id| {
+            let p = groups.remove(&id)?;
+            let keep = !p.strokes.is_empty()
+                || !p.shapes.is_empty()
+                || id_entity
+                    .get(&id)
+                    .map(|e| ink_entities.contains(e))
+                    .unwrap_or(false);
+            keep.then_some(p)
+        })
         .collect();
     if out.is_empty() {
         out.push(NtbPage {
@@ -1775,6 +1821,28 @@ pub fn parse_bundle_public(bundle: &[u8]) -> Result<BundleParts> {
 /// strokes (or sampled cubics when control points are present); NormalShape
 /// boxes become ellipses or rectangles at the top-left origin; Polygons
 /// become polygon shapes. Fill colours (when present) are applied.
+/// Notability's built-in grid paper: 18 pt spacing, rgb(163,183,211) lines,
+/// 0.5 pt wide, on white. Measured from the GT PDF exports' no-background
+/// pages (P1 gt1/gt5, E1 gt02/gt04/gt06/gt08/gt10). Returns one rect per
+/// grid line, suitable for `Item::Background`.
+fn grid_rects(w: f32, h: f32) -> Vec<(f32, f32, f32, f32, [f32; 3])> {
+    const SPACING: f32 = 18.0;
+    const LINE: f32 = 0.5;
+    const RGB: [f32; 3] = [163.0 / 255.0, 183.0 / 255.0, 211.0 / 255.0];
+    let mut rects = Vec::new();
+    let mut y = SPACING;
+    while y < h {
+        rects.push((0.0, y - LINE * 0.5, w, LINE, RGB));
+        y += SPACING;
+    }
+    let mut x = SPACING;
+    while x < w {
+        rects.push((x - LINE * 0.5, 0.0, LINE, h, RGB));
+        x += SPACING;
+    }
+    rects
+}
+
 pub fn to_pages(doc: &NtbDocument, page_h: f32) -> Vec<Page> {
     let page_h = if page_h > 0.0 { page_h } else { NTB_PAGE_H };
     paginate(doc, page_h)
@@ -1807,6 +1875,18 @@ pub fn to_pages(doc: &NtbDocument, page_h: f32) -> Vec<Page> {
                 })
                 .collect();
             items.extend(np.shapes.iter().map(shape_to_item));
+            // Notability's default paper style is an 18 pt grid. Pages that
+            // carry no PDF/image background get the grid drawn as coloured
+            // rects (Item::Background), matching the GT exports' built-in
+            // grid paper (rgb 163,183,211, 0.5 pt lines, white fill).
+            if np.asset_hash.is_none() {
+                items.insert(
+                    0,
+                    Item::Background(crate::doc::Background {
+                        rects: grid_rects(np.width, np.height),
+                    }),
+                );
+            }
             let mut page = Page {
                 uuid: format!("ntb-p{i:04}"),
                 items,
@@ -1839,7 +1919,14 @@ fn shape_to_item(s: &NtbShape) -> Item {
         1.0
     };
     match &s.geom {
-        NtbShapeGeom::Line { x1, y1, x2, y2, c1, c2 } => {
+        NtbShapeGeom::Line {
+            x1,
+            y1,
+            x2,
+            y2,
+            c1,
+            c2,
+        } => {
             // Cubic when both controls present; straight otherwise.
             let points = match (c1, c2) {
                 (Some(c1), Some(c2)) => sample_cubic([*x1, *y1], *c1, *c2, [*x2, *y2]),
@@ -1853,7 +1940,13 @@ fn shape_to_item(s: &NtbShape) -> Item {
                 parented: false,
             })
         }
-        NtbShapeGeom::Box { x, y, w, h, ellipse } => {
+        NtbShapeGeom::Box {
+            x,
+            y,
+            w,
+            h,
+            ellipse,
+        } => {
             let (w, h) = (w.abs(), h.abs());
             // IR Ellipse convention is centre + radii (matches GoodNotes
             // decoder); Box geometry is top-left + full size.
@@ -1863,7 +1956,11 @@ fn shape_to_item(s: &NtbShape) -> Item {
                 (*x, *y, w, h)
             };
             Item::Shape(ShapeEl {
-                kind: if *ellipse { ShapeKind::Ellipse } else { ShapeKind::Rect },
+                kind: if *ellipse {
+                    ShapeKind::Ellipse
+                } else {
+                    ShapeKind::Rect
+                },
                 x: sx,
                 y: sy,
                 w: sw,
@@ -2055,7 +2152,10 @@ mod tests {
         assert_eq!(count, 0);
         assert!(points.is_empty());
         // Truncated / absent vector → no geometry rather than a panic.
-        assert_eq!(decode_stroke_points(&[0u8; 3], 0, 0.0, 0.0), (0, Vec::new()));
+        assert_eq!(
+            decode_stroke_points(&[0u8; 3], 0, 0.0, 0.0),
+            (0, Vec::new())
+        );
     }
 
     #[test]
@@ -2122,7 +2222,13 @@ mod tests {
 
     #[test]
     fn shift_box_origin() {
-        let mut geom = NtbShapeGeom::Box { x: 1.0, y: 2.0, w: 3.0, h: 4.0, ellipse: true };
+        let mut geom = NtbShapeGeom::Box {
+            x: 1.0,
+            y: 2.0,
+            w: 3.0,
+            h: 4.0,
+            ellipse: true,
+        };
         shift_shape_origin(&mut geom, 10.0, 20.0);
         match geom {
             NtbShapeGeom::Box { x, y, .. } => {
@@ -2185,8 +2291,18 @@ mod tests {
             meta: NtbMeta::default(),
             strokes: vec![mk(p0, 10.0), mk(p1, 20.0), mk(p0, 30.0)],
             pages: vec![
-                NtbPageDef { id: p0, width: 595.28, height: 841.89, ..Default::default() },
-                NtbPageDef { id: p1, width: 100.0, height: 200.0, ..Default::default() },
+                NtbPageDef {
+                    id: p0,
+                    width: 595.28,
+                    height: 841.89,
+                    ..Default::default()
+                },
+                NtbPageDef {
+                    id: p1,
+                    width: 100.0,
+                    height: 200.0,
+                    ..Default::default()
+                },
             ],
             texts: vec![],
             shapes: vec![],
@@ -2211,11 +2327,37 @@ mod tests {
         let p0: PageId = (0, 1, 0);
         let p1: PageId = (0, 2, 0);
         // Bare create first, then dims update; another page stays bare.
-        upsert_page(&mut pages, NtbPageDef { id: p0, ..Default::default() });
-        upsert_page(&mut pages, NtbPageDef { id: p1, ..Default::default() });
-        upsert_page(&mut pages, NtbPageDef { id: p0, width: 842.0, height: 595.0, ..Default::default() });
+        upsert_page(
+            &mut pages,
+            NtbPageDef {
+                id: p0,
+                ..Default::default()
+            },
+        );
+        upsert_page(
+            &mut pages,
+            NtbPageDef {
+                id: p1,
+                ..Default::default()
+            },
+        );
+        upsert_page(
+            &mut pages,
+            NtbPageDef {
+                id: p0,
+                width: 842.0,
+                height: 595.0,
+                ..Default::default()
+            },
+        );
         // A later bare re-create must not clear recorded dims.
-        upsert_page(&mut pages, NtbPageDef { id: p0, ..Default::default() });
+        upsert_page(
+            &mut pages,
+            NtbPageDef {
+                id: p0,
+                ..Default::default()
+            },
+        );
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0].id, p0);
         assert_eq!(pages[0].width, 842.0);
@@ -2245,9 +2387,22 @@ mod tests {
             meta: NtbMeta::default(),
             strokes: vec![mk(p0), mk(p2)],
             pages: vec![
-                NtbPageDef { id: p0, width: 595.28, height: 841.89, ..Default::default() },
-                NtbPageDef { id: p1, ..Default::default() },
-                NtbPageDef { id: p2, width: 842.0, height: 595.0, ..Default::default() },
+                NtbPageDef {
+                    id: p0,
+                    width: 595.28,
+                    height: 841.89,
+                    ..Default::default()
+                },
+                NtbPageDef {
+                    id: p1,
+                    ..Default::default()
+                },
+                NtbPageDef {
+                    id: p2,
+                    width: 842.0,
+                    height: 595.0,
+                    ..Default::default()
+                },
             ],
             texts: vec![],
             shapes: vec![],
