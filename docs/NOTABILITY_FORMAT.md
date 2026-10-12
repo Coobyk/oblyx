@@ -177,9 +177,13 @@ listed in §4.4):
 | tsize | 44 | 40 |
 | vtable fields | `[32,24,0,0,0,23,0,19,12,8,0,0,0,0,0,4]` | `[28,20,0,0,0,0,0,16,12,8,0,0,0,0,0,4]` |
 | f9 uoffset value | 36 | 32 (layout B); **larger in shifted variants** |
-| u16 in point records | constant `15360` (`0x3c00`) | varies (~14681–15401) |
 
-Observed distribution (B1): 55 Type A, 506 Type B out of 561 strokes.
+An earlier revision of this table also compared a per-record `u16` (constant
+`15360` for Type A, ~14681–15401 for Type B). That came from the superseded
+19-byte record reading of the point blob; the real encoding is in §4.4.
+
+Observed distribution (B1, all strokes as they stood before the CRDT fold was
+implemented): 55 Type A, 506 Type B out of 561 strokes.
 
 Decoded fields (offsets differ per subtype; shown for Type A → Type B):
 
@@ -206,77 +210,90 @@ up to 839.8 > 595) and put pagination splits on the wrong axis.
 notebook uses `0.725`); observed multipliers `1, 2, 4, 5, 10, 15, 30` — matching
 Notability's pen/highlighter size presets.
 
-### 4.4 Point-data blob — VERIFIED (f16 cubic-Bézier records)
+### 4.4 Point-data blob — VERIFIED (`qT` path stream)
 
-Each stroke's `f9` uoffset points at a point-data blob (§4.3 — the target is
-`follow(f9)`, **not** `tp + tsize`, for shifted Type B layouts). Blob layout:
+Each stroke's `f9` uoffset points at a FlatBuffers **byte vector** (§4.3 —
+the target is `follow(f9)`, **not** `tp + tsize`, for shifted Type B
+layouts): a `u32` LE length `L`, then exactly `L` bytes of Notability's
+`qT` path stream — the same codec Notability Web's `ProcessStroke` worker
+decodes.
 
-```
-offset 0   u32    = vlen   (record-byte length; vlen % 19 == 14,
-                            vlen ≈ 19*n − 5 for full streams)
-offset 4   u8     = 0
-offset 5   u8     = n      (record count; only when n < 256)
-offset 6   u8     = 0
-offset 7   u8     = 3      (constant; last byte of rec0's first point)
-offset 8+  n × 19-byte records
-```
-
-The header length `vlen` is **unreliable as a record count**: 177/220 Eth1
-strokes carry records past `vlen`, 43 do not. Ground truth is a **trailer
-scan** — walk `k = 0, 1, 2, …` while `d[P + 19k + 14 .. P + 19k + 19] ==
-00 3c ff 00 00`, stopping at the first miss (no overshoot: `n` never exceeds
-`(vlen + 5) / 19 + 5` on any sample).
-
-Each 19-byte record:
+Stream header (3 bytes):
 
 ```
-offset  size  meaning
-0       2     f16 LE   c1.x
-2       2     f16 LE   c1.y
-4       2     f16 LE   c2.x
-6       2     f16 LE   c2.y
-8       2     f16 LE   end.x
-10      2     f16 LE   end.y
-12      2     u16 LE   width hint (Type A: constant 0x3c00 = f16 1.0;
-                       Type B: varies ~14681–15401 — per-point width
-                       scale, unused by the renderer today)
-14      5     trailer, always 00 3c ff 00 00
+byte 0        version << 3 | precision   (version 0 is all that is seen;
+                                          precision 0 = binary16 points,
+                                          1 = binary32)
+bytes 1-2     u16 LE                      element count
 ```
 
-All six coordinates are **IEEE-754 binary16 (f16) LE**, anchor-relative, y
-top-down. This matches the web app's `ProcessStroke` worker, which stores
-points as f16 pairs (confirmed against `/tmp/opencode/nweb/`).
+Each element then reads as:
 
-#### Path construction (validated visually on Eth1/G1/M1)
+```
+u8            type, 0..=7 (table below)
+1..3 points   type-dependent, 4 bytes each at precision 0, 8 at precision 1
+6 bytes       types 0..=3 only: u16 LE width, u16 LE force,
+              u8 altitude, u8 azimuth
+```
 
-- `rec0`'s first 8 bytes are clobbered by the stream header; its `c1`/`c2`
-  decode to garbage (Eth1 rec0 c2 → −8192). **rec0 is a moveto**: the path
-  starts at `anchor + (0, 0)`, i.e. the f1 anchor.
-- For `k = 1 .. n−1`, record `k` is a cubic Bézier from the running point
-  `cur` through controls `c1`, `c2` to `end`, **all offset by the anchor**
-  (relative → absolute; forgetting this offset produced the "starburst"
-  render). `cur ← end` after each record.
-- Each cubic is sampled at `BEZIER_SAMPLES = 12` steps; the resulting
-  polyline is the stroke path. Non-finite f16 in a record falls through as a
-  straight segment to `end` when only `end` is finite.
-- Stroke width = table `f8` (f32, absolute points); colour = `f7` (§4.6).
-
-#### Stroke/point totals (trailer-scan + f9-uoffset model, all 9 samples)
-
-| sample | strokes | total pts | note |
+| type | segment | points | attributed tail |
 | --- | --- | --- | --- |
-| B1 | 563 | 16 800 | |
-| Cambridge | 13 | 321 | |
-| D1 | 1 102 | 21 229 | |
-| E1 | 1 523 | 31 506 | |
-| Eth1 | 220 | 4 035 | matches PDF path count (230, close) |
-| F1 | 1 301 | 20 790 | |
-| G1 | 2 234 | 63 871 | shifted Type B layouts recovered (+444 strokes, +17 528 pts vs the `tp+tsize` model) |
-| M1 | 1 | 54 | |
-| P1 | 641 | 18 198 | |
+| 0 | cubic | 3 — c1, c2, end | yes |
+| 1 | quadratic | 2 — control, end | yes |
+| 2 | line | 1 — end | yes |
+| 3 | moveto | 1 — origin | yes |
+| 4 | cubic | 3 | no |
+| 5 | quadratic | 2 | no |
+| 6 | line | 1 | no |
+| 7 | moveto | 1 | no |
 
-2 G1 strokes use a non-standard trailer (`…18,12,8,…` layout) and yield 0
-records under the trailer scan; they are filtered out.
+- Points are **anchor-relative**, y top-down: absolute = `anchor + point`,
+  where the anchor is the stroke's `f1` origin (§4.3). Omitting that
+  offset scatters the path ("starburst" render).
+- Precision 0 is IEEE-754 binary16, little-endian per component;
+  precision 1 is binary32. Non-finite points are dropped, and a
+  cubic/quad with a non-finite control still connects to a finite end
+  point with a straight segment.
+- The first element is normally a moveto, which starts the path at
+  `anchor + p`; a stream that opens without one starts at the anchor
+  itself.
+- An unknown `version` (> 0), `precision` (> 1) or element type (> 7)
+  rejects the whole stream — emitting guessed geometry is worse than
+  emitting nothing.
+- Curves are sampled at `BEZIER_SAMPLES = 12` steps per segment into a
+  polyline. The attributed tail is parsed but unused: base width comes
+  from table `f8` and colour from `f7` (§4.6).
+- `decode_stroke_points()` in `src/ntb.rs` is the reference
+  implementation.
+
+This codec replaced an earlier, wrong reading of the same bytes as fixed
+19-byte records located by a `00 3c ff 00 00` trailer scan. The trailer
+heuristics ("non-standard trailers", shifted-header fallbacks) are gone.
+
+#### Decoded totals (current reader, all 9 samples)
+
+`cargo run --example ntb_probe -- <path>`. Counts are the **live**
+entities after the CRDT fold (creates patched by modifies, deletes
+removed — §7); "path elements" is the sum of `NtbStroke::point_count`,
+i.e. the `qT` elements, not the sampled polyline points:
+
+| sample | strokes | path elements | shapes |
+| --- | --- | --- | --- |
+| B1 | 424 | 10 119 | 1 |
+| Cambridge | 0 | 0 | 0 |
+| D1 | 810 | 14 479 | 7 |
+| E1 | 1 160 | 21 712 | 28 |
+| Eth1 | 218 | 3 823 | 1 |
+| F1 | 903 | 13 851 | 30 |
+| G1 | 1 772 | 48 340 | 17 |
+| M1 | 0 | 0 | 0 |
+| P1 | 515 | 11 246 | 9 |
+
+Earlier revisions of this document listed pre-fold, trailer-scan numbers
+(B1 `563` strokes / `16 800` records, 24 shapes across all samples): those
+counted entities the fold now removes, and "records" were 19-byte
+trailer-scan rows rather than `qT` elements. P1's live count of `515`
+matches the independent mirror in §9 (item 8).
 
 #### Table-layout variants (G1)
 
@@ -292,7 +309,7 @@ vary with element count:
 | 40 | `40,32,0,0,31,30,0,26,20,16,…` | 11 |
 | 52 | `52,44,…` | 9 |
 | 48 | `48,40,…` | 3 |
-| 32 | `32,24,0,0,23,22,0,18,12,8,…` | 2 (non-standard trailer) |
+| 32 | `32,24,0,0,23,22,0,18,12,8,…` | 2 |
 
 Always resolve f9 via the vtable (`field(9)`), never via a fixed offset.
 
@@ -303,18 +320,21 @@ Matching PDFs and thumbnails were used as oracles. Findings:
 - PDF handwriting is **rasterized** (`/Im1 Do`, 0 vector paths) in Cambridge and
   M1; the other 7 PDFs contain **vector** paths using both `l` (lineto) and `c`
   (cubic Bezier) operators.
-- PDF segment counts roughly match .ntb stroke counts (Eth1: 220 strokes vs 230
-  PDF paths; B1: 563 vs 3791 after Bezier subdivision).
+- PDF segment counts are comparable to .ntb stroke counts once subdivision
+  is accounted for (Eth1: 218 live strokes vs 230 PDF paths; B1: 424 live
+  strokes vs 3791 PDF paths after Bezier subdivision).
 - PDF paths are drawn with the **identity transform** (page coordinates
   directly); a `cm` scale/flip appears only for embedded images.
 - PDF y-axis is bottom-up; .ntb anchor Y is top-down. `pdf_y = pageH − ntb_Y`
   matches (Eth1 pageH = 841.89).
 - The decisive check is a **thumbnail overlay** (§4.3, §4.4): page-scaled
   dots at `(f32[0], f32[1)` land on the ink in Eth1/G1/E1; the swapped order
-  scatters over empty margin/grid. After the f16 path decode, a three-panel
-  overlay (thumbnail | reconstruction | overlay) matches the handwriting on
-  Eth1, G1, and M1 — including red underlines, purple highlighter, and small
-  doodles. Caveat: some thumbnails/PDFs are stale exports (Eth1's thumbnail
+  scatters over empty margin/grid. After the `qT` path decode, a
+  three-panel overlay (thumbnail | reconstruction | overlay) matches the
+  handwriting on Eth1 and G1 — including red underlines, purple
+  highlighter, and small doodles — and matched M1 as well before the CRDT
+  fold removed its only stroke (§7). Caveat: some thumbnails/PDFs are
+  stale exports (Eth1's thumbnail
   and PDF contain no ink at all) — the recon itself is the authority once
   validated.
 - The 24 decoded shapes could **not** be isolated as distinct PDF segments:
@@ -503,11 +523,12 @@ schemas are not yet decoded.
 ### 6.1 Rendering (`→` SVG/PDF/PNG)
 
 **Full-fidelity rendering is available.** Stroke anchors, widths, colours, and
-intra-stroke cubic-Bézier paths are all decoded (§4.3, §4.4); the reader emits
-real polylines sampled from the f16 cubics. Renders of Eth1/G1/M1 match the
-handwriting on the corresponding thumbnails (§4.5). Shapes fare as well as
-before: ellipse/rect/line classification from the f5 vector (§4.2) is decoded
-and emitted as portable-IR shapes with colour + width.
+intra-stroke path segments are all decoded (§4.3, §4.4); the reader emits
+real polylines sampled from the decoded curve segments. Renders of Eth1/G1
+match the handwriting on the corresponding thumbnails (§4.5); M1 renders
+without ink because the CRDT fold removes its only stroke (§7). Shapes fare as
+well as before: ellipse/rect/line classification from the f5 vector (§4.2) is
+decoded and emitted as portable-IR shapes with colour + width.
 
 Page geometry: each page carries its own local coordinate space (Y restarts
 near 0). Pagination groups entities by their final page SeqId (§4.8) and
@@ -543,17 +564,23 @@ GoodNotes on a device.
 `src/ntb.rs` provides a schema-less FlatBuffer walker and a `.ntb` container
 parser. Verified against all 9 sample notebooks (Notability 16.12.5):
 
-| sample | strokes | point records | shapes |
+| sample | strokes | path elements | shapes |
 | --- | --- | --- | --- |
-| B1 | 563 | 16 800 | 4 |
-| Cambridge | 13 | 321 | 0 |
-| D1 | 1 102 | 21 229 | 2 |
-| E1 | 1 523 | 31 506 | 4 |
-| Eth1 | 220 | 4 035 | 2 |
-| F1 | 1 301 | 20 790 | 3 |
-| G1 | 2 234 | 63 871 | 4 |
-| M1 | 1 | 54 | 1 |
-| P1 | 641 | 18 198 | 4 |
+| B1 | 424 | 10 119 | 1 |
+| Cambridge | 0 | 0 | 0 |
+| D1 | 810 | 14 479 | 7 |
+| E1 | 1 160 | 21 712 | 28 |
+| Eth1 | 218 | 3 823 | 1 |
+| F1 | 903 | 13 851 | 30 |
+| G1 | 1 772 | 48 340 | 17 |
+| M1 | 0 | 0 | 0 |
+| P1 | 515 | 11 246 | 9 |
+
+These are the live counts after the CRDT fold (`cargo run --example
+ntb_probe -- <path>`). The pre-fold numbers previously listed here (B1 563
+strokes / 16 800 records) counted entities the fold now removes; Cambridge
+and M1 have no live ink at all, so their paired PDFs — which still carry
+rasterized handwriting — are stale exports (§4.5).
 
 Public API:
 
@@ -575,9 +602,11 @@ Stroke/shape tables carry tool (Pen/Pencil/Highlighter/Tape) and style
 (VariableWidth/FixedWidth/Dash/Dots) enums; shape definitions decode as
 Line / Polygon / NormalShape with top-left origin and optional fill
 (§4.2 web-schema notes in the source). Anchor fields are `(X, Y)`
-(thumbnail-overlay verified). Point paths are f16 cubic-Béziers offset by
-the anchor and sampled at 12 steps per cubic (§4.4);
-`decode_stroke_points()` in `src/ntb.rs` is the reference implementation.
+(thumbnail-overlay verified). Point paths are `qT` streams of typed
+elements — cubic, quadratic, line and moveto, with an optional attributed
+tail — carrying f16 or f32 anchor-relative points, sampled at 12 steps per
+curve segment (§4.4); `decode_stroke_points()` in `src/ntb.rs` is the
+reference implementation.
 
 Two render-pipeline pitfalls fixed during shape verification:
 
@@ -613,11 +642,13 @@ loaded into the document attachment map. Example: `cargo run --bin oblyx
 4. **nf=1 purpose** — single u32 field (0, 4, or hash). Wrapper envelope matches
    strokes. Possibly annotations or degenerate strokes.
 5. **nf=4, 7, 13** — undecoded payload types (not in the known enum).
-6. **u16 width hint in point records** — constant f16 1.0 for FixedWidth
-   style, varying for VariableWidth; likely a per-point width/pressure scale
-   (multiplies the table f8 base width) but unused by the renderer today.
-7. **Non-standard trailers** — 2 G1 strokes have a non-standard header;
-   the decoder falls back to shifted-alignment trailer scans (§4.4).
+6. **Attributed tail fields** — types 0-3 carry `u16 width`, `u16 force`,
+   `u8 altitude`, `u8 azimuth` after their points (§4.4). The renderer
+   ignores them; whether `width` scales the table `f8` base width, and how
+   force/attitude are meant to be used, is unverified.
+7. ~~**Non-standard trailers**~~ — resolved: the 19-byte record/trailer-scan
+   model was a misreading of the `qT` path stream; the codec and its
+   fallbacks are gone (§4.4).
 8. ~~**P1 live count**~~ — resolved: the old "505" came from a buggy Python
    fold (missed undeletes). A corrected mirror gives 515; the 1-stroke gap
    vs Rust's 514 is the `point_count > 0` filter dropping a path-less
