@@ -188,12 +188,35 @@ const NESTED_F0_INNER: usize = 0; // uoffset to inner table holding the hash
 // and `for (let r of Kn(0, e.pageCount())) { new kk(metadata, payload, r) }`).
 const PAGE_F2_PAGE_COUNT: usize = 2; // u32, number of pages to create (default 1)
 
-/// Constant 5-byte trailer ending each 19-byte point record.
-const POINT_TRAILER: [u8; 5] = [0x00, 0x3c, 0xff, 0x00, 0x00];
-/// Bytes per point record.
-const POINT_STRIDE: usize = 19;
-/// Bézier samples emitted per cubic record when decoding paths to polylines.
+/// Path-stream element types (Notability's `qT`/`BT` codec, encoding
+/// version 0). Types 0–3 are "attributed" (carry width/force/attitude).
+const PATH_ATTR_CUBIC: u8 = 0;
+const PATH_ATTR_QUAD: u8 = 1;
+const PATH_ATTR_LINE: u8 = 2;
+const PATH_ATTR_MOVETO: u8 = 3;
+const PATH_CUBIC: u8 = 4;
+const PATH_QUAD: u8 = 5;
+const PATH_LINE: u8 = 6;
+const PATH_MOVETO: u8 = 7;
+
+/// Bézier samples emitted per curve segment when decoding paths to polylines.
 const BEZIER_SAMPLES: usize = 12;
+
+/// Types carrying a second control/end point (quadratics and cubics).
+fn path_has_second(t: u8) -> bool {
+    matches!(t, PATH_ATTR_CUBIC | PATH_ATTR_QUAD | PATH_CUBIC | PATH_QUAD)
+}
+
+/// Types carrying a third control/end point (cubics only).
+fn path_has_third(t: u8) -> bool {
+    matches!(t, PATH_ATTR_CUBIC | PATH_CUBIC)
+}
+
+/// Types followed by the 6-byte attribute tail (u16 width, u16 force, u8
+/// altitude, u8 azimuth).
+fn path_is_attributed(t: u8) -> bool {
+    t <= PATH_ATTR_MOVETO
+}
 
 /// Entity id: `(site, timestamp)` from an op's f0 sf struct.
 pub type EntityId = (u16, u32);
@@ -220,10 +243,10 @@ pub struct NtbStroke {
     pub anchor_y: f32,
     /// Stroke width in points.
     pub width: f32,
-    /// Number of 19-byte point records in the blob (the raw path length).
+    /// Number of path elements (moveto/curve/line records) in the blob.
     pub point_count: usize,
-    /// Decoded absolute page path, sampled from the cubic Bézier records.
-    /// Empty when the blob carries no trailer-verified records.
+    /// Decoded absolute page path, sampled from the curve elements.
+    /// Empty when the blob carries no decodable path stream.
     pub points: Vec<[f32; 2]>,
     /// Raw colour u32 (`0xAABBGGRR`, i.e. LE bytes are R,G,B,A) when the
     /// stroke table carries one (field f7); `None` → default black.
@@ -1290,96 +1313,203 @@ fn parse_stroke(b: &Buf, tp: usize, fields: &[u16]) -> Result<NtbStroke> {
     })
 }
 
-/// Decode the point blob at `blob` into `(record_count, absolute_points)`.
+/// Decode the path vector at `blob` into `(element_count, absolute_points)`.
 ///
-/// Layout (validated against 9 notebooks + the web-app stroke codec):
-/// the blob is a stream of 19-byte records. Record 0's first 8 bytes are
-/// clobbered by the stream header (`u32` byte-length ≈ 19n−5, then the record
-/// count); its last point is `(0, 0)` — the path origin. Records 1..n are
-/// cubic Béziers: three IEEE-754 half-precision points `(c1, c2, end)`,
-/// anchor-relative with y top-down, followed by a `u16` width hint and the
-/// constant 5-byte trailer. The record count is found by scanning for the
-/// trailer at 19-byte stride (the header length field is unreliable).
+/// Layout (validated against all 9 sample notebooks: every stream parses
+/// exactly to its declared byte length, 0 mismatches). The blob is a
+/// FlatBuffers byte vector — a `u32` byte length `L` followed by a
+/// Notability path stream of exactly `L` bytes (the `qT` codec used by
+/// Notability Web's ProcessStroke worker):
 ///
-/// A few strokes (2 in G1) carry a shifted header; when the aligned scan
-/// finds nothing, the decoder retries at byte offsets 1..19 to recover
-/// alignment (see §4.4).
+/// - byte 0: `version << 3 | precision`. Encoding version 0 in the wild;
+///   precision 0 = IEEE binary16 points (4 B each), 1 = binary32 (8 B).
+/// - `u16` LE element count.
+/// - elements, each: a `u8` type, then 1–3 anchor-relative points, then —
+///   for attributed types 0–3 — `u16` width, `u16` force, `u8` altitude,
+///   `u8` azimuth.
+///
+/// Types: 0/4 cubic, 1/5 quadratic, 2/6 line, 3/7 moveto (0–3 attributed).
+/// The first element is the moveto, whose point is the path origin `(0, 0)`
+/// relative to the stroke anchor.
 ///
 /// Points are returned in absolute page coordinates (anchor + relative),
-/// sampled at [`BEZIER_SAMPLES`] steps per cubic.
+/// sampled at [`BEZIER_SAMPLES`] steps per curve segment.
 fn decode_stroke_points(d: &[u8], blob: usize, anchor_x: f32, anchor_y: f32) -> (usize, Vec<[f32; 2]>) {
-    // Count records via trailer scan (ground truth; the header length admits
-    // false positives on non-stroke blobs).
-    let mut count = scan_trailers(d, blob);
-    let mut base = blob;
-    if count == 0 {
-        // Fallback: shifted-header strokes (2 known in G1). Try each
-        // alignment offset until trailers line up.
-        for shift in 1..POINT_STRIDE {
-            let c = scan_trailers(d, blob + shift);
-            if c > 0 {
-                count = c;
-                base = blob + shift;
-                break;
-            }
-        }
+    // FlatBuffers byte vector: `u32` byte length, then that many bytes.
+    let Some(lb) = d.get(blob..blob + 4) else {
+        return (0, Vec::new());
+    };
+    let len = u32::from_le_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
+    let Some(stream) = blob.checked_add(4) else {
+        return (0, Vec::new());
+    };
+    let Some(end) = stream.checked_add(len) else {
+        return (0, Vec::new());
+    };
+    if end > d.len() {
+        return (0, Vec::new());
     }
+    // Stream header: version/precision byte + element count.
+    let Some(&header) = d.get(stream) else {
+        return (0, Vec::new());
+    };
+    let version = header >> 3;
+    let precision = header & 7;
+    if version != 0 || precision > 1 {
+        // Unknown encoding — refuse rather than emit misplaced geometry.
+        return (0, Vec::new());
+    }
+    let Some(cb) = d.get(stream + 1..stream + 3) else {
+        return (0, Vec::new());
+    };
+    let count = u16::from_le_bytes([cb[0], cb[1]]) as usize;
     if count == 0 {
         return (0, Vec::new());
     }
-    // rec0 = moveto at the anchor; rec1..count−1 = cubics.
-    let mut points = Vec::with_capacity(count.saturating_mul(BEZIER_SAMPLES));
-    points.push([anchor_x, anchor_y]);
-    let mut cur = [0.0f32, 0.0f32]; // relative
-    for k in 1..count {
-        let off = base + k * POINT_STRIDE;
-        let c1 = read_f16_point(d, off);
-        let c2 = read_f16_point(d, off + 4);
-        let end = read_f16_point(d, off + 8);
-        match (c1, c2, end) {
-            (Some(c1), Some(c2), Some(end)) => {
-                for i in 1..=BEZIER_SAMPLES {
-                    let t = i as f32 / BEZIER_SAMPLES as f32;
-                    let u = 1.0 - t;
-                    let (ur, ut) = (u * u, t * t);
-                    let x = u * ur * cur[0] + 3.0 * ur * t * c1[0] + 3.0 * u * ut * c2[0] + t * ut * end[0];
-                    let y = u * ur * cur[1] + 3.0 * ur * t * c1[1] + 3.0 * u * ut * c2[1] + t * ut * end[1];
-                    points.push([anchor_x + x, anchor_y + y]);
+    let psize = if precision == 0 { 4 } else { 8 };
+
+    let mut off = stream + 3;
+    let mut parsed = 0usize;
+    let mut points: Vec<[f32; 2]> = Vec::with_capacity(count.saturating_mul(BEZIER_SAMPLES));
+    let mut cur = [anchor_x, anchor_y];
+    let mut started = false;
+    let abs = |p: [f32; 2]| [anchor_x + p[0], anchor_y + p[1]];
+
+    for _ in 0..count {
+        let Some(&typ) = d.get(off) else { break };
+        if typ > PATH_MOVETO {
+            break;
+        }
+        off += 1;
+        let npts = 1 + path_has_second(typ) as usize + path_has_third(typ) as usize;
+        let tail = if path_is_attributed(typ) { 6 } else { 0 };
+        let Some(size) = npts
+            .checked_mul(psize)
+            .and_then(|pts| pts.checked_add(tail))
+        else {
+            break;
+        };
+        if off + size > end {
+            break;
+        }
+        parsed += 1;
+        let p1 = read_path_point(d, off, precision);
+        off += psize;
+        let p2 = if path_has_second(typ) {
+            let v = read_path_point(d, off, precision);
+            off += psize;
+            v
+        } else {
+            None
+        };
+        let p3 = if path_has_third(typ) {
+            let v = read_path_point(d, off, precision);
+            off += psize;
+            v
+        } else {
+            None
+        };
+        off += tail;
+
+        match typ {
+            PATH_ATTR_MOVETO | PATH_MOVETO => {
+                if let Some(p) = p1 {
+                    cur = abs(p);
+                    points.push(cur);
+                    started = true;
                 }
-                cur = end;
             }
-            _ => {
-                // Non-finite half somewhere in the record — fall through as a
-                // straight segment to the end point when only that is finite.
-                if let Some(end) = end {
-                    points.push([anchor_x + end[0], anchor_y + end[1]]);
-                    cur = end;
+            PATH_ATTR_CUBIC | PATH_CUBIC => {
+                if !started {
+                    points.push(cur);
+                    started = true;
+                }
+                match (p1, p2, p3) {
+                    (Some(c1), Some(c2), Some(e)) => {
+                        let (c1, c2, e) = (abs(c1), abs(c2), abs(e));
+                        for i in 1..=BEZIER_SAMPLES {
+                            let t = i as f32 / BEZIER_SAMPLES as f32;
+                            let u = 1.0 - t;
+                            let (ur, ut) = (u * u, t * t);
+                            points.push([
+                                u * ur * cur[0] + 3.0 * ur * t * c1[0] + 3.0 * u * ut * c2[0]
+                                    + t * ut * e[0],
+                                u * ur * cur[1] + 3.0 * ur * t * c1[1] + 3.0 * u * ut * c2[1]
+                                    + t * ut * e[1],
+                            ]);
+                        }
+                        cur = e;
+                    }
+                    // Non-finite control point: keep the path connected with a
+                    // straight segment to the end point when that is finite.
+                    (_, _, Some(e)) => {
+                        cur = abs(e);
+                        points.push(cur);
+                    }
+                    _ => {}
                 }
             }
+            PATH_ATTR_QUAD | PATH_QUAD => {
+                if !started {
+                    points.push(cur);
+                    started = true;
+                }
+                match (p1, p2) {
+                    (Some(c), Some(e)) => {
+                        let (c, e) = (abs(c), abs(e));
+                        for i in 1..=BEZIER_SAMPLES {
+                            let t = i as f32 / BEZIER_SAMPLES as f32;
+                            let u = 1.0 - t;
+                            let (a, b, cc) = (u * u, 2.0 * u * t, t * t);
+                            points.push([
+                                a * cur[0] + b * c[0] + cc * e[0],
+                                a * cur[1] + b * c[1] + cc * e[1],
+                            ]);
+                        }
+                        cur = e;
+                    }
+                    (_, Some(e)) => {
+                        cur = abs(e);
+                        points.push(cur);
+                    }
+                    _ => {}
+                }
+            }
+            PATH_ATTR_LINE | PATH_LINE => {
+                if !started {
+                    points.push(cur);
+                    started = true;
+                }
+                if let Some(e) = p1 {
+                    cur = abs(e);
+                    points.push(cur);
+                }
+            }
+            _ => {}
         }
     }
-    (count, points)
+    (parsed, points)
 }
 
-/// Count consecutive 19-byte records starting at `start` whose last 5 bytes
-/// match the constant trailer.
-fn scan_trailers(d: &[u8], start: usize) -> usize {
-    let mut count = 0usize;
-    let mut p = start;
-    while p + POINT_STRIDE <= d.len() && d[p + 14..p + 19] == POINT_TRAILER {
-        count += 1;
-        p += POINT_STRIDE;
-    }
-    count
-}
-
-/// Read an IEEE-754 half-precision point `(x, y)` at `off`. Returns `None`
-/// when out of bounds or when either component is non-finite.
-fn read_f16_point(d: &[u8], off: usize) -> Option<[f32; 2]> {
-    let xb = d.get(off..off + 2)?;
-    let yb = d.get(off + 2..off + 4)?;
-    let x = f16_to_f32(u16::from_le_bytes([xb[0], xb[1]]));
-    let y = f16_to_f32(u16::from_le_bytes([yb[0], yb[1]]));
+/// Read an anchor-relative point at `off`. Precision 0 is IEEE binary16
+/// (4 bytes per point), precision 1 is IEEE binary32 (8 bytes). Returns
+/// `None` when out of bounds or when either component is non-finite.
+fn read_path_point(d: &[u8], off: usize, precision: u8) -> Option<[f32; 2]> {
+    let (x, y) = if precision == 0 {
+        let xb = d.get(off..off + 2)?;
+        let yb = d.get(off + 2..off + 4)?;
+        (
+            f16_to_f32(u16::from_le_bytes([xb[0], xb[1]])),
+            f16_to_f32(u16::from_le_bytes([yb[0], yb[1]])),
+        )
+    } else {
+        let xb = d.get(off..off + 4)?;
+        let yb = d.get(off + 4..off + 8)?;
+        (
+            f32::from_le_bytes([xb[0], xb[1], xb[2], xb[3]]),
+            f32::from_le_bytes([yb[0], yb[1], yb[2], yb[3]]),
+        )
+    };
     if x.is_finite() && y.is_finite() { Some([x, y]) } else { None }
 }
 
@@ -1815,35 +1945,117 @@ mod tests {
         assert_eq!((a * 255.0) as u8, 0xFF);
     }
 
-    #[test]
-    fn trailer_scan_counts_records() {
-        // Two 19-byte records with valid trailers.
-        let mut blob = vec![0u8; 38];
-        blob[14..19].copy_from_slice(&POINT_TRAILER);
-        blob[33..38].copy_from_slice(&POINT_TRAILER);
-        assert_eq!(scan_trailers(&blob, 0), 2);
-        // Broken trailer at record 1 → only 1.
-        blob[33] = 1;
-        assert_eq!(scan_trailers(&blob, 0), 1);
-        // Shifted header: valid records start at offset 3.
-        let mut shifted = vec![0u8; 3 + 19];
-        shifted[3 + 14..3 + 19].copy_from_slice(&POINT_TRAILER);
-        assert_eq!(scan_trailers(&shifted, 0), 0);
-        assert_eq!(scan_trailers(&shifted, 3), 1);
+    /// Build one element body: `npts` points (f16 bit pairs or f32 pairs)
+    /// plus the 6-byte attribute tail when the type is attributed.
+    fn f16_el(typ: u8, pts: &[(u16, u16)]) -> (u8, Vec<u8>) {
+        let mut b = Vec::new();
+        for (x, y) in pts {
+            b.extend_from_slice(&x.to_le_bytes());
+            b.extend_from_slice(&y.to_le_bytes());
+        }
+        if path_is_attributed(typ) {
+            b.extend_from_slice(&0u16.to_le_bytes());
+            b.extend_from_slice(&0u16.to_le_bytes());
+            b.push(0);
+            b.push(0);
+        }
+        (typ, b)
+    }
+
+    fn f32_el(typ: u8, pts: &[[f32; 2]]) -> (u8, Vec<u8>) {
+        let mut b = Vec::new();
+        for p in pts {
+            b.extend_from_slice(&p[0].to_le_bytes());
+            b.extend_from_slice(&p[1].to_le_bytes());
+        }
+        if path_is_attributed(typ) {
+            b.extend_from_slice(&0u16.to_le_bytes());
+            b.extend_from_slice(&0u16.to_le_bytes());
+            b.push(0);
+            b.push(0);
+        }
+        (typ, b)
+    }
+
+    /// Build a path vector: `u32` byte length + a version-0 `qT` stream.
+    fn build_path_stream(precision: u8, elements: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        let mut stream = Vec::new();
+        stream.push(precision); // version 0 << 3 | precision
+        stream.extend_from_slice(&(elements.len() as u16).to_le_bytes());
+        for (typ, body) in elements {
+            stream.push(*typ);
+            stream.extend_from_slice(body);
+        }
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&stream);
+        blob
     }
 
     #[test]
-    fn decode_recovers_shifted_header() {
-        // One record with a 3-byte shifted header: the aligned scan fails,
-        // the fallback finds it.
-        let mut blob = vec![0xAAu8; 3 + 19];
-        // Trailer at the shifted record's +14.
-        blob[3 + 14..3 + 19].copy_from_slice(&POINT_TRAILER);
-        // End point (record 0 bytes 8..12) = (0, 0) halves.
-        // (already zero)
+    fn path_stream_decodes_moveto_and_cubic() {
+        // moveto at the anchor, then one cubic ending at relative (2, −2).
+        let elements = vec![
+            f16_el(PATH_ATTR_MOVETO, &[(0x0000, 0x0000)]),
+            f16_el(
+                PATH_ATTR_CUBIC,
+                &[(0x3C00, 0x3C00), (0x4000, 0x4000), (0x4000, 0xC000)],
+            ),
+        ];
+        let blob = build_path_stream(0, &elements);
         let (count, points) = decode_stroke_points(&blob, 0, 10.0, 20.0);
-        assert_eq!(count, 1);
-        assert_eq!(points, vec![[10.0, 20.0]]);
+        assert_eq!(count, 2);
+        assert_eq!(points.len(), 1 + BEZIER_SAMPLES);
+        assert_eq!(points[0], [10.0, 20.0]);
+        assert_eq!(points[BEZIER_SAMPLES], [12.0, 18.0]);
+    }
+
+    #[test]
+    fn path_stream_keeps_the_final_element() {
+        // Regression: the trailing cubic used to be dropped whenever the byte
+        // after the vector was non-zero (the old trailer scan read it).
+        let mut elements = vec![f16_el(PATH_ATTR_MOVETO, &[(0x0000, 0x0000)])];
+        for _ in 0..3 {
+            elements.push(f16_el(
+                PATH_ATTR_CUBIC,
+                &[(0x3C00, 0x0000), (0x3C00, 0x0000), (0x4000, 0x0000)],
+            ));
+        }
+        let mut blob = build_path_stream(0, &elements);
+        blob.push(0xAB);
+        let (count, points) = decode_stroke_points(&blob, 0, 0.0, 0.0);
+        assert_eq!(count, 4);
+        assert_eq!(points.first(), Some(&[0.0, 0.0]));
+        assert_eq!(points.last(), Some(&[2.0, 0.0]));
+    }
+
+    #[test]
+    fn path_stream_f32_line_and_bare_cubic() {
+        // precision 1 = 8-byte points; a bare (non-attributed) line and cubic
+        // carry no attribute tail.
+        let elements = vec![
+            f32_el(PATH_ATTR_MOVETO, &[[0.0, 0.0]]),
+            f32_el(PATH_LINE, &[[5.0, 5.0]]),
+            f32_el(PATH_CUBIC, &[[5.0, 5.0], [5.0, 10.0], [10.0, 10.0]]),
+        ];
+        let blob = build_path_stream(1, &elements);
+        let (count, points) = decode_stroke_points(&blob, 0, 1.0, 2.0);
+        assert_eq!(count, 3);
+        assert_eq!(points[0], [1.0, 2.0]);
+        assert_eq!(points[1], [6.0, 7.0]);
+        assert_eq!(points[1 + BEZIER_SAMPLES], [11.0, 12.0]);
+    }
+
+    #[test]
+    fn path_stream_rejects_unknown_version() {
+        let elements = vec![f16_el(PATH_ATTR_MOVETO, &[(0x0000, 0x0000)])];
+        let mut blob = build_path_stream(0, &elements);
+        blob[4] |= 1 << 3; // encoding version 1
+        let (count, points) = decode_stroke_points(&blob, 0, 0.0, 0.0);
+        assert_eq!(count, 0);
+        assert!(points.is_empty());
+        // Truncated / absent vector → no geometry rather than a panic.
+        assert_eq!(decode_stroke_points(&[0u8; 3], 0, 0.0, 0.0), (0, Vec::new()));
     }
 
     #[test]
