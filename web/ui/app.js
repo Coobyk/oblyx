@@ -1,4 +1,4 @@
-import { convertFile, formatSize, prewarm } from "./engine.js"
+import { convertFile, formatSize, prewarm, loadThumbnails } from "./engine.js"
 
 const input = document.querySelector("#notebook-file")
 const dropzone = document.querySelector("#dropzone")
@@ -19,6 +19,8 @@ const progressValue = document.querySelector("#progress-value")
 const errorMessage = document.querySelector("#error")
 const results = document.querySelector("#results")
 const thumbsEl = document.querySelector("#thumbs")
+const previewButton = document.querySelector("#preview-toggle")
+const thumbsSection = document.querySelector("#thumbs-section")
 
 let selectedFile = null
 let preloadedBytes = null
@@ -29,6 +31,8 @@ let loadingMore = false
 let busy = false
 let outputFormat = "pdf"
 let outputPackaging = "zip"
+let savedMeta = null
+let previewLoaded = false
 
 function selectOption(group, value) {
   for (const button of group.querySelectorAll(".segment")) {
@@ -44,11 +48,19 @@ function clearOutputs() {
   outputFiles = []
   outputThumbs = []
   loadMoreThumbs = null
+  savedMeta = null
+  previewLoaded = false
   results.replaceChildren()
   results.hidden = true
   if (thumbsEl) {
     thumbsEl.replaceChildren()
     thumbsEl.hidden = true
+  }
+  if (thumbsSection) thumbsSection.hidden = true
+  if (previewButton) {
+    previewButton.hidden = true
+    previewButton.disabled = false
+    previewButton.textContent = "Show Preview"
   }
 }
 
@@ -147,7 +159,7 @@ async function convert() {
   try {
     const bytes = preloadedBytes ? await preloadedBytes : null
     const fmtCode = { pdf: 0, svg: 1, goodnotes: 2, ntb: 3 }[outputFormat] ?? 0
-    const { files, thumbs, loadMore } = await convertFile(
+    const { files, meta } = await convertFile(
       selectedFile.name,
       selectedFile,
       bytes,
@@ -156,13 +168,11 @@ async function convert() {
       progress,
     )
     outputFiles = files
-    outputThumbs = thumbs
-    loadMoreThumbs = loadMore
+    savedMeta = meta
 
-    if (thumbsEl && thumbs.length) {
-      thumbsEl.replaceChildren()
-      appendThumbs(thumbs)
-      thumbsEl.hidden = false
+    // Show preview button if there are pages to preview
+    if (previewButton && meta?.pages > 0) {
+      previewButton.hidden = false
     }
 
     results.replaceChildren()
@@ -211,6 +221,34 @@ packageOptions.addEventListener("click", (event) => {
   if (!button || busy) return
   outputPackaging = button.dataset.value
   selectOption(packageOptions, outputPackaging)
+})
+
+// Lazy preview: only load thumbnails when user clicks the button
+previewButton?.addEventListener("click", async () => {
+  if (busy || previewLoaded || !savedMeta) return
+  busy = true
+  previewButton.disabled = true
+  previewButton.textContent = "Loading preview…"
+  try {
+    const { thumbs, loadMore } = await loadThumbnails(savedMeta)
+    outputThumbs = thumbs
+    loadMoreThumbs = loadMore
+    previewLoaded = true
+    if (thumbsEl && thumbs.length) {
+      thumbsEl.replaceChildren()
+      appendThumbs(thumbs)
+      thumbsEl.hidden = false
+      if (thumbsSection) thumbsSection.hidden = false
+    }
+    previewButton.textContent = "Preview"
+    previewButton.hidden = true
+  } catch (error) {
+    showError(error instanceof Error ? error.message : String(error))
+    previewButton.disabled = false
+    previewButton.textContent = "Show Preview"
+  } finally {
+    busy = false
+  }
 })
 
 dropzone.addEventListener("dragenter", (event) => {

@@ -238,55 +238,10 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
         onProgress({ label, pct });
     };
     await ensureWorker();
-    async function renderRasters(meta, prefix) {
-        // Backgrounds are needed for thumbnails (page_to_jpeg) regardless of
-        // output format; PDF output additionally embeds them as vector Form
-        // XObjects and ignores the rasters.
-        if (!meta.jobs?.length)
-            return;
-        const pdfjsLib = await loadPdfJs();
-        const p = prefix ? `${prefix} — ` : "";
-        const byAtt = new Map();
-        meta.jobs.forEach(([att, page], i) => {
-            if (!byAtt.has(att))
-                byAtt.set(att, []);
-            byAtt.get(att).push({ i, page });
-        });
-        const total = meta.jobs.length;
-        let done = 0;
-        set(prefix ? `${p}rendering backgrounds 1/${total}` : `Rendering backgrounds 1/${total}`, 0, total);
-        for (const [att, jobs] of byAtt) {
-            const attP = expect("attachment");
-            worker.postMessage({ type: "attachment", uuid: att });
-            const { buffer } = await attP;
-            // Let pdf.js own its worker: a hand-built PDFWorker never settles
-            // its render promises under pdf.js 6. One document, one worker,
-            // released by destroy() below.
-            const loading = pdfjsLib.getDocument({ data: buffer, isEvalSupported: false });
-            try {
-                let timer = 0;
-                const pdfDoc = await Promise.race([
-                    loading.promise,
-                    new Promise((_, reject) => {
-                        timer = window.setTimeout(() => {
-                            reject(new Error("reading the background PDF timed out — try again"));
-                        }, RENDER_TIMEOUT_MS);
-                    }),
-                ]).finally(() => window.clearTimeout(timer));
-                for (const { i, page } of jobs) {
-                    const jpg = await renderPdfPage(pdfDoc, page);
-                    done++;
-                    set(prefix ? `${p}rendering backgrounds ${done}/${total}` : `Rendering backgrounds ${done}/${total}`, done, total);
-                    const acked = expect("rastered");
-                    worker.postMessage({ type: "raster", index: i, buffer: jpg.buffer }, [jpg.buffer]);
-                    await acked;
-                }
-            }
-            finally {
-                await loading.destroy?.();
-            }
-        }
-    }
+    // Lazy mode: don't render rasters/thumbnails during conversion.
+    // Backgrounds are only needed for PDF output (as vector Form XObjects)
+    // and for preview thumbnails (loaded on demand via loadThumbnails).
+    const renderRasters = async () => { };
     const THUMB_BATCH = 10;
     async function renderThumbBatch(startIndex, count, pages, prefix) {
         if (!pages || startIndex >= pages)
@@ -327,7 +282,7 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
                 await begun;
             }
             const results = [];
-            const thumbs = [];
+            let totalPages = 0;
             for (let i = 0; i < entries.length; i++) {
                 const entry = entries[i];
                 const label = `Notebook ${i + 1}/${entries.length}`;
@@ -341,10 +296,7 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
                     const buf = copyBytes(raw);
                     worker.postMessage({ type: "open_member", buffer: buf }, [buf]);
                     const memberMeta = await openedP;
-                    await renderRasters(memberMeta, label);
-                    const entryThumbs = await renderThumbBatch(0, THUMB_BATCH, memberMeta.pages, label);
-                    for (const t of entryThumbs)
-                        thumbs.push({ ...t, label: `${label} — ${t.label}` });
+                    totalPages += memberMeta.pages ?? 0;
                     await convertCurrent(label);
                 }
                 else {
@@ -352,10 +304,7 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
                     const buf = copyBytes(raw);
                     worker.postMessage({ type: "open", buffer: buf }, [buf]);
                     const meta = await openedP;
-                    await renderRasters(meta, label);
-                    const entryThumbs = await renderThumbBatch(0, THUMB_BATCH, meta.pages, label);
-                    for (const t of entryThumbs)
-                        thumbs.push({ ...t, label: `${label} — ${t.label}` });
+                    totalPages += meta.pages ?? 0;
                     const buffer = await convertCurrent(label);
                     results.push(fileOf(entryOutputName(entry, meta.pages ?? 1, fmt), buffer));
                 }
@@ -367,9 +316,9 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
                 const { buffer } = await packP;
                 set("Packing archive…", 1, 1);
                 const outName = `${name.replace(/\.zip$/i, "")}-converted.zip`;
-                return { files: [fileOf(outName, buffer)], thumbs, loadMore: null };
+                return { files: [fileOf(outName, buffer)], meta: { pages: totalPages } };
             }
-            return { files: results, thumbs, loadMore: null };
+            return { files: results, meta: { pages: totalPages } };
         }
         show("Opening notebook…");
         const bytes = preloaded ?? (await blob.arrayBuffer());
@@ -377,25 +326,84 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
         const openedP = expect("opened");
         worker.postMessage({ type: "open", buffer: buf }, [buf]);
         const meta = await openedP;
-        await renderRasters(meta, "");
-        const pages = meta.pages ?? 1;
-        const firstBatch = await renderThumbBatch(0, THUMB_BATCH, pages, "");
-        let nextThumb = firstBatch.length;
-        const loadMore = nextThumb < pages
-            ? async () => {
-                const batch = await renderThumbBatch(nextThumb, THUMB_BATCH, pages, "");
-                nextThumb += batch.length;
-                return batch;
-            }
-            : null;
         const buffer = await convertCurrent("");
+        const pages = meta.pages ?? 1;
         const single = fmt === 1 && pages <= 1;
         const ext = fmt === 0 ? "pdf" : fmt === 2 ? "goodnotes" : fmt === 3 ? "ntb" : single ? "svg" : "zip";
         const base = name.replace(/\.(goodnotes|ntb)$/i, "");
-        return { files: [fileOf(`${base}.${ext}`, buffer)], thumbs: firstBatch, loadMore };
+        return { files: [fileOf(`${base}.${ext}`, buffer)], meta: { pages, meta } };
     }
     catch (err) {
         onWorkerProgress = null;
         throw err;
+    }
+}
+
+// Lazy thumbnail loading: call this only when user requests preview.
+// Renders backgrounds first, then pages on demand.
+export async function loadThumbnails(savedMeta) {
+    const THUMB_BATCH = 10;
+    const set = () => { };
+    // If backgrounds haven't been rendered yet, render them now
+    if (savedMeta.meta?.jobs?.length && !savedMeta._rastersRendered) {
+        await renderRastersForPreview(savedMeta.meta, "");
+        savedMeta._rastersRendered = true;
+    }
+    const pages = savedMeta.pages ?? savedMeta.meta?.pages ?? 0;
+    let nextThumb = 0;
+    const renderBatch = async (startIndex, count) => {
+        if (!pages || startIndex >= pages)
+            return [];
+        const end = Math.min(startIndex + count, pages);
+        const thumbs = [];
+        for (let i = startIndex; i < end; i++) {
+            const imgP = expect("page_image");
+            worker.postMessage({ type: "render_page", index: i });
+            const { buffer } = await imgP;
+            const blob = new Blob([buffer], { type: "image/jpeg" });
+            thumbs.push({ url: URL.createObjectURL(blob), label: `Page ${i + 1}` });
+        }
+        return thumbs;
+    };
+    const firstBatch = await renderBatch(0, THUMB_BATCH);
+    nextThumb = firstBatch.length;
+    const loadMore = nextThumb < pages
+        ? async () => {
+            const batch = await renderBatch(nextThumb, THUMB_BATCH);
+            nextThumb += batch.length;
+            return batch;
+        }
+        : null;
+    return { thumbs: firstBatch, loadMore };
+}
+
+// Render backgrounds on demand for preview.
+async function renderRastersForPreview(meta, prefix) {
+    if (!meta?.jobs?.length)
+        return;
+    const pdfjsLib = await loadPdfJs();
+    const byAtt = new Map();
+    meta.jobs.forEach(([att, page], i) => {
+        if (!byAtt.has(att))
+            byAtt.set(att, []);
+        byAtt.get(att).push({ i, page });
+    });
+    for (const [att, jobs] of byAtt) {
+        const attP = expect("attachment");
+        worker.postMessage({ type: "attachment", uuid: att });
+        const { buffer } = await attP;
+        const loading = pdfjsLib.getDocument({ data: buffer, isEvalSupported: false });
+        try {
+            const pdfDoc = await loading.promise;
+            for (const { i, page } of jobs) {
+                const jpg = await renderPdfPage(pdfDoc, page);
+                const acked = expect("rastered");
+                worker.postMessage({ type: "raster", index: i, buffer: jpg.buffer }, [jpg.buffer]);
+                await acked;
+            }
+        }
+        finally {
+            await loading.destroy?.();
+        }
     }
 }
