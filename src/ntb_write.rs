@@ -23,6 +23,18 @@ use crate::doc::{Document, Item, Page, ShapeKind, Stroke};
 const PT_CREATE_PAGE: u8 = 3;
 const PT_CREATE_INK: u8 = 15;
 const PT_CREATE_SHAPE: u8 = 18;
+const PT_DOCUMENT_SETUP: u8 = 1;
+
+// Root table field indices (verified against real samples).
+const ROOT_F0_NOTE_GUID: usize = 0; // 16-byte inline GUID
+const ROOT_F3_DEVICE_UUID_UPPER: usize = 3; // uoffset to string
+const ROOT_F4_TIMESTAMP: usize = 4; // u64 ms epoch
+const ROOT_F5_DEVICE_UUID_LOWER: usize = 5; // uoffset to string
+const ROOT_F6_OPS: usize = 6; // uoffset to ops vector
+const ROOT_F7_VERSION: usize = 7; // u32 version
+
+/// Version observed in real samples: 0x800012.
+const NTB_VERSION: u32 = 0x800012;
 
 // Path element types (non-attributed, to avoid the 6-byte attribute tail).
 const PATH_LINE: u8 = 6;
@@ -245,7 +257,8 @@ struct EntityGen {
 
 impl EntityGen {
     fn new() -> Self {
-        Self { site: 1, ts: 1000 }
+        // Real samples start at site=0, ts=0.
+        Self { site: 0, ts: 0 }
     }
 
     fn next(&mut self) -> (u16, u32) {
@@ -349,6 +362,40 @@ fn write_create_shape(
     ])
 }
 
+/// Write a string field (uoffset to u32-len + bytes).
+fn write_string(fb: &mut Fb, s: &str) -> usize {
+    fb.write_byte_vector(s.as_bytes())
+}
+
+/// Write a DocumentSetup op (pt=1). This is the first op in real files and
+/// configures the notebook metadata (title, locale, default settings).
+fn write_document_setup(fb: &mut Fb, entity: (u16, u32), title: &str, locale: &str) -> usize {
+    // Sub-tables for string fields.
+    let title_str = write_string(fb, title);
+    let title_tbl = fb.write_table(&[(0, FieldVal::Uoffset(title_str))]);
+
+    let locale_str = write_string(fb, locale);
+    let locale_tbl = fb.write_table(&[(0, FieldVal::Uoffset(locale_str))]);
+
+    // Subject name placeholder (binary-ish data observed in samples).
+    let subject_tbl = fb.write_table(&[(0, FieldVal::Inline(vec![0x20; 16]))]);
+
+    // Payload: f0=title, f1=subject, f2=locale, f3=flags, f5=default_font_size.
+    let payload = fb.write_table(&[
+        (0, FieldVal::Uoffset(title_tbl)),
+        (1, FieldVal::Uoffset(subject_tbl)),
+        (2, FieldVal::Uoffset(locale_tbl)),
+        (3, FieldVal::Inline(6145u32.to_le_bytes().to_vec())), // flags
+        (5, FieldVal::Inline(14.0f32.to_le_bytes().to_vec())), // default font size
+    ]);
+
+    fb.write_table(&[
+        (0, FieldVal::Inline(sf_inline(entity.0, entity.1))),
+        (4, FieldVal::Inline(vec![PT_DOCUMENT_SETUP])),
+        (5, FieldVal::Uoffset(payload)),
+    ])
+}
+
 /// Write one CreatePage op. Returns the op table position.
 ///
 /// When `background_hash` is `Some`, the page gets a `PageBackground` table
@@ -394,6 +441,12 @@ fn build_note_bundle(pages: &[Page], doc: &Document) -> Vec<u8> {
     let mut ids = EntityGen::new();
 
     let mut op_positions: Vec<usize> = Vec::new();
+
+    // First op: DocumentSetup (pt=1). Required by Notability.
+    let setup_entity = ids.next();
+    let title = format!("Note {}", chrono_like_timestamp());
+    let setup_op = write_document_setup(&mut fb, setup_entity, &title, "en_US");
+    op_positions.push(setup_op);
 
     for (page_idx, page) in pages.iter().enumerate() {
         // Page entity: one CreatePage per IR page.
@@ -525,10 +578,47 @@ fn build_note_bundle(pages: &[Page], doc: &Document) -> Vec<u8> {
     // Ops vector.
     let ops_vec = fb.write_uoffset_vector(&op_positions);
 
-    // Root table: f6 = ops vector.
-    let root = fb.write_table(&[(6, FieldVal::Uoffset(ops_vec))]);
+    // Root table with all required fields.
+    // f0: 16-byte note GUID (inline).
+    let note_guid: [u8; 16] = [
+        0xb7, 0xaf, 0xff, 0x54, 0xb0, 0xce, 0xb0, 0x85, 0x10, 0x41, 0x94, 0xc5, 0x81, 0xb7, 0x1b,
+        0x23,
+    ];
+    // f3: device UUID (uppercase string).
+    let device_uuid_upper = write_string(&mut fb, "798E2A39-80A9-4BBE-B95C-B205F461CDB1");
+    // f5: device UUID (lowercase string).
+    let device_uuid_lower = write_string(&mut fb, "798e2a39-80a9-4bbe-b95c-b205f461cdb1");
+    // f4: timestamp (u64 ms epoch).
+    let timestamp_ms: u64 = 1789453933593; // Matches sample files.
+
+    let root = fb.write_table(&[
+        (ROOT_F0_NOTE_GUID, FieldVal::Inline(note_guid.to_vec())),
+        (
+            ROOT_F3_DEVICE_UUID_UPPER,
+            FieldVal::Uoffset(device_uuid_upper),
+        ),
+        (
+            ROOT_F4_TIMESTAMP,
+            FieldVal::Inline(timestamp_ms.to_le_bytes().to_vec()),
+        ),
+        (
+            ROOT_F5_DEVICE_UUID_LOWER,
+            FieldVal::Uoffset(device_uuid_lower),
+        ),
+        (ROOT_F6_OPS, FieldVal::Uoffset(ops_vec)),
+        (
+            ROOT_F7_VERSION,
+            FieldVal::Inline(NTB_VERSION.to_le_bytes().to_vec()),
+        ),
+    ]);
 
     fb.finish(root)
+}
+
+/// Generate a simple timestamp string for note titles.
+fn chrono_like_timestamp() -> String {
+    // Use a fixed timestamp matching the sample files for reproducibility.
+    "Sep 15, 2026".to_string()
 }
 
 /// Compute a 64-byte content hash (SHA-256 double-round for a 64-byte output).
@@ -567,11 +657,21 @@ pub fn write_ntb(pages: &[Page], doc: &Document, mut w: impl Write) -> Result<()
     let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
 
+    // Version file (1 byte, observed in real samples).
+    zip.start_file("version", opts)?;
+    zip.write_all(&[1])?;
+
     zip.start_file("noteBundle", opts)?;
     zip.write_all(&bundle)?;
 
+    // Manifest with required fields (subjectId, subjectName, appVersion).
+    let manifest = r#"{
+  "subjectId" : "f662d1e9-a300-45b4-affe-bb36e2a825c3",
+  "subjectName" : "Imported",
+  "appVersion" : "16.12.5"
+}"#;
     zip.start_file("manifest.json", opts)?;
-    zip.write_all(br#"{"version":1}"#)?;
+    zip.write_all(manifest.as_bytes())?;
 
     zip.start_file("thumbnail.png", opts)?;
     zip.write_all(&tiny_png())?;
@@ -682,7 +782,7 @@ mod tests {
             .read_to_end(&mut bundle)
             .unwrap();
         let (meta, strokes, page_defs, _texts, shapes) = ntb::parse_bundle_public(&bundle).unwrap();
-        assert_eq!(meta.element_count, 2); // 1 CreatePage + 1 CreateInk
+        assert_eq!(meta.element_count, 3); // 1 DocumentSetup + 1 CreatePage + 1 CreateInk
         assert_eq!(strokes.len(), 1);
         assert_eq!(page_defs.len(), 1);
         assert!(shapes.is_empty());
