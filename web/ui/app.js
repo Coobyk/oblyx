@@ -18,10 +18,12 @@ const progressTrack = document.querySelector(".progress-track")
 const progressValue = document.querySelector("#progress-value")
 const errorMessage = document.querySelector("#error")
 const results = document.querySelector("#results")
+const thumbsEl = document.querySelector("#thumbs")
 
 let selectedFile = null
 let preloadedBytes = null
 let outputFiles = []
+let outputThumbs = []
 let busy = false
 let outputFormat = "pdf"
 let outputPackaging = "zip"
@@ -36,9 +38,15 @@ function selectOption(group, value) {
 
 function clearOutputs() {
   for (const file of outputFiles) URL.revokeObjectURL(file.url)
+  for (const thumb of outputThumbs) URL.revokeObjectURL(thumb.url)
   outputFiles = []
+  outputThumbs = []
   results.replaceChildren()
   results.hidden = true
+  if (thumbsEl) {
+    thumbsEl.replaceChildren()
+    thumbsEl.hidden = true
+  }
 }
 
 function showError(message = "") {
@@ -120,7 +128,7 @@ async function convert() {
 
   try {
     const bytes = preloadedBytes ? await preloadedBytes : null
-    outputFiles = await convertFile(
+    const { files, thumbs } = await convertFile(
       selectedFile.name,
       selectedFile,
       bytes,
@@ -128,6 +136,25 @@ async function convert() {
       outputPackaging === "zip",
       progress,
     )
+    outputFiles = files
+    outputThumbs = thumbs
+
+    if (thumbsEl && thumbs.length) {
+      thumbsEl.replaceChildren()
+      for (const thumb of thumbs) {
+        const img = document.createElement("img")
+        img.src = thumb.url
+        img.alt = thumb.label
+        img.loading = "lazy"
+        const cap = document.createElement("figcaption")
+        cap.textContent = thumb.label
+        const cell = document.createElement("figure")
+        cell.className = "thumb"
+        cell.append(img, cap)
+        thumbsEl.append(cell)
+      }
+      thumbsEl.hidden = false
+    }
 
     results.replaceChildren()
     for (const file of outputFiles) {

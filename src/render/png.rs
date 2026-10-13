@@ -506,7 +506,7 @@ fn draw_fill_path(pm: &mut Pixmap, fp: &FillPathEl, scale: f32) {
     }
 }
 
-pub fn page_to_png(page: &Page, doc: &Document, scale: f32) -> Result<Vec<u8>> {
+fn render_page_pixmap(page: &Page, doc: &Document, scale: f32) -> Result<Pixmap> {
     let w = (page.width * scale).round().max(1.0) as u32;
     let h = (page.height * scale).round().max(1.0) as u32;
     let mut pm = Pixmap::new(w, h).context("create pixmap")?;
@@ -560,6 +560,28 @@ pub fn page_to_png(page: &Page, doc: &Document, scale: f32) -> Result<Vec<u8>> {
             Item::Connector(_) => {}
         }
     }
+    Ok(pm)
+}
 
-    Ok(pm.encode_png()?)
+pub fn page_to_png(page: &Page, doc: &Document, scale: f32) -> Result<Vec<u8>> {
+    Ok(render_page_pixmap(page, doc, scale)?.encode_png()?)
+}
+
+/// Render a page to JPEG (for browser thumbnails). The pixmap is filled
+/// white so every pixel is opaque; RGBA is stripped to RGB for the encoder.
+pub fn page_to_jpeg(page: &Page, doc: &Document, scale: f32, quality: u8) -> Result<Vec<u8>> {
+    let pm = render_page_pixmap(page, doc, scale)?;
+    let (w, h) = (pm.width(), pm.height());
+    let rgba = pm.data();
+    let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
+    for px in rgba.chunks_exact(4) {
+        rgb.extend_from_slice(&px[..3]);
+    }
+    let w16 = u16::try_from(w).context("page too wide for JPEG")?;
+    let h16 = u16::try_from(h).context("page too tall for JPEG")?;
+    let mut out = Vec::new();
+    jpeg_encoder::Encoder::new(&mut out, quality)
+        .encode(&rgb, w16, h16, jpeg_encoder::ColorType::Rgb)
+        .context("jpeg encode")?;
+    Ok(out)
 }

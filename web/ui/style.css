@@ -202,6 +202,10 @@ button, input, select { font: inherit; }
 .progress-track { height: 5px; overflow: hidden; border-radius: 999px; background: var(--muted); }
 .progress-value { display: block; width: 0; height: 100%; border-radius: inherit; background: var(--primary); transition: width 180ms ease; }
 .error { margin: 12px 0 0; color: oklch(0.55 0.19 27); font-size: 12px; line-height: 1.5; }
+.thumbs { display: flex; gap: 10px; overflow-x: auto; padding: 14px 2px 4px; scroll-snap-type: x mandatory; }
+.thumbs .thumb { flex: 0 0 auto; margin: 0; scroll-snap-align: start; }
+.thumbs img { display: block; width: 110px; height: auto; border: 1px solid var(--border); border-radius: 6px; background: var(--background); }
+.thumbs figcaption { margin-top: 4px; color: var(--muted-foreground); font-size: 10px; text-align: center; white-space: nowrap; }
 .results { display: flex; flex-direction: column; gap: 7px; padding-top: 14px; }
 .results a { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: calc(var(--radius) - 2px); color: var(--foreground); font-size: 12px; text-decoration: none; }
 .results a:hover { background: var(--muted); }

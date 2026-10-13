@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use oblyx::convert::{Sink, ZipSink, zip_member_layout};
 use oblyx::doc::{Document, Page};
 use oblyx::render::pdf::document_to_pdf_with;
+use oblyx::render::png::page_to_jpeg;
 use oblyx::render::svg::page_to_svg;
 
 /// Matches the native CLI default (used when decoding pages).
@@ -73,6 +74,9 @@ thread_local! {
     static SINK: RefCell<Option<ZipSink<Cursor<Vec<u8>>>>> = const { RefCell::new(None) };
     /// Pre-built pages from a `.ntb` (None for GoodNotes, which uses `decode_page`).
     static NTB_PAGES: RefCell<Option<Vec<Page>>> = const { RefCell::new(None) };
+    /// Decoded + background-injected pages, cached after first use so
+    /// `oblyx_render_page` and `oblyx_convert` share one decode pass.
+    static DECODED_PAGES: RefCell<Option<Vec<Page>>> = const { RefCell::new(None) };
 }
 
 fn set_out(bytes: Vec<u8>) -> i32 {
@@ -113,6 +117,7 @@ fn clear_archive() {
     ENTRIES.with(|e| *e.borrow_mut() = Vec::new());
     CURRENT.with(|c| *c.borrow_mut() = None);
     SINK.with(|s| *s.borrow_mut() = None);
+    DECODED_PAGES.with(|p| *p.borrow_mut() = None);
 }
 
 #[unsafe(no_mangle)]
@@ -140,6 +145,7 @@ fn open_doc(data: Vec<u8>) -> i32 {
         return open_ntb(data);
     }
     NTB_PAGES.with(|p| *p.borrow_mut() = None);
+    DECODED_PAGES.with(|p| *p.borrow_mut() = None);
     match Document::from_bytes(data) {
         Ok(doc) => {
             // Background pages that SVG/PNG must rasterize through pdf.js.
@@ -185,6 +191,7 @@ fn open_ntb(data: Vec<u8>) -> i32 {
             JOBS.with(|j| *j.borrow_mut() = raster_jobs);
             DOC.with(|d| *d.borrow_mut() = Some(doc));
             NTB_PAGES.with(|p| *p.borrow_mut() = Some(pages));
+            DECODED_PAGES.with(|p| *p.borrow_mut() = None);
             set_out(json.into_bytes())
         }
         Err(e) => fail(format!("could not open Notability notebook: {e}")),
@@ -407,6 +414,63 @@ pub extern "C" fn oblyx_set_raster(index: u32, ptr: *mut u8, len: usize) -> i32 
     })
 }
 
+/// Decode every page (once) and inject PDF backgrounds from JS-rendered
+/// rasters. Returns the cached page list. Both `oblyx_render_page` and
+/// `oblyx_convert` go through here so a single decode pass serves thumbnails
+/// and the final output.
+fn ensure_pages(doc: &Document) -> Result<Vec<Page>, String> {
+    let cached = DECODED_PAGES.with(|p| p.borrow().clone());
+    if let Some(pages) = cached {
+        return Ok(pages);
+    }
+    let ntb_pages = NTB_PAGES.with(|p| p.borrow().clone());
+    let total = if let Some(ref np) = ntb_pages {
+        np.len() as u32
+    } else {
+        doc.pages.len() as u32
+    };
+    let mut pages = if let Some(np) = ntb_pages {
+        np
+    } else {
+        let mut pages = Vec::with_capacity(doc.pages.len());
+        for (i, src) in doc.pages.iter().enumerate() {
+            match doc.decode_page(src, false) {
+                Ok(page) => pages.push(page),
+                Err(e) => return Err(format!("decode page {}: {e:#}", src.uuid)),
+            }
+            report(PHASE_DECODE, i as u32 + 1, total);
+        }
+        pages
+    };
+    doc.inject_pdf_backgrounds(&mut pages);
+    DECODED_PAGES.with(|p| *p.borrow_mut() = Some(pages.clone()));
+    Ok(pages)
+}
+
+/// Render page `index` (0-based) as a JPEG thumbnail at scale 2.0 (144 dpi,
+/// matching the background raster cache). OUT becomes the JPEG bytes.
+/// Call after `oblyx_set_raster` has filled the background cache.
+#[unsafe(no_mangle)]
+pub extern "C" fn oblyx_render_page(index: u32) -> i32 {
+    DOC.with(|d| {
+        let doc_ref = d.borrow();
+        let Some(doc) = doc_ref.as_ref() else {
+            return fail("no document".into());
+        };
+        let pages = match ensure_pages(doc) {
+            Ok(p) => p,
+            Err(e) => return fail(e),
+        };
+        let Some(page) = pages.get(index as usize) else {
+            return fail(format!("no page {index}"));
+        };
+        match page_to_jpeg(page, doc, 2.0, 82) {
+            Ok(bytes) => set_out(bytes),
+            Err(e) => fail(format!("render page {index}: {e:#}")),
+        }
+    })
+}
+
 /// Decode every page, then render. For a single notebook OUT becomes the PDF
 /// (fmt 0) or SVG (fmt 1, zip if the notebook has more than one page). Inside
 /// an archive run the bytes are written into the pending zip instead and OUT
@@ -418,28 +482,11 @@ pub extern "C" fn oblyx_convert(fmt: u32) -> i32 {
         let Some(doc) = doc_ref.as_ref() else {
             return fail("no document".into());
         };
-        // .ntb pages are pre-built by to_pages; GoodNotes pages come from decode_page.
-        let ntb_pages = NTB_PAGES.with(|p| p.borrow().clone());
-        let total = if let Some(ref np) = ntb_pages {
-            np.len() as u32
-        } else {
-            doc.pages.len() as u32
+        let pages = match ensure_pages(doc) {
+            Ok(p) => p,
+            Err(e) => return fail(e),
         };
-        let mut pages = if let Some(np) = ntb_pages {
-            np
-        } else {
-            let mut pages = Vec::with_capacity(doc.pages.len());
-            for (i, src) in doc.pages.iter().enumerate() {
-                match doc.decode_page(src, false) {
-                    Ok(page) => pages.push(page),
-                    Err(e) => return fail(format!("decode page {}: {e:#}", src.uuid)),
-                }
-                report(PHASE_DECODE, i as u32 + 1, total);
-            }
-            pages
-        };
-        // Inject PDF backgrounds from js-rendered rasters (no-op if none).
-        doc.inject_pdf_backgrounds(&mut pages);
+        let total = pages.len() as u32;
         let archived = SINK.with(|s| s.borrow().is_some());
         match fmt {
             0 => {

@@ -29,7 +29,7 @@ function withInput(bytes, fn) {
 async function init() {
   // Query string is the wasm hash. worker.js revalidates; the wasm file is
   // cached, so a new worker must not keep calling exports the cached module lacks.
-  const resp = await fetch("oblyx_web.wasm?v=a9d82b44786a");
+  const resp = await fetch("oblyx_web.wasm?v=df9fc35ed155");
   if (!resp.ok) throw new Error(`wasm download failed: HTTP ${resp.status}`);
   const imports = {
     oblyx: {
@@ -117,6 +117,13 @@ self.onmessage = (e) => {
         );
         if (rc !== 0) throw new Error(outText());
         postMessage({ type: "rastered" });
+        break;
+      }
+      case "render_page": {
+        const rc = W.oblyx_render_page(msg.index);
+        if (rc !== 0) throw new Error(outText());
+        const bytes = outBytes();
+        postMessage({ type: "page_image", index: msg.index, buffer: bytes.buffer }, [bytes.buffer]);
         break;
       }
       case "convert": {

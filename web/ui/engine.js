@@ -239,8 +239,10 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
     };
     await ensureWorker();
     async function renderRasters(meta, prefix) {
-        // fmt 0 (PDF) embeds backgrounds as vector Form XObjects — no rasters.
-        if (fmt === 0 || !meta.jobs?.length)
+        // Backgrounds are needed for thumbnails (page_to_jpeg) regardless of
+        // output format; PDF output additionally embeds them as vector Form
+        // XObjects and ignores the rasters.
+        if (!meta.jobs?.length)
             return;
         const pdfjsLib = await loadPdfJs();
         const p = prefix ? `${prefix} — ` : "";
@@ -285,6 +287,21 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
             }
         }
     }
+    async function renderThumbnails(pages, prefix) {
+        if (!pages)
+            return [];
+        const p = prefix ? `${prefix} — ` : "";
+        const thumbs = [];
+        for (let i = 0; i < pages; i++) {
+            const imgP = expect("page_image");
+            worker.postMessage({ type: "render_page", index: i });
+            const { buffer } = await imgP;
+            const blob = new Blob([buffer], { type: "image/jpeg" });
+            thumbs.push({ url: URL.createObjectURL(blob), label: `Page ${i + 1}` });
+            set(prefix ? `${p}previewing page ${i + 1}/${pages}` : `Previewing page ${i + 1}/${pages}`, i + 1, pages);
+        }
+        return thumbs;
+    }
     async function convertCurrent(label) {
         const p = label ? `${label} — ` : "";
         const phaseLabel = {
@@ -308,6 +325,7 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
                 await begun;
             }
             const results = [];
+            const thumbs = [];
             for (let i = 0; i < entries.length; i++) {
                 const entry = entries[i];
                 const label = `Notebook ${i + 1}/${entries.length}`;
@@ -322,6 +340,9 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
                     worker.postMessage({ type: "open_member", buffer: buf }, [buf]);
                     const memberMeta = await openedP;
                     await renderRasters(memberMeta, label);
+                    const entryThumbs = await renderThumbnails(memberMeta.pages, label);
+                    for (const t of entryThumbs)
+                        thumbs.push({ ...t, label: `${label} — ${t.label}` });
                     await convertCurrent(label);
                 }
                 else {
@@ -330,6 +351,9 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
                     worker.postMessage({ type: "open", buffer: buf }, [buf]);
                     const meta = await openedP;
                     await renderRasters(meta, label);
+                    const entryThumbs = await renderThumbnails(meta.pages, label);
+                    for (const t of entryThumbs)
+                        thumbs.push({ ...t, label: `${label} — ${t.label}` });
                     const buffer = await convertCurrent(label);
                     results.push(fileOf(entryOutputName(entry, meta.pages ?? 1, fmt), buffer));
                 }
@@ -341,9 +365,9 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
                 const { buffer } = await packP;
                 set("Packing archive…", 1, 1);
                 const outName = `${name.replace(/\.zip$/i, "")}-converted.zip`;
-                return [fileOf(outName, buffer)];
+                return { files: [fileOf(outName, buffer)], thumbs };
             }
-            return results;
+            return { files: results, thumbs };
         }
         show("Opening notebook…");
         const bytes = preloaded ?? (await blob.arrayBuffer());
@@ -352,12 +376,13 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
         worker.postMessage({ type: "open", buffer: buf }, [buf]);
         const meta = await openedP;
         await renderRasters(meta, "");
+        const thumbs = await renderThumbnails(meta.pages, "");
         const buffer = await convertCurrent("");
         const pages = meta.pages ?? 1;
         const single = fmt === 1 && pages <= 1;
         const ext = fmt === 0 ? "pdf" : single ? "svg" : "zip";
         const base = name.replace(/\.(goodnotes|ntb)$/i, "");
-        return [fileOf(`${base}.${ext}`, buffer)];
+        return { files: [fileOf(`${base}.${ext}`, buffer)], thumbs };
     }
     catch (err) {
         onWorkerProgress = null;
