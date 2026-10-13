@@ -114,3 +114,17 @@ pub fn decompress_bv4(blob: &[u8]) -> Result<Vec<u8>> {
         pos = end;
     }
 }
+
+/// Compress data as a stored (uncompressed) bv4 block: `bv4-` magic + u32 LE
+/// uncompressed size + u32 LE stored size + raw payload, terminated by a
+/// `bv4$` end marker. The decompressor accepts this alongside LZ4 blocks.
+pub fn compress_bv4_stored(data: &[u8]) -> Vec<u8> {
+    let len = data.len() as u32;
+    let mut out = Vec::with_capacity(16 + data.len());
+    out.extend_from_slice(b"bv4-");
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"bv4$");
+    out
+}

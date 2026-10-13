@@ -31,6 +31,8 @@ use std::path::{Path, PathBuf};
 
 use oblyx::convert::{Sink, ZipSink, zip_member_layout};
 use oblyx::doc::{Document, Page};
+use oblyx::goodnotes_write::write_goodnotes_to_vec;
+use oblyx::ntb_write::write_ntb_to_vec;
 use oblyx::render::pdf::document_to_pdf_with;
 use oblyx::render::png::page_to_jpeg;
 use oblyx::render::svg::page_to_svg;
@@ -527,6 +529,46 @@ pub extern "C" fn oblyx_convert(fmt: u32) -> i32 {
                     }
                 }
             }
+            2 => {
+                // GoodNotes format.
+                let bytes = match write_goodnotes_to_vec(&pages, doc) {
+                    Ok(b) => b,
+                    Err(e) => return fail(format!("write goodnotes: {e:#}")),
+                };
+                report(PHASE_RENDER, total, total);
+                if archived {
+                    let Some(entry) = CURRENT.with(|c| c.borrow().clone()) else {
+                        return fail("no archive entry".into());
+                    };
+                    let target = archive_notebook_path(&entry, "goodnotes");
+                    if let Err(e) = write_archive(&target, bytes) {
+                        return fail(e);
+                    }
+                    set_out(Vec::new())
+                } else {
+                    set_out(bytes)
+                }
+            }
+            3 => {
+                // Notability (.ntb) format.
+                let bytes = match write_ntb_to_vec(&pages, doc) {
+                    Ok(b) => b,
+                    Err(e) => return fail(format!("write ntb: {e:#}")),
+                };
+                report(PHASE_RENDER, total, total);
+                if archived {
+                    let Some(entry) = CURRENT.with(|c| c.borrow().clone()) else {
+                        return fail("no archive entry".into());
+                    };
+                    let target = archive_notebook_path(&entry, "ntb");
+                    if let Err(e) = write_archive(&target, bytes) {
+                        return fail(e);
+                    }
+                    set_out(Vec::new())
+                } else {
+                    set_out(bytes)
+                }
+            }
             _ => fail(format!("unknown format {fmt}")),
         }
     })
@@ -536,6 +578,13 @@ pub extern "C" fn oblyx_convert(fmt: u32) -> i32 {
 fn archive_pdf_path(entry: &ArchEntry) -> PathBuf {
     let mut path = entry.sub.clone().unwrap_or_default();
     path.push(format!("{}.pdf", entry.stem));
+    path
+}
+
+/// `sub/stem.goodnotes` or `sub/stem.ntb` inside the pending archive.
+fn archive_notebook_path(entry: &ArchEntry, ext: &str) -> PathBuf {
+    let mut path = entry.sub.clone().unwrap_or_default();
+    path.push(format!("{}.{}", entry.stem, ext));
     path
 }
 

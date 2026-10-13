@@ -90,9 +90,15 @@ impl<'a> Buf<'a> {
     }
 
     /// Follow a uoffset at `pos` to the target position.
+    /// The offset is a signed 32-bit relative offset (can be negative when
+    /// the target was written before the field, i.e. at a lower address).
     fn follow(&self, pos: usize) -> Result<usize> {
-        let rel = self.u32(pos)? as usize;
-        Ok(pos + rel)
+        let rel = self.i32(pos)? as i64;
+        let target = pos as i64 + rel;
+        if target < 0 {
+            bail!("uoffset underflow at {pos}");
+        }
+        Ok(target as usize)
     }
 
     /// Field byte offset within a table, or 0 when the field is absent.

@@ -319,12 +319,106 @@ pub fn polyline(starts: &[[f32; 2]], segments: &[[f32; 4]]) -> Vec<[f32; 2]> {
     pts.push(*first);
     for s in segments {
         if let Some(last) = pts.last()
-            && ((last[0] - s[0]).abs() > 1e-3 || (last[1] - s[1]).abs() > 1e-3) {
-                pts.push([s[0], s[1]]);
-            }
+            && ((last[0] - s[0]).abs() > 1e-3 || (last[1] - s[1]).abs() > 1e-3)
+        {
+            pts.push([s[0], s[1]]);
+        }
         pts.push([s[2], s[3]]);
     }
     pts
+}
+
+// ---------------------------------------------------------------------------
+// Encoder
+// ---------------------------------------------------------------------------
+
+/// Write a TPL image: magic + u32 LE total length + NUL-terminated format +
+/// packed LE payload. Returns the complete image bytes.
+fn build_tpl(fmt: &str, payload: &[u8]) -> Vec<u8> {
+    let fmt_bytes = fmt.as_bytes();
+    let total = 8 + fmt_bytes.len() + 1 + payload.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(b"tpl\0");
+    out.extend_from_slice(&(total as u32).to_le_bytes());
+    out.extend_from_slice(fmt_bytes);
+    out.push(0);
+    out.extend_from_slice(payload);
+    out
+}
+
+fn push_v(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn push_u(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn push_f(out: &mut Vec<u8>, bits: u64) {
+    out.extend_from_slice(&bits.to_le_bytes());
+}
+
+/// Encode a polyline as a standard-width TPL stroke image.
+///
+/// Layout follows [`STROKE_FORMAT`]: version v=0, width u=bits, flags A(v),
+/// starts A(S(u,u)), segments A(S(u,u,u,u)), pad v=0, dash A(f)=empty.
+/// Flags are 0 for the first point (move) and 1 for each subsequent segment.
+pub fn encode_stroke(points: &[[f32; 2]], width: f32, dash: Option<[f32; 2]>) -> Vec<u8> {
+    let width_bits = if width.is_finite() && width > 0.0 {
+        width.to_bits()
+    } else {
+        1.5f32.to_bits()
+    };
+    // Build starts/segments from the polyline.
+    let starts: Vec<[f32; 2]> = points.first().copied().into_iter().collect();
+    let segments: Vec<[f32; 4]> = points
+        .windows(2)
+        .map(|w| [w[0][0], w[0][1], w[1][0], w[1][1]])
+        .collect();
+    let flags: Vec<u16> = std::iter::once(0u16)
+        .chain(std::iter::repeat_n(1u16, segments.len()))
+        .collect();
+
+    let mut p = Vec::new();
+    // values[0]: v = 0
+    push_v(&mut p, 0);
+    // values[1]: u = width bits
+    push_u(&mut p, width_bits);
+    // values[2]: A(v) = flags
+    push_u(&mut p, flags.len() as u32);
+    for &f in &flags {
+        push_v(&mut p, f);
+    }
+    // values[3]: A(S(u,u)) = starts
+    push_u(&mut p, starts.len() as u32);
+    for s in &starts {
+        push_u(&mut p, s[0].to_bits());
+        push_u(&mut p, s[1].to_bits());
+    }
+    // values[4]: A(S(u,u,u,u)) = segments
+    push_u(&mut p, segments.len() as u32);
+    for s in &segments {
+        push_u(&mut p, s[0].to_bits());
+        push_u(&mut p, s[1].to_bits());
+        push_u(&mut p, s[2].to_bits());
+        push_u(&mut p, s[3].to_bits());
+    }
+    // values[5]: v = 0
+    push_v(&mut p, 0);
+    // values[6]: A(f) = dash
+    match dash {
+        Some([seg, gap]) => {
+            push_u(&mut p, 1);
+            push_f(
+                &mut p,
+                ((seg.to_bits() as u64) << 32) | gap.to_bits() as u64,
+            );
+        }
+        None => {
+            push_u(&mut p, 0);
+        }
+    }
+    build_tpl(STROKE_FORMAT, &p)
 }
 
 fn split_runs(pts: &[[f32; 2]], th: f32) -> Vec<Vec<[f32; 2]>> {
@@ -421,9 +515,10 @@ pub fn vector_fill_geometry(img: &[u8]) -> Result<Option<Contours>> {
             }
         }
         if contours.is_empty()
-            && let Some(runs) = nth {
-                contours = runs.into_iter().filter(|r| r.len() >= 3).collect();
-            }
+            && let Some(runs) = nth
+        {
+            contours = runs.into_iter().filter(|r| r.len() >= 3).collect();
+        }
     }
     if contours.is_empty() {
         return Ok(None);

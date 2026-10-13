@@ -135,7 +135,7 @@ function fileOf(name, buffer) {
     return { name, url: URL.createObjectURL(blob), size: blob.size };
 }
 function entryOutputName(entry, pages, fmt) {
-    const ext = fmt === 0 ? "pdf" : pages <= 1 ? "svg" : "zip";
+    const ext = fmt === 0 ? "pdf" : fmt === 2 ? "goodnotes" : fmt === 3 ? "ntb" : pages <= 1 ? "svg" : "zip";
     const base = entry.sub ? `${entry.sub}/${entry.stem}` : entry.stem;
     return `${base}.${ext}`;
 }
@@ -308,7 +308,7 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
         const p = label ? `${label} — ` : "";
         const phaseLabel = {
             0: `${p}decoding pages`,
-            1: fmt === 0 ? `${p}writing PDF` : `${p}writing SVGs`,
+            1: fmt === 0 ? `${p}writing PDF` : fmt === 2 ? `${p}writing GoodNotes` : fmt === 3 ? `${p}writing Notability` : `${p}writing SVGs`,
         };
         show(phaseLabel[0]);
         onWorkerProgress = (m) => set(phaseLabel[m.phase ?? 0] ?? "", m.done ?? 0, m.total ?? 0);
@@ -390,7 +390,7 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
             : null;
         const buffer = await convertCurrent("");
         const single = fmt === 1 && pages <= 1;
-        const ext = fmt === 0 ? "pdf" : single ? "svg" : "zip";
+        const ext = fmt === 0 ? "pdf" : fmt === 2 ? "goodnotes" : fmt === 3 ? "ntb" : single ? "svg" : "zip";
         const base = name.replace(/\.(goodnotes|ntb)$/i, "");
         return { files: [fileOf(`${base}.${ext}`, buffer)], thumbs: firstBatch, loadMore };
     }

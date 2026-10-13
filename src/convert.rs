@@ -15,6 +15,8 @@ pub enum Fmt {
     Svg,
     Png,
     Pdf,
+    Goodnotes,
+    Ntb,
 }
 
 impl Fmt {
@@ -23,7 +25,15 @@ impl Fmt {
             Fmt::Svg => "svg",
             Fmt::Png => "png",
             Fmt::Pdf => "pdf",
+            Fmt::Goodnotes => "goodnotes",
+            Fmt::Ntb => "ntb",
         }
+    }
+
+    /// True when this format produces a single notebook file rather than
+    /// per-page artifacts.
+    pub fn is_notebook(self) -> bool {
+        matches!(self, Fmt::Goodnotes | Fmt::Ntb)
     }
 }
 
@@ -46,6 +56,16 @@ pub fn parse_formats(spec: &str) -> Result<Vec<Fmt>> {
                     out.push(Fmt::Pdf)
                 }
             }
+            "goodnotes" => {
+                if !out.contains(&Fmt::Goodnotes) {
+                    out.push(Fmt::Goodnotes)
+                }
+            }
+            "ntb" => {
+                if !out.contains(&Fmt::Ntb) {
+                    out.push(Fmt::Ntb)
+                }
+            }
             "all" => {
                 for f in [Fmt::Svg, Fmt::Png, Fmt::Pdf] {
                     if !out.contains(&f) {
@@ -53,7 +73,9 @@ pub fn parse_formats(spec: &str) -> Result<Vec<Fmt>> {
                     }
                 }
             }
-            other => bail!("unknown format {other:?} (expected svg, png, pdf or all)"),
+            other => {
+                bail!("unknown format {other:?} (expected svg, png, pdf, goodnotes, ntb or all)")
+            }
         }
     }
     if out.is_empty() {
@@ -68,7 +90,8 @@ pub fn is_goodnotes(path: &Path) -> bool {
 }
 
 pub fn is_ntb(path: &Path) -> bool {
-    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("ntb"))
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("ntb"))
 }
 
 pub fn is_zip(path: &Path) -> bool {
@@ -298,6 +321,14 @@ pub fn plan_jobs(files: &[InputFile], formats: &[Fmt], output: &Option<PathBuf>)
                         let p = uniquify(base.join(format!("{stem}.pdf")), &mut used);
                         targets.push((Fmt::Pdf, p));
                     }
+                    Fmt::Goodnotes => {
+                        let p = uniquify(base.join(format!("{stem}.goodnotes")), &mut used);
+                        targets.push((Fmt::Goodnotes, p));
+                    }
+                    Fmt::Ntb => {
+                        let p = uniquify(base.join(format!("{stem}.ntb")), &mut used);
+                        targets.push((Fmt::Ntb, p));
+                    }
                     Fmt::Svg | Fmt::Png => {
                         let dir = dir_path
                             .get_or_insert_with(|| uniquify(base.join(stem.clone()), &mut used));
@@ -520,11 +551,7 @@ pub fn convert_job_sink(
 
     // Load pages + document, dispatching on file type. For zip-archive
     // members the extension lives on the member name, not the outer zip.
-    let effective = job
-        .member
-        .as_deref()
-        .map(Path::new)
-        .unwrap_or(&job.file);
+    let effective = job.member.as_deref().map(Path::new).unwrap_or(&job.file);
     let (doc, pages) = if is_ntb(effective) {
         load_ntb_pages(job)?
     } else {
@@ -591,6 +618,18 @@ pub fn convert_job_sink(
                     })
                     .collect::<Result<Vec<_>>>()?;
                 written += pages.len();
+            }
+            Fmt::Goodnotes => {
+                let bytes = crate::goodnotes_write::write_goodnotes_to_vec(&pages, &doc)?;
+                sink.write(&job.root, path, bytes)?;
+                crate::vlog!(1, "{label}: wrote {}", path.display());
+                written += 1;
+            }
+            Fmt::Ntb => {
+                let bytes = crate::ntb_write::write_ntb_to_vec(&pages, &doc)?;
+                sink.write(&job.root, path, bytes)?;
+                crate::vlog!(1, "{label}: wrote {}", path.display());
+                written += 1;
             }
         }
     }
@@ -714,8 +753,8 @@ fn load_ntb_pages(job: &Job) -> Result<(Document, Vec<Page>)> {
 /// Parse an `.ntb` from in-memory bytes (for zip-archive members).
 fn parse_ntb_bytes(bytes: &[u8]) -> Result<crate::ntb::NtbDocument> {
     use std::io::Read as _;
-    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec()))
-        .context("ntb zip open")?;
+    let mut z =
+        zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).context("ntb zip open")?;
     let mut manifest = Vec::new();
     if let Ok(mut f) = z.by_name("manifest.json") {
         f.read_to_end(&mut manifest)?;

@@ -146,11 +146,12 @@ async function convert() {
 
   try {
     const bytes = preloadedBytes ? await preloadedBytes : null
+    const fmtCode = { pdf: 0, svg: 1, goodnotes: 2, ntb: 3 }[outputFormat] ?? 0
     const { files, thumbs, loadMore } = await convertFile(
       selectedFile.name,
       selectedFile,
       bytes,
-      outputFormat === "pdf" ? 0 : 1,
+      fmtCode,
       outputPackaging === "zip",
       progress,
     )
