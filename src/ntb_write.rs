@@ -576,42 +576,73 @@ fn build_note_bundle(pages: &[Page], doc: &Document) -> Vec<u8> {
         let _ = page_idx;
     }
 
-    // Ops vector.
-    let ops_vec = fb.write_uoffset_vector(&op_positions);
-
     // Root table with all required fields.
     // f0: 16-byte note GUID (inline).
     let note_guid: [u8; 16] = [
         0xb7, 0xaf, 0xff, 0x54, 0xb0, 0xce, 0xb0, 0x85, 0x10, 0x41, 0x94, 0xc5, 0x81, 0xb7, 0x1b,
         0x23,
     ];
-    // f3: device UUID (uppercase string).
-    let device_uuid_upper = write_string(&mut fb, "798E2A39-80A9-4BBE-B95C-B205F461CDB1");
-    // f5: device UUID (lowercase string).
-    let device_uuid_lower = write_string(&mut fb, "798e2a39-80a9-4bbe-b95c-b205f461cdb1");
     // f4: timestamp (u64 ms epoch).
     let timestamp_ms: u64 = 1789453933593; // Matches sample files.
 
+    // Write root table FIRST with placeholder uoffsets (0 = absent), then
+    // write the referenced data AFTER the table so uoffsets point forward
+    // (matching the layout real Notability files use).
     let root = fb.write_table(&[
         (ROOT_F0_NOTE_GUID, FieldVal::Inline(note_guid.to_vec())),
-        (
-            ROOT_F3_DEVICE_UUID_UPPER,
-            FieldVal::Uoffset(device_uuid_upper),
-        ),
+        // Placeholder uoffsets — will be patched after data is written.
+        (ROOT_F3_DEVICE_UUID_UPPER, FieldVal::Inline(vec![0; 4])),
         (
             ROOT_F4_TIMESTAMP,
             FieldVal::Inline(timestamp_ms.to_le_bytes().to_vec()),
         ),
-        (
-            ROOT_F5_DEVICE_UUID_LOWER,
-            FieldVal::Uoffset(device_uuid_lower),
-        ),
-        (ROOT_F6_OPS, FieldVal::Uoffset(ops_vec)),
+        (ROOT_F5_DEVICE_UUID_LOWER, FieldVal::Inline(vec![0; 4])),
+        (ROOT_F6_OPS, FieldVal::Inline(vec![0; 4])),
         (
             ROOT_F7_VERSION,
             FieldVal::Inline(NTB_VERSION.to_le_bytes().to_vec()),
         ),
     ]);
+
+    // Now write the referenced data AFTER the table.
+    let device_uuid_upper = write_string(&mut fb, "798E2A39-80A9-4BBE-B95C-B205F461CDB1");
+    let device_uuid_lower = write_string(&mut fb, "798e2a39-80a9-4bbe-b95c-b205f461cdb1");
+    let ops_vec = fb.write_uoffset_vector(&op_positions);
+
+    // Patch the placeholder uoffsets to point forward to the data.
+    // f3 field position = root + f3_off; uoffset = data_pos - field_pos.
+    // We need to find the field positions from the vtable.
+    let root_soff = i32::from_le_bytes(fb.buf[root..root + 4].try_into().unwrap());
+    let vtable_pos = (root as i32 - root_soff) as usize;
+    let vsize = u16::from_le_bytes(fb.buf[vtable_pos..vtable_pos + 2].try_into().unwrap());
+    let nfields = ((vsize - 4) / 2) as usize;
+    let mut field_offs = vec![0u16; nfields];
+    for (i, off) in field_offs.iter_mut().enumerate() {
+        *off = u16::from_le_bytes(
+            fb.buf[vtable_pos + 4 + 2 * i..vtable_pos + 6 + 2 * i]
+                .try_into()
+                .unwrap(),
+        );
+    }
+
+    // Patch f3 (device UUID upper).
+    if field_offs[ROOT_F3_DEVICE_UUID_UPPER] > 0 {
+        let field_pos = root + field_offs[ROOT_F3_DEVICE_UUID_UPPER] as usize;
+        let uoff = (device_uuid_upper as i64 - field_pos as i64) as u32;
+        fb.buf[field_pos..field_pos + 4].copy_from_slice(&uoff.to_le_bytes());
+    }
+    // Patch f5 (device UUID lower).
+    if field_offs[ROOT_F5_DEVICE_UUID_LOWER] > 0 {
+        let field_pos = root + field_offs[ROOT_F5_DEVICE_UUID_LOWER] as usize;
+        let uoff = (device_uuid_lower as i64 - field_pos as i64) as u32;
+        fb.buf[field_pos..field_pos + 4].copy_from_slice(&uoff.to_le_bytes());
+    }
+    // Patch f6 (ops vector).
+    if field_offs[ROOT_F6_OPS] > 0 {
+        let field_pos = root + field_offs[ROOT_F6_OPS] as usize;
+        let uoff = (ops_vec as i64 - field_pos as i64) as u32;
+        fb.buf[field_pos..field_pos + 4].copy_from_slice(&uoff.to_le_bytes());
+    }
 
     fb.finish(root)
 }
