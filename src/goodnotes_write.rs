@@ -492,13 +492,15 @@ pub fn write_goodnotes(pages: &[Page], doc: &Document, mut w: impl Write) -> Res
     let att_keys = used_attachments(pages);
     let mut index_atts = Vec::new();
     let mut att_uuids: Vec<String> = Vec::new();
+    let mut att_file_map: Vec<(String, String)> = Vec::new(); // (key, uuid_filename)
     for key in &att_keys {
         let att_uuid = ids.uuid();
         let mut rec = Vec::new();
         write_bytes_field(&mut rec, 1, att_uuid.as_bytes());
-        write_bytes_field(&mut rec, 2, format!("attachments/{key}").as_bytes());
+        write_bytes_field(&mut rec, 2, format!("attachments/{att_uuid}").as_bytes());
         write_record(&mut index_atts, &rec);
-        att_uuids.push(att_uuid);
+        att_uuids.push(att_uuid.clone());
+        att_file_map.push((key.clone(), att_uuid));
     }
 
     let events = build_events(pages, doc, &mut ids);
@@ -549,9 +551,9 @@ pub fn write_goodnotes(pages: &[Page], doc: &Document, mut w: impl Write) -> Res
         zip.write_all(blob)?;
     }
 
-    for key in &att_keys {
+    for (key, att_uuid) in &att_file_map {
         if let Some(bytes) = doc.attachments.get(key) {
-            zip.start_file(format!("attachments/{key}"), opts)?;
+            zip.start_file(format!("attachments/{att_uuid}"), opts)?;
             zip.write_all(bytes)?;
         }
     }

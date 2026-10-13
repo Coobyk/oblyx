@@ -4960,6 +4960,7 @@ dependencies = [
  "png 0.18.1",
  "rayon",
  "rfd",
+ "sha2 0.10.9",
  "tiny-skia 0.12.0",
  "zip",
 ]

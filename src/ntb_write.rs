@@ -14,6 +14,7 @@
 use std::io::Write;
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha512};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
@@ -621,33 +622,13 @@ fn chrono_like_timestamp() -> String {
     "Sep 15, 2026".to_string()
 }
 
-/// Compute a 64-byte content hash (SHA-256 double-round for a 64-byte output).
+/// Compute a 64-byte content hash (SHA-512).
 ///
-/// Notability uses a 64-byte hash of the asset content. We use SHA-256 of
-/// the bytes, then SHA-256 of that, and concatenate — producing 64 bytes.
-/// (The exact hash algorithm is not critical for round-tripping within
-/// oblyx; it only needs to be a stable content address.)
+/// Notability uses SHA-512 of the asset content as the filename.
 fn compute_hash(data: &[u8]) -> [u8; 64] {
-    // Simple FNV-1a-based 64-byte hash (not cryptographic, but stable).
-    // For production we'd use a real 64-byte hash, but this keeps the
-    // dependency footprint zero and the hash is only used as a zip member
-    // name / page UUID tag.
-    let mut h = [0u8; 64];
-    // Seed with a simple pattern.
-    for (i, b) in h.iter_mut().enumerate() {
-        *b = (i as u8).wrapping_mul(31).wrapping_add(17);
-    }
-    for &byte in data {
-        for chunk in h.chunks_mut(8) {
-            let mut acc = u64::from_le_bytes(chunk.try_into().unwrap());
-            acc = acc
-                .wrapping_mul(0x100000001B3)
-                .wrapping_add(byte as u64)
-                .wrapping_add(acc >> 33);
-            chunk.copy_from_slice(&acc.to_le_bytes());
-        }
-    }
-    h
+    let mut hasher = Sha512::new();
+    hasher.update(data);
+    hasher.finalize().into()
 }
 
 /// Write a `.ntb` archive to `w`.
