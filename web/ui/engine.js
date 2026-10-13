@@ -287,20 +287,20 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
             }
         }
     }
-    const THUMB_MAX_PAGES = 3;
-    async function renderThumbnails(pages, prefix) {
-        if (!pages)
+    const THUMB_BATCH = 10;
+    async function renderThumbBatch(startIndex, count, pages, prefix) {
+        if (!pages || startIndex >= pages)
             return [];
-        const count = Math.min(pages, THUMB_MAX_PAGES);
+        const end = Math.min(startIndex + count, pages);
         const p = prefix ? `${prefix} — ` : "";
         const thumbs = [];
-        for (let i = 0; i < count; i++) {
+        for (let i = startIndex; i < end; i++) {
             const imgP = expect("page_image");
             worker.postMessage({ type: "render_page", index: i });
             const { buffer } = await imgP;
             const blob = new Blob([buffer], { type: "image/jpeg" });
             thumbs.push({ url: URL.createObjectURL(blob), label: `Page ${i + 1}` });
-            set(prefix ? `${p}previewing page ${i + 1}/${count}` : `Previewing page ${i + 1}/${count}`, i + 1, count);
+            set(prefix ? `${p}previewing page ${i + 1}/${pages}` : `Previewing page ${i + 1}/${pages}`, i - startIndex + 1, end - startIndex);
         }
         return thumbs;
     }
@@ -342,7 +342,7 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
                     worker.postMessage({ type: "open_member", buffer: buf }, [buf]);
                     const memberMeta = await openedP;
                     await renderRasters(memberMeta, label);
-                    const entryThumbs = await renderThumbnails(memberMeta.pages, label);
+                    const entryThumbs = await renderThumbBatch(0, THUMB_BATCH, memberMeta.pages, label);
                     for (const t of entryThumbs)
                         thumbs.push({ ...t, label: `${label} — ${t.label}` });
                     await convertCurrent(label);
@@ -353,7 +353,7 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
                     worker.postMessage({ type: "open", buffer: buf }, [buf]);
                     const meta = await openedP;
                     await renderRasters(meta, label);
-                    const entryThumbs = await renderThumbnails(meta.pages, label);
+                    const entryThumbs = await renderThumbBatch(0, THUMB_BATCH, meta.pages, label);
                     for (const t of entryThumbs)
                         thumbs.push({ ...t, label: `${label} — ${t.label}` });
                     const buffer = await convertCurrent(label);
@@ -367,9 +367,9 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
                 const { buffer } = await packP;
                 set("Packing archive…", 1, 1);
                 const outName = `${name.replace(/\.zip$/i, "")}-converted.zip`;
-                return { files: [fileOf(outName, buffer)], thumbs };
+                return { files: [fileOf(outName, buffer)], thumbs, loadMore: null };
             }
-            return { files: results, thumbs };
+            return { files: results, thumbs, loadMore: null };
         }
         show("Opening notebook…");
         const bytes = preloaded ?? (await blob.arrayBuffer());
@@ -378,13 +378,21 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
         worker.postMessage({ type: "open", buffer: buf }, [buf]);
         const meta = await openedP;
         await renderRasters(meta, "");
-        const thumbs = await renderThumbnails(meta.pages, "");
-        const buffer = await convertCurrent("");
         const pages = meta.pages ?? 1;
+        const firstBatch = await renderThumbBatch(0, THUMB_BATCH, pages, "");
+        let nextThumb = firstBatch.length;
+        const loadMore = nextThumb < pages
+            ? async () => {
+                const batch = await renderThumbBatch(nextThumb, THUMB_BATCH, pages, "");
+                nextThumb += batch.length;
+                return batch;
+            }
+            : null;
+        const buffer = await convertCurrent("");
         const single = fmt === 1 && pages <= 1;
         const ext = fmt === 0 ? "pdf" : single ? "svg" : "zip";
         const base = name.replace(/\.(goodnotes|ntb)$/i, "");
-        return { files: [fileOf(`${base}.${ext}`, buffer)], thumbs };
+        return { files: [fileOf(`${base}.${ext}`, buffer)], thumbs: firstBatch, loadMore };
     }
     catch (err) {
         onWorkerProgress = null;

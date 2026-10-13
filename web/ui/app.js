@@ -24,6 +24,8 @@ let selectedFile = null
 let preloadedBytes = null
 let outputFiles = []
 let outputThumbs = []
+let loadMoreThumbs = null
+let loadingMore = false
 let busy = false
 let outputFormat = "pdf"
 let outputPackaging = "zip"
@@ -41,11 +43,27 @@ function clearOutputs() {
   for (const thumb of outputThumbs) URL.revokeObjectURL(thumb.url)
   outputFiles = []
   outputThumbs = []
+  loadMoreThumbs = null
   results.replaceChildren()
   results.hidden = true
   if (thumbsEl) {
     thumbsEl.replaceChildren()
     thumbsEl.hidden = true
+  }
+}
+
+function appendThumbs(thumbs) {
+  for (const thumb of thumbs) {
+    const img = document.createElement("img")
+    img.src = thumb.url
+    img.alt = thumb.label
+    img.loading = "lazy"
+    const cap = document.createElement("figcaption")
+    cap.textContent = thumb.label
+    const cell = document.createElement("figure")
+    cell.className = "thumb"
+    cell.append(img, cap)
+    thumbsEl.append(cell)
   }
 }
 
@@ -128,7 +146,7 @@ async function convert() {
 
   try {
     const bytes = preloadedBytes ? await preloadedBytes : null
-    const { files, thumbs } = await convertFile(
+    const { files, thumbs, loadMore } = await convertFile(
       selectedFile.name,
       selectedFile,
       bytes,
@@ -138,21 +156,11 @@ async function convert() {
     )
     outputFiles = files
     outputThumbs = thumbs
+    loadMoreThumbs = loadMore
 
     if (thumbsEl && thumbs.length) {
       thumbsEl.replaceChildren()
-      for (const thumb of thumbs) {
-        const img = document.createElement("img")
-        img.src = thumb.url
-        img.alt = thumb.label
-        img.loading = "lazy"
-        const cap = document.createElement("figcaption")
-        cap.textContent = thumb.label
-        const cell = document.createElement("figure")
-        cell.className = "thumb"
-        cell.append(img, cap)
-        thumbsEl.append(cell)
-      }
+      appendThumbs(thumbs)
       thumbsEl.hidden = false
     }
 
@@ -220,6 +228,21 @@ dropzone.addEventListener("keydown", (event) => {
     event.preventDefault()
     input.click()
   }
+})
+
+thumbsEl?.addEventListener("scroll", () => {
+  if (!loadMoreThumbs || loadingMore || busy) return
+  const { scrollLeft, scrollWidth, clientWidth } = thumbsEl
+  if (scrollLeft + clientWidth < scrollWidth - 80) return
+  loadingMore = true
+  loadMoreThumbs().then((batch) => {
+    if (batch.length) appendThumbs(batch)
+    else loadMoreThumbs = null
+  }).catch(() => {
+    loadMoreThumbs = null
+  }).finally(() => {
+    loadingMore = false
+  })
 })
 
 if ("requestIdleCallback" in window) {
