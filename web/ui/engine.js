@@ -263,7 +263,7 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
         const p = label ? `${label} — ` : "";
         const phaseLabel = {
             0: `${p}decoding pages`,
-            1: fmt === 0 ? `${p}writing PDF` : fmt === 2 ? `${p}writing GoodNotes` : fmt === 3 ? `${p}writing Notability` : `${p}writing SVGs`,
+            1: fmt === 0 ? `${p}writing PDF` : fmt === 2 ? `${p}writing Goodnotes` : fmt === 3 ? `${p}writing Notability` : `${p}writing SVGs`,
         };
         show(phaseLabel[0]);
         onWorkerProgress = (m) => set(phaseLabel[m.phase ?? 0] ?? "", m.done ?? 0, m.total ?? 0);

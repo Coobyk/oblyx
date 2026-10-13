@@ -93,6 +93,11 @@ function reset() {
   outputPackaging = "zip"
   selectOption(formatOptions, outputFormat)
   selectOption(packageOptions, outputPackaging)
+  // Show all format options again
+  const gnButton = formatOptions.querySelector('[data-value="goodnotes"]')
+  const ntbButton = formatOptions.querySelector('[data-value="ntb"]')
+  if (gnButton) gnButton.hidden = false
+  if (ntbButton) ntbButton.hidden = false
   fileRow.hidden = true
   options.hidden = true
   packageOption.hidden = true
@@ -109,7 +114,9 @@ function reset() {
 function selectFile(file) {
   if (!file) return
   const isZip = /\.zip$/i.test(file.name)
-  if (!isZip && !/\.goodnotes$/i.test(file.name) && !/\.ntb$/i.test(file.name)) {
+  const isGoodnotes = /\.goodnotes$/i.test(file.name)
+  const isNtb = /\.ntb$/i.test(file.name)
+  if (!isZip && !isGoodnotes && !isNtb) {
     showError("Choose a .goodnotes, .ntb file, or .zip archive.")
     return
   }
@@ -118,12 +125,25 @@ function selectFile(file) {
   showError()
   selectedFile = file
   fileName.textContent = file.name
-  const kind = isZip ? "ZIP archive" : file.name.endsWith(".ntb") ? "Notability notebook" : "Goodnotes notebook"
+  const kind = isZip ? "ZIP archive" : isNtb ? "Notability notebook" : "Goodnotes notebook"
   fileSize.textContent = `${formatSize(file.size)} · ${kind}`
   dropzone.hidden = true
   fileRow.hidden = false
   options.hidden = false
   packageOption.hidden = !isZip
+
+  // Hide same-format options (no point converting to same format)
+  const gnButton = formatOptions.querySelector('[data-value="goodnotes"]')
+  const ntbButton = formatOptions.querySelector('[data-value="ntb"]')
+  if (gnButton) gnButton.hidden = isGoodnotes
+  if (ntbButton) ntbButton.hidden = isNtb
+
+  // Reset format if current selection is hidden
+  if ((isGoodnotes && outputFormat === "goodnotes") || (isNtb && outputFormat === "ntb")) {
+    outputFormat = "pdf"
+    selectOption(formatOptions, outputFormat)
+  }
+
   progressArea.hidden = true
   convertButton.hidden = false
   input.value = ""
