@@ -288,21 +288,6 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
         }
     }
     const THUMB_MAX_PAGES = 3;
-    const THUMB_MAX_WIDTH = 400;
-    async function downscaleJpeg(buffer, maxWidth) {
-        const blob = new Blob([buffer], { type: "image/jpeg" });
-        const bitmap = await createImageBitmap(blob);
-        const scale = Math.min(1, maxWidth / bitmap.width);
-        const w = Math.max(1, Math.round(bitmap.width * scale));
-        const h = Math.max(1, Math.round(bitmap.height * scale));
-        const canvas = document.createElement("canvas");
-        canvas.width = w;
-        canvas.height = h;
-        canvas.getContext("2d").drawImage(bitmap, 0, 0, w, h);
-        bitmap.close();
-        return new Uint8Array(await new Promise((res, rej) =>
-            canvas.toBlob((b) => (b ? b.arrayBuffer().then(res) : rej(new Error("JPEG encode failed"))), "image/jpeg", 0.75)));
-    }
     async function renderThumbnails(pages, prefix) {
         if (!pages)
             return [];
@@ -313,8 +298,7 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
             const imgP = expect("page_image");
             worker.postMessage({ type: "render_page", index: i });
             const { buffer } = await imgP;
-            const small = await downscaleJpeg(buffer, THUMB_MAX_WIDTH);
-            const blob = new Blob([small], { type: "image/jpeg" });
+            const blob = new Blob([buffer], { type: "image/jpeg" });
             thumbs.push({ url: URL.createObjectURL(blob), label: `Page ${i + 1}` });
             set(prefix ? `${p}previewing page ${i + 1}/${count}` : `Previewing page ${i + 1}/${count}`, i + 1, count);
         }
