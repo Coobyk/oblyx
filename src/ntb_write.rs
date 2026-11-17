@@ -823,15 +823,20 @@ pub fn write_ntb(pages: &[Page], doc: &Document, mut w: impl Write) -> Result<()
     zip.start_file("thumbnail.png", opts)?;
     zip.write_all(&generate_thumbnail(pages, doc))?;
 
-    // Assets: copy any PDF attachments referenced by page configs.
+    // Assets: copy any PDF attachments referenced by page configs. Entries are
+    // named by content hash, so deduplicate by that name rather than by the
+    // attachment UUID: a GoodNotes export can use several UUIDs for the very
+    // same PDF bytes, which would otherwise produce duplicate zip entries.
     let mut written_assets = std::collections::HashSet::new();
     for page in pages {
         if let Some(cfg) = doc.page_cfg().get(&page.uuid)
             && let Some(bytes) = doc.attachments.get(&cfg.attachment)
-            && written_assets.insert(cfg.attachment.clone())
         {
             let hash = compute_hash(bytes);
             let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+            if !written_assets.insert(hex.clone()) {
+                continue;
+            }
             zip.start_file(format!("assets/{hex}.pdf"), opts)?;
             zip.write_all(bytes)?;
         }
@@ -921,6 +926,42 @@ mod tests {
         let mut z = zip::ZipArchive::new(std::io::Cursor::new(out)).unwrap();
         assert!(z.by_name("noteBundle").is_ok());
         assert!(z.by_name("manifest.json").is_ok());
+    }
+
+    #[test]
+    fn identical_asset_contents_are_deduplicated_by_hash() {
+        // A GoodNotes export can bind different page configs to distinct
+        // attachment UUIDs that contain the same PDF bytes. The .ntb archive
+        // names assets by content hash, so both would map to one zip entry.
+        let mut doc = Document::empty();
+        let pdf = b"%PDF-1.4 identical content".to_vec();
+        doc.insert_attachment("att-a", pdf.clone());
+        doc.insert_attachment("att-b", pdf);
+        doc.set_page_cfg("p0", "att-a".into(), None);
+        doc.set_page_cfg("p1", "att-b".into(), None);
+        let pages = vec![
+            Page {
+                uuid: "p0".into(),
+                items: vec![],
+                width: 595.28,
+                height: 841.89,
+            },
+            Page {
+                uuid: "p1".into(),
+                items: vec![],
+                width: 595.28,
+                height: 841.89,
+            },
+        ];
+
+        let mut out = Vec::new();
+        write_ntb(&pages, &doc, &mut out).unwrap();
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(out)).unwrap();
+        let assets: Vec<String> = (0..z.len())
+            .filter_map(|i| z.by_index(i).ok().map(|e| e.name().to_string()))
+            .filter(|name| name.starts_with("assets/"))
+            .collect();
+        assert_eq!(assets.len(), 1, "expected one asset for identical bytes");
     }
 
     #[test]
