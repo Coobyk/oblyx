@@ -28,4 +28,8 @@ package() {
   cd "oblyx-$pkgver"
   install -Dm755 "target/release/oblyx-gui" "$pkgdir/usr/bin/oblyx-gui"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "assets/oblyx-gui.desktop" \
+      "$pkgdir/usr/share/applications/oblyx-gui.desktop"
+  install -Dm644 "assets/oblyx.svg" \
+      "$pkgdir/usr/share/icons/hicolor/scalable/apps/oblyx.svg"
 }

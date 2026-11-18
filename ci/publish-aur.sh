@@ -11,10 +11,15 @@ tag="$1"
 ver="${tag#v}"
 repo_root="ssh://aur@aur.archlinux.org"
 
-src_url() {
+src_urls() {
   case "$1" in
-    oblyx-bin | oblyx-gui-bin)
+    oblyx-bin)
       echo "https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/oblyx-${ver}-linux-x64.tar.gz"
+      ;;
+    oblyx-gui-bin)
+      echo "https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/oblyx-${ver}-linux-x64.tar.gz"
+      echo "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${tag}/assets/oblyx-gui.desktop"
+      echo "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${tag}/assets/oblyx.svg"
       ;;
     *)
       echo "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${tag}.tar.gz"
@@ -24,13 +29,18 @@ src_url() {
 
 for pkg in oblyx oblyx-bin oblyx-gui oblyx-gui-bin; do
   work="$(mktemp -d)"
-  url="$(src_url "$pkg")"
 
-  echo "==> $pkg: fetch $url"
-  curl -fsSL "$url" -o "$work/source.tar.gz"
-  sha256="$(sha256sum "$work/source.tar.gz" | awk '{print $1}')"
+  # Fetch every source[] entry and build the sha256sums list in order.
+  sums=""
+  i=0
+  while IFS= read -r url; do
+    i=$((i + 1))
+    echo "==> $pkg: fetch $url"
+    curl -fsSL "$url" -o "$work/source.$i"
+    sums+=" '$(sha256sum "$work/source.$i" | awk '{print $1}')'"
+  done < <(src_urls "$pkg")
 
-  sed -e "s/@PKGVER@/${ver}/g" -e "s/@SHA256@/${sha256}/g" \
+  sed -e "s/@PKGVER@/${ver}/g" -e "s/@SHA256@/${sums# }/g" \
       "aur/${pkg}/PKGBUILD" > "$work/PKGBUILD"
   chmod -R a+rwX "$work"
 

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Oblyx
+GenericName=Notebook Converter
+Comment=Convert GoodNotes notebooks to SVG, PDF, PNG, and Notability .ntb
+Exec=oblyx-gui %F
+Icon=oblyx
+Terminal=false
+Categories=Utility;Office;Graphics;
+Keywords=goodnotes;notability;convert;converter;notebook;svg;pdf;
+StartupNotify=true
+StartupWMClass=oblyx-gui
