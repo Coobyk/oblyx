@@ -103,7 +103,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: desktop-${{ matrix.target }}
-          cache-targets: false
+          cache-targets: true
 
       - name: Build CLI
         run: cargo build --release --target ${{ matrix.target }} --bin oblyx
@@ -168,7 +168,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "lts/*"
           cache: npm
           cache-dependency-path: web/ui/package-lock.json
 
@@ -176,7 +176,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: pages-wasm
-          cache-targets: false
+          cache-targets: true
 
       - name: Build WASM + UI
         run: |
@@ -236,10 +236,14 @@ jobs:
       - name: Set up AUR SSH
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          # OpenSSH resolves ~/.ssh from the passwd entry, not $HOME — in
+          # container jobs HOME=/github/home but root's home is /root, so
+          # writing to ~/.ssh would leave ssh unable to find the key.
+          ssh_dir="$(getent passwd "$(id -un)" | cut -d: -f6)/.ssh"
+          mkdir -p "$ssh_dir" && chmod 700 "$ssh_dir"
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh-keyscan -H aur.archlinux.org >> "$ssh_dir/known_hosts" 2>/dev/null
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
