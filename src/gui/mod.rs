@@ -42,6 +42,7 @@ enum Status {
     Ready,
     Running {
         preparing: bool,
+        phase: Option<&'static str>,
         done: usize,
         total: usize,
     },
@@ -492,6 +493,7 @@ impl ConverterView {
                 if let Some(entry) = self.entries.get_mut(index) {
                     entry.status = Status::Running {
                         preparing: true,
+                        phase: None,
                         done: 0,
                         total: 0,
                     };
@@ -501,6 +503,7 @@ impl ConverterView {
                 if let Some(entry) = self.entries.get_mut(index)
                     && let Status::Running {
                         preparing,
+                        phase,
                         done,
                         total,
                     } = &mut entry.status
@@ -508,13 +511,19 @@ impl ConverterView {
                     match update {
                         JobProgress::Decode { done: d, total: t } => {
                             *preparing = true;
+                            *phase = None;
                             *done = d;
                             *total = t;
                         }
                         JobProgress::Render { done: d, total: t } => {
                             *preparing = false;
+                            *phase = None;
                             *done = d;
                             *total = t;
+                        }
+                        JobProgress::Writing(label) => {
+                            *preparing = false;
+                            *phase = Some(label);
                         }
                     }
                 }
@@ -886,6 +895,7 @@ impl ConverterView {
             ),
             Status::Running {
                 preparing,
+                phase,
                 done,
                 total,
             } => (
@@ -893,7 +903,9 @@ impl ConverterView {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(if *total == 0 {
+                    .child(if let Some(label) = phase {
+                        (*label).to_string()
+                    } else if *total == 0 {
                         "Converting…".to_string()
                     } else if *preparing {
                         format!("preparing {done}/{total}")

@@ -387,6 +387,9 @@ pub enum JobProgress {
     Decode { done: usize, total: usize },
     /// Pages rendered so far (writing phase, one range per target format).
     Render { done: usize, total: usize },
+    /// A whole-notebook format (Goodnotes/NTB) is being serialised; it has no
+    /// per-page render events of its own.
+    Writing(&'static str),
 }
 
 /// Where converted bytes go. `FolderSink` writes a directory tree;
@@ -620,12 +623,14 @@ pub fn convert_job_sink(
                 written += pages.len();
             }
             Fmt::Goodnotes => {
+                progress(JobProgress::Writing("Writing Goodnotes notebook…"));
                 let bytes = crate::goodnotes_write::write_goodnotes_to_vec(&pages, &doc)?;
                 sink.write(&job.root, path, bytes)?;
                 crate::vlog!(1, "{label}: wrote {}", path.display());
                 written += 1;
             }
             Fmt::Ntb => {
+                progress(JobProgress::Writing("Writing Notability notebook…"));
                 let bytes = crate::ntb_write::write_ntb_to_vec(&pages, &doc)?;
                 sink.write(&job.root, path, bytes)?;
                 crate::vlog!(1, "{label}: wrote {}", path.display());
