@@ -86,6 +86,7 @@ jobs:
           fi
           cp "target/${{ matrix.target }}/release/oblyx${ext}" "$staging/"
           cp "target/${{ matrix.target }}/release/oblyx-gui${ext}" "$staging/"
+          cp LICENSE "$staging/" 2>/dev/null || true
           if command -v strip >/dev/null 2>&1 && [[ "${{ runner.os }}" != "Windows" ]]; then
             strip "$staging/oblyx${ext}" "$staging/oblyx-gui${ext}" || true
           fi
@@ -175,3 +176,35 @@ jobs:
           files: dist/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+  aur:
+    name: publish to AUR
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    permissions:
+      contents: read
+    env:
+      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+    steps:
+      - name: Install tools
+        run: pacman -Syu --noconfirm --needed git openssh base-devel curl
+
+      - uses: actions/checkout@v4
+
+      - name: Set up AUR SSH
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Publish oblyx
+        run: ./ci/publish-aur.sh oblyx "$GITHUB_REF_NAME"
+
+      - name: Publish oblyx-bin
+        run: ./ci/publish-aur.sh oblyx-bin "$GITHUB_REF_NAME"
