@@ -86,6 +86,8 @@ pub struct ConverterView {
     fmt_svg: bool,
     fmt_png: bool,
     fmt_pdf: bool,
+    fmt_goodnotes: bool,
+    fmt_ntb: bool,
     output_mode: usize,
     output_dir: Entity<InputState>,
     dpi: Entity<InputState>,
@@ -115,6 +117,8 @@ impl ConverterView {
             fmt_svg: true,
             fmt_png: false,
             fmt_pdf: false,
+            fmt_goodnotes: false,
+            fmt_ntb: false,
             output_mode: 0,
             output_dir,
             dpi,
@@ -264,6 +268,12 @@ impl ConverterView {
         if self.fmt_pdf {
             formats.push(Fmt::Pdf);
         }
+        if self.fmt_goodnotes {
+            formats.push(Fmt::Goodnotes);
+        }
+        if self.fmt_ntb {
+            formats.push(Fmt::Ntb);
+        }
         formats
     }
 
@@ -367,7 +377,7 @@ impl ConverterView {
                 Self::toast(
                     window,
                     cx,
-                    "Add .goodnotes files or a zip archive to convert.",
+                    "Add .goodnotes/.ntb files or a zip archive to convert.",
                 );
                 return;
             }
@@ -741,7 +751,8 @@ impl ConverterView {
         let archive_out = self.output_mode == 2;
 
         let formats = h_flex()
-            .gap_5()
+            .flex_wrap()
+            .gap_3()
             .child(
                 Checkbox::new("fmt-svg")
                     .label("SVG")
@@ -766,6 +777,24 @@ impl ConverterView {
                     .checked(self.fmt_pdf)
                     .on_change(cx.listener(|view, value, _, cx| {
                         view.fmt_pdf = *value;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Checkbox::new("fmt-goodnotes")
+                    .label("Goodnotes")
+                    .checked(self.fmt_goodnotes)
+                    .on_change(cx.listener(|view, value, _, cx| {
+                        view.fmt_goodnotes = *value;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Checkbox::new("fmt-ntb")
+                    .label("Notability")
+                    .checked(self.fmt_ntb)
+                    .on_change(cx.listener(|view, value, _, cx| {
+                        view.fmt_ntb = *value;
                         cx.notify();
                     })),
             );
@@ -1050,7 +1079,7 @@ impl ConverterView {
             div()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child("Add .goodnotes files or a zip archive to begin")
+                .child("Add .goodnotes/.ntb files or a zip archive to begin")
                 .into_any_element()
         } else {
             div()
@@ -1167,7 +1196,9 @@ impl Render for ConverterView {
                                 div()
                                     .text_sm()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("Convert GoodNotes notebooks to SVG, PDF and PNG"),
+                                    .child(
+                                        "Convert notebooks to SVG, PNG, PDF, Goodnotes or Notability",
+                                    ),
                             ),
                     )
                     .child(
