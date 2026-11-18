@@ -38,6 +38,12 @@ const ROOT_F7_VERSION: usize = 7; // u32 version
 /// Version observed in real samples: 0x800012.
 const NTB_VERSION: u32 = 0x800012;
 
+/// Notability's Android importer (`NtbImporter`/`ope.c`) refuses any single
+/// zip entry larger than 64 MiB, and its picker (`hb9.d`) refuses `.ntb`
+/// streams larger than 500 MB. Warn when output would hit either limit.
+const MOBILE_MAX_ENTRY: u64 = 64 * 1024 * 1024;
+const MOBILE_MAX_ARCHIVE: u64 = 500 * 1024 * 1024;
+
 // Path element types (non-attributed, to avoid the 6-byte attribute tail).
 const PATH_LINE: u8 = 6;
 const PATH_MOVETO: u8 = 7;
@@ -793,6 +799,12 @@ fn compute_hash(data: &[u8]) -> [u8; 64] {
 /// Write a `.ntb` archive to `w`.
 pub fn write_ntb(pages: &[Page], doc: &Document, mut w: impl Write) -> Result<()> {
     let bundle = build_note_bundle(pages, doc);
+    if bundle.len() as u64 > MOBILE_MAX_ENTRY {
+        eprintln!(
+            "warning: noteBundle is {} MiB; Notability's Android importer rejects entries over 64 MiB",
+            bundle.len() / 1024 / 1024
+        );
+    }
 
     let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -837,13 +849,26 @@ pub fn write_ntb(pages: &[Page], doc: &Document, mut w: impl Write) -> Result<()
             if !written_assets.insert(hex.clone()) {
                 continue;
             }
+            if bytes.len() as u64 > MOBILE_MAX_ENTRY {
+                eprintln!(
+                    "warning: asset {hex}.pdf is {} MiB; Notability's Android importer rejects entries over 64 MiB",
+                    bytes.len() / 1024 / 1024
+                );
+            }
             zip.start_file(format!("assets/{hex}.pdf"), opts)?;
             zip.write_all(bytes)?;
         }
     }
 
     let cursor = zip.finish().context("finish ntb zip")?;
-    w.write_all(&cursor.into_inner())?;
+    let bytes = cursor.into_inner();
+    if bytes.len() as u64 > MOBILE_MAX_ARCHIVE {
+        eprintln!(
+            "warning: .ntb is {} MB; Notability's Android picker rejects files over 500 MB",
+            bytes.len() / 1_000_000
+        );
+    }
+    w.write_all(&bytes)?;
     Ok(())
 }
 
@@ -926,6 +951,37 @@ mod tests {
         let mut z = zip::ZipArchive::new(std::io::Cursor::new(out)).unwrap();
         assert!(z.by_name("noteBundle").is_ok());
         assert!(z.by_name("manifest.json").is_ok());
+    }
+
+    #[test]
+    fn archive_satisfies_mobile_importer_entry_checks() {
+        // Mirrors what Notability's Android NtbImporter checks:
+        // version text == "1", a noteBundle entry, unique names, and the
+        // 64 MiB per-entry / 500 MB whole-file limits.
+        let mut doc = Document::empty();
+        doc.insert_attachment("att", b"%PDF-1.4 mobile limits test".to_vec());
+        doc.set_page_cfg("p0", "att".into(), None);
+        let pages = vec![Page {
+            uuid: "p0".into(),
+            items: vec![],
+            width: 595.28,
+            height: 841.89,
+        }];
+        let mut out = Vec::new();
+        write_ntb(&pages, &doc, &mut out).unwrap();
+
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(&out)).unwrap();
+        assert_eq!(z.by_name("version").unwrap().size(), 1);
+        let mut version = Vec::new();
+        z.by_name("version").unwrap().read_to_end(&mut version).unwrap();
+        assert_eq!(version, b"1");
+        assert!(z.by_name("noteBundle").is_ok());
+        let names: Vec<String> = (0..z.len())
+            .filter_map(|i| z.by_index(i).ok().map(|e| e.name().to_string()))
+            .collect();
+        assert_eq!(names.len(), names.iter().collect::<std::collections::HashSet<_>>().len());
+        assert!(names.iter().all(|n| z.by_name(n).unwrap().size() as u64 <= MOBILE_MAX_ENTRY));
+        assert!(out.len() as u64 <= MOBILE_MAX_ARCHIVE);
     }
 
     #[test]
