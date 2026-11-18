@@ -2,13 +2,14 @@
 pkgname=oblyx
 pkgver=@PKGVER@
 pkgrel=1
-pkgdesc="Convert GoodNotes notebooks to SVG, PDF, PNG, and Notability .ntb"
+pkgdesc="Convert GoodNotes notebooks to SVG, PDF, PNG, and Notability .ntb (CLI)"
 arch=('x86_64')
 url="https://github.com/Coobyk/oblyx"
 license=('MIT')
-depends=('fontconfig' 'libxkbcommon' 'libxkbcommon-x11' 'libxcb' 'libx11' 'wayland' 'vulkan-icd-loader')
-makedepends=('cargo' 'pkgconf')
-optdepends=('poppler: rasterize PDF page backgrounds for SVG/PNG output')
+depends=('gcc-libs')
+makedepends=('cargo')
+optdepends=('poppler: rasterize PDF page backgrounds for SVG/PNG output'
+            'oblyx-gui: graphical interface')
 options=('!lto')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/Coobyk/oblyx/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('@SHA256@')
@@ -21,12 +22,10 @@ prepare() {
 build() {
   cd "$pkgname-$pkgver"
   cargo build --frozen --release --bin oblyx
-  cargo build --frozen --release --features gui --bin oblyx-gui
 }
 
 package() {
   cd "$pkgname-$pkgver"
   install -Dm755 "target/release/oblyx" "$pkgdir/usr/bin/oblyx"
-  install -Dm755 "target/release/oblyx-gui" "$pkgdir/usr/bin/oblyx-gui"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

@@ -1,60 +1,62 @@
 #!/usr/bin/env bash
-# Push one package (oblyx or oblyx-bin) to the AUR.
+# Push all oblyx packages to the AUR for a release tag.
 #
 # Expects: git, curl, ssh configured with an AUR-authorized key, and makepkg
-# (run inside an archlinux container). Rendered in CI on tag pushes.
+# (run inside an archlinux container). Runs in CI on pushes to main and tags.
 #
-# Usage: publish-aur.sh <pkgbase> <tag>
+# Usage: publish-aur.sh <tag>
 set -euo pipefail
 
-pkg="$1"
-tag="$2"
+tag="$1"
 ver="${tag#v}"
-repo="ssh://aur@aur.archlinux.org/${pkg}.git"
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+repo_root="ssh://aur@aur.archlinux.org"
 
-case "$pkg" in
-  oblyx-bin)
-    url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/oblyx-linux-x64.tar.gz"
-    ;;
-  oblyx)
-    url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${tag}.tar.gz"
-    ;;
-  *)
-    echo "unknown package: $pkg" >&2
-    exit 1
-    ;;
-esac
+src_url() {
+  case "$1" in
+    oblyx-bin | oblyx-gui-bin)
+      echo "https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/oblyx-${ver}-linux-x64.tar.gz"
+      ;;
+    *)
+      echo "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${tag}.tar.gz"
+      ;;
+  esac
+}
 
-echo "==> $pkg: fetch $url"
-curl -fsSL "$url" -o "$work/source.tar.gz"
-sha256="$(sha256sum "$work/source.tar.gz" | awk '{print $1}')"
+for pkg in oblyx oblyx-bin oblyx-gui oblyx-gui-bin; do
+  work="$(mktemp -d)"
+  url="$(src_url "$pkg")"
 
-sed -e "s/@PKGVER@/${ver}/g" -e "s/@SHA256@/${sha256}/g" \
-    "aur/${pkg}/PKGBUILD" > "$work/PKGBUILD"
-chmod -R a+rwX "$work"
+  echo "==> $pkg: fetch $url"
+  curl -fsSL "$url" -o "$work/source.tar.gz"
+  sha256="$(sha256sum "$work/source.tar.gz" | awk '{print $1}')"
 
-# makepkg refuses to run as root; regenerate .SRCINFO as an unprivileged user.
-if [ "$(id -u)" -eq 0 ]; then
-  id builder &>/dev/null || useradd -m builder
-  su builder -s /bin/sh -c "cd '$work' && makepkg --printsrcinfo" > "$work/.SRCINFO"
-else
-  (cd "$work" && makepkg --printsrcinfo > .SRCINFO)
-fi
+  sed -e "s/@PKGVER@/${ver}/g" -e "s/@SHA256@/${sha256}/g" \
+      "aur/${pkg}/PKGBUILD" > "$work/PKGBUILD"
+  chmod -R a+rwX "$work"
 
-# First push to a package repo registers it; clone only if it already exists.
-if ! git clone "$repo" "$work/aur" 2>/dev/null; then
-  mkdir "$work/aur"
-  git -C "$work/aur" init
-  git -C "$work/aur" remote add origin "$repo"
-fi
-cp "$work/PKGBUILD" "$work/.SRCINFO" "$work/aur/"
-git -C "$work/aur" add PKGBUILD .SRCINFO
-if git -C "$work/aur" diff --cached --quiet && git -C "$work/aur" rev-parse --verify HEAD &>/dev/null; then
-  echo "==> $pkg already up to date on AUR"
-  exit 0
-fi
-git -C "$work/aur" commit -m "$pkg $ver"
-git -C "$work/aur" push origin HEAD:master
-echo "==> $pkg $ver published"
+  # makepkg refuses to run as root; regenerate .SRCINFO unprivileged.
+  if [ "$(id -u)" -eq 0 ]; then
+    id builder &>/dev/null || useradd -m builder
+    su builder -s /bin/sh -c "cd '$work' && makepkg --printsrcinfo" > "$work/.SRCINFO"
+  else
+    (cd "$work" && makepkg --printsrcinfo > .SRCINFO)
+  fi
+
+  # First push to a package repo registers it; clone only if it exists.
+  repo="${repo_root}/${pkg}.git"
+  if ! git clone "$repo" "$work/aur" 2>/dev/null; then
+    mkdir "$work/aur"
+    git -C "$work/aur" init
+    git -C "$work/aur" remote add origin "$repo"
+  fi
+  cp "$work/PKGBUILD" "$work/.SRCINFO" "$work/aur/"
+  git -C "$work/aur" add PKGBUILD .SRCINFO
+  if git -C "$work/aur" diff --cached --quiet && git -C "$work/aur" rev-parse --verify HEAD &>/dev/null; then
+    echo "==> $pkg already up to date on AUR"
+  else
+    git -C "$work/aur" commit -m "$pkg $ver" >/dev/null
+    git -C "$work/aur" push origin HEAD:master
+    echo "==> $pkg $ver published"
+  fi
+  rm -rf "$work"
+done

@@ -1,6 +1,7 @@
 # Desktop binaries (CLI + GUI) for Linux / macOS / Windows, plus Pages deploy.
-# - push to main: upload build artifacts + deploy the web app
-# - tag v*: publish those binaries as a GitHub Release
+# - push to main: auto-versioned release (v<base>.r<commit-count>) + AUR publish
+# - tag v*: release that version + AUR publish
+# - workflow_dispatch: Pages deploy only
 name: CI
 
 on:
@@ -14,11 +15,47 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  version:
+    name: resolve version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      needed: ${{ steps.v.outputs.needed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version + decide whether a release is needed
+        id: v
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            ver="${GITHUB_REF_NAME#v}"
+          else
+            base="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+            ver="${base}.r$(git rev-list --count HEAD)"
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          # A release that already has assets means this is a re-run (e.g. a
+          # manually pushed tag we already published); skip the pipeline.
+          assets="$(gh release view "v${ver}" --json assets --jq '.assets | length' 2>/dev/null || echo 0)"
+          echo "needed=$([ "$assets" -eq 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "version $ver (existing release assets: $assets)"
+
   desktop:
     name: desktop (${{ matrix.name }})
+    needs: version
+    if: needs.version.outputs.needed == 'true'
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -78,7 +115,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          staging="oblyx-${{ matrix.name }}"
+          staging="oblyx-${VERSION}-${{ matrix.name }}"
           mkdir -p "$staging"
           ext=""
           if [[ "${{ runner.os }}" == "Windows" ]]; then
@@ -91,7 +128,7 @@ jobs:
             strip "$staging/oblyx${ext}" "$staging/oblyx-gui${ext}" || true
           fi
           {
-            echo "oblyx ${{ github.ref_name }} (${{ matrix.name }})"
+            echo "oblyx ${VERSION} (${{ matrix.name }})"
             echo
             echo "- oblyx${ext}      CLI converter"
             echo "- oblyx-gui${ext}  native GUI"
@@ -157,11 +194,13 @@ jobs:
 
   release:
     name: github release
-    needs: desktop
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, desktop]
+    if: needs.version.outputs.needed == 'true' && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -173,14 +212,15 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ needs.version.outputs.version }}
           files: dist/*
           generate_release_notes: true
           fail_on_unmatched_files: true
 
   aur:
     name: publish to AUR
-    needs: release
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, release]
+    if: needs.version.outputs.needed == 'true' && github.event_name == 'push'
     runs-on: ubuntu-latest
     container: archlinux:latest
     permissions:
@@ -203,8 +243,5 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Publish oblyx
-        run: ./ci/publish-aur.sh oblyx "$GITHUB_REF_NAME"
-
-      - name: Publish oblyx-bin
-        run: ./ci/publish-aur.sh oblyx-bin "$GITHUB_REF_NAME"
+      - name: Publish oblyx, oblyx-bin, oblyx-gui, oblyx-gui-bin
+        run: ./ci/publish-aur.sh "v${{ needs.version.outputs.version }}"
