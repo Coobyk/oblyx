@@ -44,6 +44,17 @@ impl IdGen {
         }
     }
 
+    /// Generator for content records of one page when pages are encoded in
+    /// parallel: the actor (last UUID group) is namespaced by page index so
+    /// page-local counters can restart at 1 without colliding with the main
+    /// generator or other pages.
+    fn for_page(idx: usize) -> Self {
+        Self {
+            counter: 1,
+            actor: 0xABCDEF01u64.wrapping_add(1 + idx as u64),
+        }
+    }
+
     /// Mint a 36-char uppercase hyphenated UUID from the counter.
     fn uuid(&mut self) -> String {
         let c = self.counter;
@@ -476,7 +487,12 @@ pub fn write_goodnotes(pages: &[Page], doc: &Document, mut w: impl Write) -> Res
     let mut ids = IdGen::new();
 
     let page_uuids: Vec<String> = pages.iter().map(|_| ids.uuid()).collect();
-    let page_blobs: Vec<Vec<u8>> = pages.iter().map(|p| encode_page(&mut ids, p)).collect();
+    // Encode pages in parallel; each gets an actor-namespaced id generator so
+    // uuids stay globally unique without a shared counter.
+    let page_blobs: Vec<Vec<u8>> = crate::par::mapi(pages, |i, p| {
+        let mut pids = IdGen::for_page(i);
+        encode_page(&mut pids, p)
+    });
 
     let mut schema = Vec::new();
     write_varint_field(&mut schema, 1, 35);
@@ -551,9 +567,13 @@ pub fn write_goodnotes(pages: &[Page], doc: &Document, mut w: impl Write) -> Res
         zip.write_all(blob)?;
     }
 
+    // Attachments are images/PDFs — already compressed, so deflate only burns
+    // time on big notebooks. Entries below 64 KiB still deflate (cheap).
+    let stored = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     for (key, att_uuid) in &att_file_map {
         if let Some(bytes) = doc.attachments.get(key) {
-            zip.start_file(format!("attachments/{att_uuid}"), opts)?;
+            let o = if bytes.len() >= 64 * 1024 { stored } else { opts };
+            zip.start_file(format!("attachments/{att_uuid}"), o)?;
             zip.write_all(bytes)?;
         }
     }

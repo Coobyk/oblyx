@@ -432,35 +432,33 @@ pub struct NtbDocument {
 
 /// Open a `.ntb` file from disk.
 pub fn open(path: &Path) -> Result<NtbDocument> {
-    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut zip = ZipArchive::new(Cursor::new(read_all(file)?))
-        .with_context(|| format!("zip open {}", path.display()))?;
-    parse_zip(&mut zip)
+    let data = std::fs::read(path).with_context(|| format!("open {}", path.display()))?;
+    parse_bytes(&data).with_context(|| format!("zip open {}", path.display()))
 }
 
-fn read_all(mut r: impl Read) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    r.read_to_end(&mut buf)?;
-    Ok(buf)
-}
+/// Parse a `.ntb` from in-memory bytes.
+pub fn parse_bytes(data: &[u8]) -> Result<NtbDocument> {
+    let mut z = ZipArchive::new(Cursor::new(data)).context("not a readable zip archive")?;
+    let manifest = read_member(&mut z, "manifest.json")?.unwrap_or_default();
+    let thumbnail = read_member(&mut z, "thumbnail.png")?;
+    let bundle = read_member(&mut z, "noteBundle")?.context("noteBundle missing")?;
 
-fn parse_zip<R: std::io::Read + std::io::Seek>(z: &mut ZipArchive<R>) -> Result<NtbDocument> {
-    let manifest = read_member(z, "manifest.json")?.unwrap_or_default();
-    let thumbnail = read_member(z, "thumbnail.png")?;
-    let bundle = read_member(z, "noteBundle")?.context("noteBundle missing")?;
-
-    // Collect assets (content-addressed files under assets/).
-    let mut assets = Vec::new();
+    // Collect asset member names, then inflate them in parallel.
+    let mut names = Vec::new();
     for i in 0..z.len() {
-        let entry = z.by_index(i)?;
-        let name = entry.name().to_string();
+        let name = z.by_index(i)?.name().to_string();
         if name.starts_with("assets/") {
-            let mut buf = Vec::new();
-            let mut entry = entry;
-            entry.read_to_end(&mut buf)?;
-            assets.push((name, buf));
+            names.push(name);
         }
     }
+    drop(z);
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let blobs = crate::par::zip_members(data, &name_refs)?;
+    let assets: Vec<(String, Vec<u8>)> = names
+        .into_iter()
+        .zip(blobs)
+        .filter_map(|(n, b)| b.map(|b| (n, b)))
+        .collect();
 
     let (meta, strokes, pages, texts, shapes) = parse_bundle(&bundle)?;
     Ok(NtbDocument {

@@ -195,13 +195,26 @@ pub(crate) fn write_temp_pdf(path: &Path, bytes: &[u8]) -> Result<()> {
 // PDF output embeds these instead of rasterizing (see render::pdf).
 // ---------------------------------------------------------------------------
 
-/// Width × height of a 1-based page in PDF points (viewer orientation).
-pub(crate) fn page_size(pdf: &[u8], page_1based: u64) -> Option<(f32, f32)> {
-    let doc = load_pdf(pdf)?;
+/// A parsed PDF together with its page-number map, so repeated page lookups
+/// cost neither a re-parse nor a `get_pages` page-tree walk.
+pub(crate) struct LoadedPdf {
+    pub doc: PdfDoc,
+    pub pages: std::collections::BTreeMap<u32, ObjectId>,
+}
+
+/// Parse a PDF attachment once for repeated page imports / size lookups.
+pub(crate) fn load_pdf_full(bytes: &[u8]) -> Option<LoadedPdf> {
+    let doc = load_pdf(bytes)?;
     let pages = doc.get_pages();
-    let page_id = *pages.get(&(page_1based as u32))?;
-    let bbox = page_bbox_of(&doc, page_id)?;
-    let rotate = page_rotate(&doc, page_id);
+    Some(LoadedPdf { doc, pages })
+}
+
+/// Width × height of a 1-based page in PDF points (viewer orientation),
+/// against an already-parsed document.
+pub(crate) fn page_size_of(lp: &LoadedPdf, page_1based: u64) -> Option<(f32, f32)> {
+    let page_id = *lp.pages.get(&(page_1based as u32))?;
+    let bbox = page_bbox_of(&lp.doc, page_id)?;
+    let rotate = page_rotate(&lp.doc, page_id);
     let (w, h) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
     if !(w > 1.0 && h > 1.0) {
         return None;
@@ -284,31 +297,62 @@ pub(crate) fn load_pdf(bytes: &[u8]) -> Option<PdfDoc> {
     PdfDoc::load_mem(bytes).ok()
 }
 
-/// Import one page of `src` into `dst` as a Form XObject.
-/// Returns the new object id and the form BBox `[x0,y0,x1,y1]` in the
-/// orientation used for placement (rotation baked into `/Matrix` when needed).
-pub(crate) fn import_page_as_form(
-    src: &PdfDoc,
-    page_1based: u32,
-    dst: &mut PdfDoc,
-) -> Option<(ObjectId, [f32; 4])> {
-    let pages = src.get_pages();
-    let page_id = *pages.get(&page_1based)?;
+/// Per-page data extracted for a later [`finish_form`] merge: everything a
+/// Form XObject needs except its `dst`-side resources.
+pub(crate) struct FormPrep {
+    page_id: ObjectId,
+    bbox: [f32; 4],
+    /// Content stream bytes (deflate-compressed when `compressed` is true).
+    content: Vec<u8>,
+    compressed: bool,
+    rotate: i64,
+}
+
+/// Extract and compress one page's content + geometry. Pure read on `src`,
+/// so callers can run it across pages in parallel; [`finish_form`] does the
+/// sequential merge into the destination document.
+pub(crate) fn prep_form(lp: &LoadedPdf, page_1based: u32) -> Option<FormPrep> {
+    let src = &lp.doc;
+    let page_id = *lp.pages.get(&page_1based)?;
     let bbox = page_bbox_of(src, page_id)?;
     let content = src.get_page_content(page_id);
     let rotate = page_rotate(src, page_id);
+    let mut st = Stream::new(Dictionary::new(), content);
+    // compress() returns Ok even when it declines (tiny gains), so check
+    // whether it actually set the Filter key.
+    let _ = st.compress();
+    let compressed = st.dict.get(b"Filter").is_ok();
+    Some(FormPrep {
+        page_id,
+        bbox,
+        content: st.content,
+        compressed,
+        rotate,
+    })
+}
 
-    let mut id_map: HashMap<ObjectId, ObjectId> = HashMap::new();
+/// Merge a [`prep_form`] result into `dst` as a Form XObject. `id_map` is
+/// shared across all imports from one source document, so resources every
+/// page shares (fonts, images) are copied only once. Returns the new object
+/// id and the form BBox `[x0,y0,x1,y1]` in placement orientation.
+pub(crate) fn finish_form(
+    lp: &LoadedPdf,
+    prep: FormPrep,
+    dst: &mut PdfDoc,
+    id_map: &mut HashMap<ObjectId, ObjectId>,
+) -> Option<(ObjectId, [f32; 4])> {
+    let src = &lp.doc;
+    let bbox = prep.bbox;
     let resources = match src
-        .get_dictionary(page_id)
+        .get_dictionary(prep.page_id)
         .ok()
         .and_then(|p| p.get(b"Resources").ok())
     {
-        Some(Object::Reference(id)) => Object::Reference(copy_ref(src, *id, dst, &mut id_map)?),
+        Some(Object::Reference(id)) => Object::Reference(copy_ref(src, *id, dst, id_map)?),
         Some(Object::Dictionary(dict)) => {
-            copy_object(src, Object::Dictionary(dict.clone()), dst, &mut id_map)?
+            copy_object(src, Object::Dictionary(dict.clone()), dst, id_map)?
         }
-        Some(other) => copy_object(src, other.clone(), dst, &mut id_map)?,
+        Some(other) => copy_object(src, other.clone(), dst, id_map)?,
         None => Object::Dictionary(Dictionary::new()),
     };
 
@@ -316,14 +360,14 @@ pub(crate) fn import_page_as_form(
     let (bw, bh) = (x1 - x0, y1 - y0);
 
     // Form BBox is always origin-aligned; page origin offsets go into Matrix.
-    let (form_w, form_h, matrix) = match rotate {
+    let (form_w, form_h, matrix) = match prep.rotate {
         90 => (bh, bw, vec![0.0, 1.0, -1.0, 0.0, y1, -x0]),
         180 => (bw, bh, vec![-1.0, 0.0, 0.0, -1.0, x1, y1]),
         270 => (bh, bw, vec![0.0, -1.0, 1.0, 0.0, -y0, x1]),
         _ => (bw, bh, vec![1.0, 0.0, 0.0, 1.0, -x0, -y0]),
     };
 
-    let dict = dictionary! {
+    let mut dict = dictionary! {
         "Type" => "XObject",
         "Subtype" => "Form",
         "FormType" => 1,
@@ -336,9 +380,11 @@ pub(crate) fn import_page_as_form(
         "Matrix" => Object::Array(matrix.into_iter().map(Object::Real).collect()),
         "Resources" => resources,
     };
+    if prep.compressed {
+        dict.set("Filter", "FlateDecode");
+    }
 
-    let mut stream = Stream::new(dict, content);
-    let _ = stream.compress();
+    let stream = Stream::new(dict, prep.content);
     let id = dst.add_object(Object::Stream(stream));
     Some((id, [0.0, 0.0, form_w, form_h]))
 }

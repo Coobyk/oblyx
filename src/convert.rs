@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use rayon::prelude::*;
 
 use crate::doc::{Document, Page, PageSource};
 use crate::render::{pdf::document_to_pdf_with, png::page_to_png, svg::page_to_svg};
@@ -476,8 +475,21 @@ impl<W: std::io::Write + std::io::Seek + Send> Sink for ZipSink<W> {
                 n += 1;
             }
         }
-        let opts = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+        // Already-compressed payloads (PDFs, notebook zips, raster images)
+        // gain nothing from a second deflate pass — it just serialises the
+        // slowest stage of archive writes. Text-ish output still deflates.
+        let method = match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("pdf" | "goodnotes" | "ntb" | "png" | "jpg" | "jpeg" | "zip") => {
+                zip::CompressionMethod::Stored
+            }
+            _ => zip::CompressionMethod::Deflated,
+        };
+        let opts = zip::write::SimpleFileOptions::default().compression_method(method);
         inner.zip.start_file(name, opts)?;
         inner.zip.write_all(&bytes)?;
         Ok(())
@@ -509,17 +521,16 @@ pub fn decode_pages_with(
         .collect();
     let total = sources.len();
     let done = AtomicUsize::new(0);
-    sources
-        .par_iter()
-        .map(|src| {
-            let page = doc
-                .decode_page(src, include_deleted)
-                .with_context(|| format!("decode page {}", src.uuid))?;
-            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            progress(JobProgress::Decode { done: n, total });
-            Ok(page)
-        })
-        .collect()
+    crate::par::map(&sources, |src| -> Result<Page> {
+        let page = doc
+            .decode_page(src, include_deleted)
+            .with_context(|| format!("decode page {}", src.uuid))?;
+        let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+        progress(JobProgress::Decode { done: n, total });
+        Ok(page)
+    })
+    .into_iter()
+    .collect()
 }
 
 /// Outcome of converting one input file.
@@ -585,41 +596,39 @@ pub fn convert_job_sink(
                 let total = pages.len();
                 let done = AtomicUsize::new(0);
                 let prog = &progress;
-                pages
-                    .par_iter()
-                    .map(|page| {
-                        let svg = page_to_svg(page, &doc, options.dpi);
-                        sink.write(
-                            &job.root,
-                            &path.join(format!("{}.svg", page.uuid)),
-                            svg.into_bytes(),
-                        )
-                        .with_context(|| format!("write {}", page.uuid))?;
-                        let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                        crate::vlog!(1, "  svg page {}/{total}: {}", n, page.uuid);
-                        prog(JobProgress::Render { done: n, total });
-                        Ok(())
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                crate::par::map(&pages, |page| -> Result<()> {
+                    let svg = page_to_svg(page, &doc, options.dpi);
+                    sink.write(
+                        &job.root,
+                        &path.join(format!("{}.svg", page.uuid)),
+                        svg.into_bytes(),
+                    )
+                    .with_context(|| format!("write {}", page.uuid))?;
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    crate::vlog!(1, "  svg page {}/{total}: {}", n, page.uuid);
+                    prog(JobProgress::Render { done: n, total });
+                    Ok(())
+                })
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
                 written += pages.len();
             }
             Fmt::Png => {
                 let total = pages.len();
                 let done = AtomicUsize::new(0);
                 let prog = &progress;
-                pages
-                    .par_iter()
-                    .map(|page| {
-                        let png = page_to_png(page, &doc, scale)
-                            .with_context(|| format!("render {}", page.uuid))?;
-                        sink.write(&job.root, &path.join(format!("{}.png", page.uuid)), png)
-                            .with_context(|| format!("write {}", page.uuid))?;
-                        let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                        crate::vlog!(1, "  png page {}/{total}: {}", n, page.uuid);
-                        prog(JobProgress::Render { done: n, total });
-                        Ok(())
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                crate::par::map(&pages, |page| -> Result<()> {
+                    let png = page_to_png(page, &doc, scale)
+                        .with_context(|| format!("render {}", page.uuid))?;
+                    sink.write(&job.root, &path.join(format!("{}.png", page.uuid)), png)
+                        .with_context(|| format!("write {}", page.uuid))?;
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    crate::vlog!(1, "  png page {}/{total}: {}", n, page.uuid);
+                    prog(JobProgress::Render { done: n, total });
+                    Ok(())
+                })
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
                 written += pages.len();
             }
             Fmt::Goodnotes => {
@@ -757,45 +766,7 @@ fn load_ntb_pages(job: &Job) -> Result<(Document, Vec<Page>)> {
 
 /// Parse an `.ntb` from in-memory bytes (for zip-archive members).
 fn parse_ntb_bytes(bytes: &[u8]) -> Result<crate::ntb::NtbDocument> {
-    use std::io::Read as _;
-    let mut z =
-        zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).context("ntb zip open")?;
-    let mut manifest = Vec::new();
-    if let Ok(mut f) = z.by_name("manifest.json") {
-        f.read_to_end(&mut manifest)?;
-    }
-    let mut thumbnail = None;
-    if let Ok(mut f) = z.by_name("thumbnail.png") {
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf)?;
-        thumbnail = Some(buf);
-    }
-    let mut bundle = Vec::new();
-    z.by_name("noteBundle")?
-        .read_to_end(&mut bundle)
-        .context("noteBundle missing")?;
-    let mut assets = Vec::new();
-    for i in 0..z.len() {
-        let entry = z.by_index(i)?;
-        let name = entry.name().to_string();
-        if name.starts_with("assets/") {
-            let mut buf = Vec::new();
-            let mut entry = entry;
-            entry.read_to_end(&mut buf)?;
-            assets.push((name, buf));
-        }
-    }
-    let (meta, strokes, pages, texts, shapes) = crate::ntb::parse_bundle_public(&bundle)?;
-    Ok(crate::ntb::NtbDocument {
-        meta,
-        strokes,
-        pages,
-        texts,
-        shapes,
-        manifest,
-        thumbnail,
-        assets,
-    })
+    crate::ntb::parse_bytes(bytes).context("ntb zip open")
 }
 
 /// Read one member out of a notebook `.zip` on disk.

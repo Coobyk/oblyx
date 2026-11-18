@@ -526,7 +526,7 @@ pub fn document_to_pdf(pages: &[Page], doc: &Document) -> Vec<u8> {
 pub fn document_to_pdf_with(
     pages: &[Page],
     doc: &Document,
-    mut on_page: impl FnMut(usize),
+    on_page: impl Fn(usize) + Sync,
 ) -> Vec<u8> {
     let mut img_order: Vec<&String> = Vec::new();
     let mut inline: HashMap<&str, &[u8]> = HashMap::new();
@@ -566,15 +566,19 @@ pub fn document_to_pdf_with(
         }
     }
 
-    let mut img_obj: HashMap<String, Option<usize>> = HashMap::new();
-    let mut img_blobs: Vec<(usize, u32, u32, bool, Vec<u8>)> = Vec::new();
-    let mut next_obj = 5usize;
-    for att in &img_order {
-        let prepared = inline
+    // Decode/re-encode attachment images in parallel.
+    let prepared_images = crate::par::map(&img_order, |att| {
+        inline
             .get(att.as_str())
             .copied()
             .or_else(|| doc.attachments.get(att.as_str()).map(|b| b.as_slice()))
-            .and_then(prepare_image);
+            .and_then(prepare_image)
+    });
+
+    let mut img_obj: HashMap<String, Option<usize>> = HashMap::new();
+    let mut img_blobs: Vec<(usize, u32, u32, bool, Vec<u8>)> = Vec::new();
+    let mut next_obj = 5usize;
+    for (att, prepared) in img_order.iter().zip(prepared_images) {
         match prepared {
             Some((w, h, gray, data)) => {
                 crate::vlog!(
@@ -607,15 +611,12 @@ pub fn document_to_pdf_with(
     let total = base + pages.len() * 2;
 
     let ctx = Ctx { img_obj, gs_obj };
-    let contents: Vec<String> = pages
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let content = page_content(p, &ctx);
-            on_page(i + 1);
-            content
-        })
-        .collect();
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let contents: Vec<String> = crate::par::map(pages, |p| {
+        let content = page_content(p, &ctx);
+        on_page(done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
+        content
+    });
 
     let mut objs: Vec<Obj> = (0..total).map(|_| Obj::Text(String::new())).collect();
     objs[1] = Obj::Text("<< /Type /Catalog /Pages 2 0 R >>".into());
@@ -733,8 +734,73 @@ fn embed_pdf_backgrounds(bytes: Vec<u8>, pages: &[Page], doc: &Document) -> Vec<
     };
 
     let out_pages = out.get_pages();
-    let mut src_cache: HashMap<String, PdfDoc> = HashMap::new();
+
+    // Load every distinct background attachment (usually one) and its page
+    // map once — `get_pages` walks the page tree, so doing it per import is
+    // O(pages²). Parsing runs in parallel across attachments.
+    let mut att_names: Vec<String> = Vec::new();
+    for page in pages {
+        for item in &page.items {
+            if let Item::PdfBackground(bg) = item
+                && !att_names.iter().any(|a| a == &bg.attachment)
+            {
+                att_names.push(bg.attachment.clone());
+            }
+        }
+    }
+    let loaded = crate::par::map(&att_names, |name| {
+        doc.attachments
+            .get(name)
+            .and_then(|att| {
+                if let Some(lp) = pdfinput::load_pdf_full(att) {
+                    Some(lp)
+                } else {
+                    crate::vlog!(1, "pdf background {name}: failed to parse PDF");
+                    None
+                }
+            })
+            .map(std::sync::Arc::new)
+    });
+    let srcs: HashMap<&str, std::sync::Arc<pdfinput::LoadedPdf>> = att_names
+        .iter()
+        .zip(loaded)
+        .filter_map(|(name, lp)| lp.map(|lp| (name.as_str(), lp)))
+        .collect();
+
+    // Extract each distinct (attachment, page) form in parallel: page object
+    // id, bbox, compressed content stream, rotation. The `dst`-mutating part
+    // (resource copying + object insertion) merges sequentially below.
+    let mut work: Vec<(&str, u64)> = Vec::new();
+    let mut work_seen: BTreeSet<(&str, u64)> = BTreeSet::new();
+    for page in pages {
+        for item in &page.items {
+            if let Item::PdfBackground(bg) = item
+                && work_seen.insert((bg.attachment.as_str(), bg.pdf_page))
+            {
+                work.push((bg.attachment.as_str(), bg.pdf_page));
+            }
+        }
+    }
+    let preps: Vec<Option<pdfinput::FormPrep>> = crate::par::map(&work, |(att, pg)| {
+        srcs.get(att)
+            .and_then(|lp| pdfinput::prep_form(lp.as_ref(), *pg as u32))
+    });
+
+    // Merge sequentially. `id_maps` is shared per attachment, so resources
+    // common to many pages (fonts, images) are copied into `out` only once.
     let mut form_cache: HashMap<(String, u64), (ObjectId, [f32; 4])> = HashMap::new();
+    let mut id_maps: HashMap<&str, HashMap<ObjectId, ObjectId>> = HashMap::new();
+    for ((att, pg), prep) in work.iter().zip(preps) {
+        let Some(prep) = prep else {
+            crate::vlog!(1, "pdf background {att}:{pg}: import failed");
+            continue;
+        };
+        let lp = srcs.get(att).expect("prep implies src loaded");
+        let map = id_maps.entry(att).or_default();
+        if let Some(imported) = pdfinput::finish_form(lp.as_ref(), prep, &mut out, map) {
+            form_cache.insert((att.to_string(), *pg), imported);
+        }
+    }
 
     for (page_idx, page) in pages.iter().enumerate() {
         let bgs: Vec<&PdfBgEl> = page
@@ -759,40 +825,9 @@ fn embed_pdf_backgrounds(bytes: Vec<u8>, pages: &[Page], doc: &Document) -> Vec<
             // remaining backgrounds stay aligned with their markers.
             let mut draw = String::new();
             let key = (bg.attachment.clone(), bg.pdf_page);
-            let (form_id, bbox) = if let Some(&hit) = form_cache.get(&key) {
-                hit
-            } else {
-                if !src_cache.contains_key(&bg.attachment) {
-                    let Some(att) = doc.attachments.get(&bg.attachment) else {
-                        crate::vlog!(1, "pdf background {}: attachment missing", bg.attachment);
-                        draws.push(draw);
-                        continue;
-                    };
-                    let Some(src) = pdfinput::load_pdf(att) else {
-                        crate::vlog!(1, "pdf background {}: failed to parse PDF", bg.attachment);
-                        draws.push(draw);
-                        continue;
-                    };
-                    src_cache.insert(bg.attachment.clone(), src);
-                }
-                let Some(src) = src_cache.get(&bg.attachment) else {
-                    draws.push(draw);
-                    continue;
-                };
-                let Some(imported) =
-                    pdfinput::import_page_as_form(src, bg.pdf_page as u32, &mut out)
-                else {
-                    crate::vlog!(
-                        1,
-                        "pdf background {}:{}: import failed",
-                        bg.attachment,
-                        bg.pdf_page
-                    );
-                    draws.push(draw);
-                    continue;
-                };
-                form_cache.insert(key, imported);
-                imported
+            let Some(&(form_id, bbox)) = form_cache.get(&key) else {
+                draws.push(draw);
+                continue;
             };
 
             let name = format!("PBg{}", form_id.0);

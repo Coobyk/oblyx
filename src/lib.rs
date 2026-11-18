@@ -8,6 +8,7 @@ pub mod gui;
 pub mod mem;
 pub mod ntb;
 pub mod ntb_write;
+pub(crate) mod par;
 pub mod paper;
 pub mod pb;
 pub mod pbw;

@@ -12,14 +12,16 @@
 //! vector, op tables, payloads, leaves) and patches uoffsets so they point
 //! forward, as required by Notability's FlatBuffers readers.
 
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha512};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
-use crate::doc::{Document, Item, Page, ShapeKind, Stroke};
+use crate::doc::{Document, Item, Page, ShapeKind};
 
 // PayloadType constants (matching the reader in `ntb.rs`).
 const PT_CREATE_PAGE: u8 = 3;
@@ -64,6 +66,17 @@ impl Fb {
     fn new() -> Self {
         // Reserve 4 bytes for the root uoffset.
         Self { buf: vec![0; 4] }
+    }
+
+    /// Empty buffer for a self-contained sub-buffer (one op serialised
+    /// independently, later appended to the main buffer). Relative uoffsets
+    /// are preserved by the shift, so internal references stay valid.
+    fn bare() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    fn into_buf(self) -> Vec<u8> {
+        self.buf
     }
 
     fn align(&mut self, n: usize) {
@@ -222,29 +235,18 @@ fn build_path_stream(points: &[[f32; 2]]) -> Vec<u8> {
         return Vec::new();
     }
     let anchor = points[0];
-    let mut elements: Vec<(u8, Vec<u8>)> = Vec::new();
-
+    let mut stream = Vec::with_capacity(3 + points.len() * 9);
+    stream.push(1); // version 0 << 3 | precision 1 (f32)
+    stream.extend_from_slice(&(points.len() as u16).to_le_bytes());
     // First element: moveto at (0, 0) relative to anchor.
-    {
-        let mut b = Vec::new();
-        b.extend_from_slice(&0f32.to_le_bytes());
-        b.extend_from_slice(&0f32.to_le_bytes());
-        elements.push((PATH_MOVETO, b));
-    }
+    stream.push(PATH_MOVETO);
+    stream.extend_from_slice(&0f32.to_le_bytes());
+    stream.extend_from_slice(&0f32.to_le_bytes());
     // Remaining: line-to each point (relative to anchor).
     for p in &points[1..] {
-        let mut b = Vec::new();
-        b.extend_from_slice(&(p[0] - anchor[0]).to_le_bytes());
-        b.extend_from_slice(&(p[1] - anchor[1]).to_le_bytes());
-        elements.push((PATH_LINE, b));
-    }
-
-    let mut stream = Vec::new();
-    stream.push(1); // version 0 << 3 | precision 1 (f32)
-    stream.extend_from_slice(&(elements.len() as u16).to_le_bytes());
-    for (typ, body) in &elements {
-        stream.push(*typ);
-        stream.extend_from_slice(body);
+        stream.push(PATH_LINE);
+        stream.extend_from_slice(&(p[0] - anchor[0]).to_le_bytes());
+        stream.extend_from_slice(&(p[1] - anchor[1]).to_le_bytes());
     }
     stream
 }
@@ -311,13 +313,15 @@ fn write_create_ink(
     fb: &mut Fb,
     entity: (u16, u32),
     page: (u16, u32, u32),
-    stroke: &Stroke,
+    points: &[[f32; 2]],
+    width: f32,
+    rgba: &[f32; 4],
 ) -> usize {
     // Colour struct (inline Gf, 4 bytes).
-    let color = gf_color(&stroke.rgba);
-    let origin = stroke.points.first().copied().unwrap_or([0.0, 0.0]);
-    let width = if stroke.width.is_finite() && stroke.width > 0.0 {
-        stroke.width
+    let color = gf_color(rgba);
+    let origin = points.first().copied().unwrap_or([0.0, 0.0]);
+    let width = if width.is_finite() && width > 0.0 {
+        width
     } else {
         1.0
     };
@@ -343,7 +347,7 @@ fn write_create_ink(
         (9, FieldVal::Inline(vec![0; 4])), // placeholder
     ]);
 
-    let path_pos = fb.write_byte_vector(&build_path_stream(&stroke.points));
+    let path_pos = fb.write_byte_vector(&build_path_stream(points));
     fb.patch_uoffset(payload, 9, path_pos);
     fb.patch_uoffset(op, 5, payload);
     op
@@ -518,10 +522,25 @@ fn write_create_page(
     op
 }
 
-/// Build the `noteBundle` FlatBuffer from pages and document.
+/// Stroke geometry for a CreateInk op: borrowed item points, or a synthetic
+/// two-point segment (connectors have no point list of their own).
+enum InkPts<'a> {
+    Ref(&'a [[f32; 2]]),
+    Owned(Vec<[f32; 2]>),
+}
+
+impl InkPts<'_> {
+    fn points(&self) -> &[[f32; 2]] {
+        match self {
+            InkPts::Ref(p) => p,
+            InkPts::Owned(v) => v,
+        }
+    }
+}
+
 /// Deferred op description: ops are collected first, then written after the
 /// root table and ops vector so every uoffset points forward.
-enum OpSpec {
+enum OpSpec<'a> {
     Setup {
         entity: (u16, u32),
         title: String,
@@ -538,7 +557,9 @@ enum OpSpec {
     Ink {
         entity: (u16, u32),
         page: (u16, u32, u32),
-        stroke: Stroke,
+        pts: InkPts<'a>,
+        width: f32,
+        rgba: [f32; 4],
     },
     Shape {
         entity: (u16, u32),
@@ -554,7 +575,67 @@ enum OpSpec {
     },
 }
 
-fn build_note_bundle(pages: &[Page], doc: &Document) -> Vec<u8> {
+/// Serialise one op into a self-contained buffer. All uoffsets it writes are
+/// relative to field positions inside the buffer, so the whole buffer can be
+/// appended to the main one and its references stay valid; the ops vector
+/// just needs slot `i` patched to `base + op_table_pos`.
+fn serialize_op(spec: &OpSpec) -> (usize, Vec<u8>) {
+    let mut fb = Fb::bare();
+    let op = match spec {
+        OpSpec::Setup {
+            entity,
+            title,
+            locale,
+        } => write_document_setup(&mut fb, *entity, title, locale),
+        OpSpec::Page {
+            entity,
+            width,
+            height,
+            background,
+            background_size,
+            page_count,
+        } => write_create_page(
+            &mut fb,
+            *entity,
+            *width,
+            *height,
+            background.as_ref(),
+            *background_size,
+            *page_count,
+        ),
+        OpSpec::Ink {
+            entity,
+            page,
+            pts,
+            width,
+            rgba,
+        } => write_create_ink(&mut fb, *entity, *page, pts.points(), *width, rgba),
+        OpSpec::Shape {
+            entity,
+            page,
+            x,
+            y,
+            w,
+            h,
+            ellipse,
+            fill,
+            stroke,
+            border_width,
+        } => write_create_shape(
+            &mut fb, *entity, *page, *x, *y, *w, *h, *ellipse, fill, stroke, *border_width,
+        ),
+    };
+    (op, fb.into_buf())
+}
+
+/// Build the `noteBundle` FlatBuffer from pages and document.
+/// `hashes` maps each background attachment key to its precomputed content
+/// hash (computed once per unique attachment, not per page).
+fn build_note_bundle(
+    pages: &[Page],
+    doc: &Document,
+    hashes: &HashMap<String, [u8; 64]>,
+) -> Vec<u8> {
     let mut ids = EntityGen::new();
     let mut specs: Vec<OpSpec> = Vec::new();
 
@@ -574,8 +655,11 @@ fn build_note_bundle(pages: &[Page], doc: &Document) -> Vec<u8> {
         let bg = doc
             .page_cfg()
             .get(&page.uuid)
-            .and_then(|cfg| doc.attachments.get(&cfg.attachment))
-            .map(|bytes| (compute_hash(bytes), bytes.len() as u32));
+            .and_then(|cfg| {
+                let hash = hashes.get(&cfg.attachment).copied()?;
+                let size = doc.attachments.get(&cfg.attachment)?.len() as u32;
+                Some((hash, size))
+            });
 
         specs.push(OpSpec::Page {
             entity: page_entity,
@@ -595,7 +679,9 @@ fn build_note_bundle(pages: &[Page], doc: &Document) -> Vec<u8> {
                     specs.push(OpSpec::Ink {
                         entity: ids.next(),
                         page: page_id,
-                        stroke: s.clone(),
+                        pts: InkPts::Ref(&s.points),
+                        width: s.width,
+                        rgba: s.rgba,
                     });
                 }
                 Item::Shape(sh) => {
@@ -611,17 +697,12 @@ fn build_note_bundle(pages: &[Page], doc: &Document) -> Vec<u8> {
                                 if let Some(f) = pts.first().copied() {
                                     pts.push(f);
                                 }
-                                let stroke = Stroke {
-                                    points: pts,
-                                    width: sh.width,
-                                    rgba: sh.stroke,
-                                    dash: sh.dash,
-                                    parented: false,
-                                };
                                 specs.push(OpSpec::Ink {
                                     entity: ids.next(),
                                     page: page_id,
-                                    stroke,
+                                    pts: InkPts::Owned(pts),
+                                    width: sh.width,
+                                    rgba: sh.stroke,
                                 });
                             }
                             continue;
@@ -647,13 +728,9 @@ fn build_note_bundle(pages: &[Page], doc: &Document) -> Vec<u8> {
                     specs.push(OpSpec::Ink {
                         entity: ids.next(),
                         page: page_id,
-                        stroke: Stroke {
-                            points: p.points.clone(),
-                            width: p.width,
-                            rgba: p.rgba,
-                            dash: None,
-                            parented: false,
-                        },
+                        pts: InkPts::Ref(&p.points),
+                        width: p.width,
+                        rgba: p.rgba,
                     });
                 }
                 Item::FillPath(fp) => {
@@ -664,13 +741,9 @@ fn build_note_bundle(pages: &[Page], doc: &Document) -> Vec<u8> {
                         specs.push(OpSpec::Ink {
                             entity: ids.next(),
                             page: page_id,
-                            stroke: Stroke {
-                                points: contour.clone(),
-                                width: 1.0,
-                                rgba: fp.rgba,
-                                dash: None,
-                                parented: false,
-                            },
+                            pts: InkPts::Ref(contour),
+                            width: 1.0,
+                            rgba: fp.rgba,
                         });
                     }
                 }
@@ -678,16 +751,12 @@ fn build_note_bundle(pages: &[Page], doc: &Document) -> Vec<u8> {
                     specs.push(OpSpec::Ink {
                         entity: ids.next(),
                         page: page_id,
-                        stroke: Stroke {
-                            points: vec![
-                                [c.anchor[0], c.anchor[1]],
-                                [c.anchor[0], c.anchor[1]],
-                            ],
-                            width: c.width,
-                            rgba: c.rgba,
-                            dash: None,
-                            parented: false,
-                        },
+                        pts: InkPts::Owned(vec![
+                            [c.anchor[0], c.anchor[1]],
+                            [c.anchor[0], c.anchor[1]],
+                        ]),
+                        width: c.width,
+                        rgba: c.rgba,
                     });
                 }
                 // Backgrounds, PDF backgrounds, images, text, stickies: not
@@ -729,52 +798,15 @@ fn build_note_bundle(pages: &[Page], doc: &Document) -> Vec<u8> {
     fb.patch_uoffset(root, ROOT_F3_DEVICE_UUID_UPPER, device_uuid_upper);
     fb.patch_uoffset(root, ROOT_F5_DEVICE_UUID_LOWER, device_uuid_lower);
 
-    // Ops vector is written before the op tables it references.
+    // Ops vector is written before the op tables it references. Each op is
+    // serialised into its own buffer in parallel — uoffsets are all relative,
+    // so appending each buffer whole keeps its internal references valid.
     let ops_vec = fb.write_uoffset_slots(specs.len());
-    for (i, spec) in specs.iter().enumerate() {
-        let op = match spec {
-            OpSpec::Setup {
-                entity,
-                title,
-                locale,
-            } => write_document_setup(&mut fb, *entity, title, locale),
-            OpSpec::Page {
-                entity,
-                width,
-                height,
-                background,
-                background_size,
-                page_count,
-            } => write_create_page(
-                &mut fb,
-                *entity,
-                *width,
-                *height,
-                background.as_ref(),
-                *background_size,
-                *page_count,
-            ),
-            OpSpec::Ink {
-                entity,
-                page,
-                stroke,
-            } => write_create_ink(&mut fb, *entity, *page, stroke),
-            OpSpec::Shape {
-                entity,
-                page,
-                x,
-                y,
-                w,
-                h,
-                ellipse,
-                fill,
-                stroke,
-                border_width,
-            } => write_create_shape(
-                &mut fb, *entity, *page, *x, *y, *w, *h, *ellipse, fill, stroke, *border_width,
-            ),
-        };
-        fb.patch_uoffset_slot(ops_vec, i, op);
+    let op_bufs = crate::par::map(&specs, serialize_op);
+    for (i, (op_pos, buf)) in op_bufs.iter().enumerate() {
+        let base = fb.buf.len();
+        fb.buf.extend_from_slice(buf);
+        fb.patch_uoffset_slot(ops_vec, i, base + op_pos);
     }
     fb.patch_uoffset(root, ROOT_F6_OPS, ops_vec);
 
@@ -796,9 +828,56 @@ fn compute_hash(data: &[u8]) -> [u8; 64] {
     hasher.finalize().into()
 }
 
+/// Distinct attachment keys referenced by page backgrounds, in first-seen
+/// order. Several keys can alias one byte buffer.
+fn referenced_attachments(pages: &[Page], doc: &Document) -> Vec<(String, Arc<Vec<u8>>)> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for page in pages {
+        let Some(cfg) = doc.page_cfg().get(&page.uuid) else {
+            continue;
+        };
+        if !seen.insert(cfg.attachment.clone()) {
+            continue;
+        }
+        if let Some(bytes) = doc.attachments.get(&cfg.attachment) {
+            out.push((cfg.attachment.clone(), Arc::clone(bytes)));
+        }
+    }
+    out
+}
+
 /// Write a `.ntb` archive to `w`.
 pub fn write_ntb(pages: &[Page], doc: &Document, mut w: impl Write) -> Result<()> {
-    let bundle = build_note_bundle(pages, doc);
+    // SHA-512 each unique background attachment once — hashing per page is
+    // quadratic on PDF-imported notebooks where every page shares one
+    // multi-hundred-MB asset. Aliased keys share one hash via their byte
+    // pointer; distinct keys with identical bytes hash separately and are
+    // deduplicated again by entry name below.
+    let atts = referenced_attachments(pages, doc);
+    let mut uniq: Vec<&Arc<Vec<u8>>> = Vec::new();
+    let mut seen_ptrs = HashSet::new();
+    for (_, bytes) in &atts {
+        if seen_ptrs.insert(Arc::as_ptr(bytes) as usize) {
+            uniq.push(bytes);
+        }
+    }
+    let ptr_hash: HashMap<usize, [u8; 64]> = crate::par::map(&uniq, |bytes| {
+        (Arc::as_ptr(*bytes) as usize, compute_hash(bytes))
+    })
+    .into_iter()
+    .collect();
+    let hashes: HashMap<String, [u8; 64]> = atts
+        .iter()
+        .map(|(key, bytes)| {
+            (
+                key.clone(),
+                ptr_hash[&(Arc::as_ptr(bytes) as usize)],
+            )
+        })
+        .collect();
+
+    let bundle = build_note_bundle(pages, doc, &hashes);
     if bundle.len() as u64 > MOBILE_MAX_ENTRY {
         eprintln!(
             "warning: noteBundle is {} MiB; Notability's Android importer rejects entries over 64 MiB",
@@ -806,15 +885,18 @@ pub fn write_ntb(pages: &[Page], doc: &Document, mut w: impl Write) -> Result<()
         );
     }
 
-    let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let deflated = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    // Assets are PDF/images — already compressed, so deflate gains nothing
+    // but takes most of the write time on large notebooks.
+    let stored = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
 
     // Version file: Notability's NTB parser decodes this as a UTF-8 string and
     // requires it to equal "1" (ASCII 0x31), not a single byte 0x01.
-    zip.start_file("version", opts)?;
+    zip.start_file("version", deflated)?;
     zip.write_all(b"1")?;
 
-    zip.start_file("noteBundle", opts)?;
+    zip.start_file("noteBundle", deflated)?;
     zip.write_all(&bundle)?;
 
     // Manifest with required fields (subjectId, subjectName, appVersion).
@@ -823,41 +905,37 @@ pub fn write_ntb(pages: &[Page], doc: &Document, mut w: impl Write) -> Result<()
   "subjectName" : "Imported",
   "appVersion" : "16.12.5"
 }"#;
-    zip.start_file("manifest.json", opts)?;
+    zip.start_file("manifest.json", deflated)?;
     zip.write_all(manifest.as_bytes())?;
 
     // HandwritingIndex.fb — required by Notability import.
     // Structure from real samples: 4-field table with version/flags.
-    zip.start_file("index/ios/HandwritingIndex.fb", opts)?;
+    zip.start_file("index/ios/HandwritingIndex.fb", deflated)?;
     zip.write_all(&build_handwriting_index())?;
 
     // Thumbnail — generate a minimal valid PNG (64x64 white).
-    zip.start_file("thumbnail.png", opts)?;
+    zip.start_file("thumbnail.png", deflated)?;
     zip.write_all(&generate_thumbnail(pages, doc))?;
 
     // Assets: copy any PDF attachments referenced by page configs. Entries are
     // named by content hash, so deduplicate by that name rather than by the
     // attachment UUID: a GoodNotes export can use several UUIDs for the very
     // same PDF bytes, which would otherwise produce duplicate zip entries.
-    let mut written_assets = std::collections::HashSet::new();
-    for page in pages {
-        if let Some(cfg) = doc.page_cfg().get(&page.uuid)
-            && let Some(bytes) = doc.attachments.get(&cfg.attachment)
-        {
-            let hash = compute_hash(bytes);
-            let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-            if !written_assets.insert(hex.clone()) {
-                continue;
-            }
-            if bytes.len() as u64 > MOBILE_MAX_ENTRY {
-                eprintln!(
-                    "warning: asset {hex}.pdf is {} MiB; Notability's Android importer rejects entries over 64 MiB",
-                    bytes.len() / 1024 / 1024
-                );
-            }
-            zip.start_file(format!("assets/{hex}.pdf"), opts)?;
-            zip.write_all(bytes)?;
+    let mut written_assets = HashSet::new();
+    for (key, bytes) in &atts {
+        let hash = &hashes[key];
+        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        if !written_assets.insert(hex.clone()) {
+            continue;
         }
+        if bytes.len() as u64 > MOBILE_MAX_ENTRY {
+            eprintln!(
+                "warning: asset {hex}.pdf is {} MiB; Notability's Android importer rejects entries over 64 MiB",
+                bytes.len() / 1024 / 1024
+            );
+        }
+        zip.start_file(format!("assets/{hex}.pdf"), stored)?;
+        zip.write_all(bytes)?;
     }
 
     let cursor = zip.finish().context("finish ntb zip")?;

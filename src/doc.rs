@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufReader, Cursor, Read, Seek};
+use std::io::{Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -47,9 +46,10 @@ pub struct Document {
     /// Paper rectangles per background attachment, parsed once and shared
     /// across every page (backgrounds can be a 300 MB PDF).
     paper_cache: Mutex<HashMap<usize, Arc<PaperRects>>>,
-    /// Page sizes in PDF points per (attachment ptr, pdf page), parsed once so
-    /// background placement never re-reads a multi-hundred-MB PDF.
-    page_size_cache: Mutex<HashMap<(usize, u64), (f32, f32)>>,
+    /// Parsed PDF attachments (document + page map), keyed by shared byte
+    /// pointer. Without this, every page background would re-parse a
+    /// multi-hundred-MB PDF and re-walk its page tree.
+    pdf_docs: Mutex<HashMap<usize, Option<Arc<pdfinput::LoadedPdf>>>>,
     /// Temp copies of PDF attachments for pdftoppm, keyed by attachment
     /// pointer so aliased attachment uuids share one file.
     pdf_temps: Mutex<HashMap<usize, PathBuf>>,
@@ -228,7 +228,6 @@ impl Page {
     }
 }
 
-type Zip = ZipArchive<BufReader<File>>;
 /// `(x, y, w, h, rgb)` per paper rectangle.
 type PaperRects = Vec<(f32, f32, f32, f32, [f32; 3])>;
 /// Single-flight result of rasterizing one PDF page.
@@ -319,7 +318,7 @@ impl Document {
             attachments: HashMap::new(),
             page_cfg: HashMap::new(),
             paper_cache: Mutex::new(HashMap::new()),
-            page_size_cache: Mutex::new(HashMap::new()),
+            pdf_docs: Mutex::new(HashMap::new()),
             pdf_temps: Mutex::new(HashMap::new()),
             raster_cache: Mutex::new(HashMap::new()),
             temp_tag: 0,
@@ -378,24 +377,30 @@ impl Document {
         })
     }
 
-    /// Page size in PDF points, parsed once per (attachment, page).
-    fn cached_page_size(&self, att: &Arc<Vec<u8>>, pdf_page: u64) -> Option<(f32, f32)> {
-        let key = (Arc::as_ptr(att) as usize, pdf_page);
+    /// Parsed PDF attachment (document + page map), loaded once per shared
+    /// byte buffer.
+    fn cached_pdf(&self, att: &Arc<Vec<u8>>) -> Option<Arc<pdfinput::LoadedPdf>> {
+        let key = Arc::as_ptr(att) as usize;
         if let Some(hit) = self
-            .page_size_cache
+            .pdf_docs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&key)
-            .copied()
         {
-            return Some(hit);
+            return hit.clone();
         }
-        let size = pdfinput::page_size(att, pdf_page)?;
-        self.page_size_cache
+        let loaded = pdfinput::load_pdf_full(att).map(Arc::new);
+        self.pdf_docs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key, size);
-        Some(size)
+            .insert(key, loaded.clone());
+        loaded
+    }
+
+    /// Page size in PDF points, via the attachment's cached parse.
+    fn cached_page_size(&self, att: &Arc<Vec<u8>>, pdf_page: u64) -> Option<(f32, f32)> {
+        let lp = self.cached_pdf(att)?;
+        pdfinput::page_size_of(&lp, pdf_page)
     }
 
     /// JPEG raster of a background PDF page for SVG/PNG output at `dpi`.
@@ -437,59 +442,81 @@ impl Document {
     }
 
     pub fn open(path: &Path) -> Result<Document> {
-        let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let z = Zip::new(BufReader::new(file))
-            .with_context(|| format!("{} is not a readable zip archive", path.display()))?;
-        Self::load(z)
+        let data = std::fs::read(path).with_context(|| format!("open {}", path.display()))?;
+        Self::load(&data)
+            .with_context(|| format!("{} is not a readable zip archive", path.display()))
     }
 
     /// Open a notebook from an in-memory archive (the WASM/web entry point).
     pub fn from_bytes(data: Vec<u8>) -> Result<Document> {
-        let z = ZipArchive::new(Cursor::new(data)).context("not a readable zip archive")?;
-        Self::load(z)
+        Self::load(&data)
     }
 
-    fn load<R: Read + Seek>(mut z: ZipArchive<R>) -> Result<Document> {
+    fn load(data: &[u8]) -> Result<Document> {
+        let mut z = ZipArchive::new(Cursor::new(data)).context("not a readable zip archive")?;
         let schema = match read_member(&mut z, "schema.pb")? {
             Some(raw) => parse(&raw).ok().and_then(|f| varint_of(&f, 1)).unwrap_or(0),
             None => 0,
         };
+        let index_notes = read_member(&mut z, "index.notes.pb")?;
+        let index_atts = read_member(&mut z, "index.attachments.pb")?;
+        let index_events = read_member(&mut z, "index.events.pb")?;
+        drop(z);
 
-        let mut pages = Vec::new();
-        if let Some(idx) = read_member(&mut z, "index.notes.pb")? {
-            for (uuid, member) in index_entries(&idx)? {
-                let data = read_member(&mut z, &member)?
-                    .filter(|d| !d.is_empty())
-                    .unwrap_or_default();
-                pages.push(PageSource { uuid, data });
+        let page_entries = match index_notes {
+            Some(idx) => index_entries(&idx)?,
+            None => Vec::new(),
+        };
+        let att_entries = match index_atts {
+            Some(idx) => index_entries(&idx)?,
+            None => Vec::new(),
+        };
+
+        // Inflate every needed member at once (parallel on native targets).
+        // Attachment uuids can alias one member, so members are read uniquely.
+        let mut member_names: Vec<String> = page_entries
+            .iter()
+            .map(|(_, member)| member.clone())
+            .collect();
+        let mut att_members: Vec<String> = Vec::new();
+        {
+            let mut seen = HashSet::new();
+            for (_, member) in &att_entries {
+                if seen.insert(member.clone()) {
+                    att_members.push(member.clone());
+                }
             }
+            member_names.extend(att_members.iter().cloned());
+        }
+        let name_refs: Vec<&str> = member_names.iter().map(String::as_str).collect();
+        let mut blobs = crate::par::zip_members(data, &name_refs)?.into_iter();
+
+        let mut pages = Vec::with_capacity(page_entries.len());
+        for (uuid, _member) in page_entries {
+            let data = blobs
+                .next()
+                .flatten()
+                .filter(|d| !d.is_empty())
+                .unwrap_or_default();
+            pages.push(PageSource { uuid, data });
         }
 
-        let mut attachments = HashMap::new();
         let mut member_cache: HashMap<String, Arc<Vec<u8>>> = HashMap::new();
-        if let Some(idx) = read_member(&mut z, "index.attachments.pb")? {
-            for (uuid, member) in index_entries(&idx)? {
-                let data = match member_cache.get(&member) {
-                    Some(cached) => Arc::clone(cached),
-                    None => {
-                        let Some(data) = read_member(&mut z, &member)? else {
-                            continue;
-                        };
-                        if data.is_empty() {
-                            continue;
-                        }
-                        crate::vlog!(1, "asset {uuid}: {} bytes loaded", data.len());
-                        let data = Arc::new(data);
-                        member_cache.insert(member, Arc::clone(&data));
-                        data
-                    }
-                };
-                attachments.insert(uuid, data);
+        for (member, blob) in att_members.into_iter().zip(&mut blobs) {
+            if let Some(data) = blob.filter(|d| !d.is_empty()) {
+                member_cache.insert(member, Arc::new(data));
+            }
+        }
+        let mut attachments = HashMap::new();
+        for (uuid, member) in att_entries {
+            if let Some(data) = member_cache.get(&member) {
+                crate::vlog!(1, "asset {uuid}: {} bytes loaded", data.len());
+                attachments.insert(uuid, Arc::clone(data));
             }
         }
 
         let mut page_cfg: HashMap<String, PageCfg> = HashMap::new();
-        if let Some(raw) = read_member(&mut z, "index.events.pb")?
+        if let Some(raw) = index_events
             && let Ok((configs, page_cfgs)) = parse_events(&raw)
         {
             for page in &pages {
@@ -517,7 +544,7 @@ impl Document {
             attachments,
             page_cfg,
             paper_cache: Mutex::new(HashMap::new()),
-            page_size_cache: Mutex::new(HashMap::new()),
+            pdf_docs: Mutex::new(HashMap::new()),
             pdf_temps: Mutex::new(HashMap::new()),
             raster_cache: Mutex::new(HashMap::new()),
             temp_tag: DOC_TAG.fetch_add(1, Ordering::Relaxed),
