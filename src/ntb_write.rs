@@ -16,12 +16,10 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use sha2::{Digest, Sha512};
-use zip::ZipWriter;
-use zip::write::SimpleFileOptions;
 
-use crate::doc::{Document, Item, Page, ShapeKind};
+use crate::doc::{Document, Item, PAGE_H, PAGE_W, Page, ShapeKind};
 
 // PayloadType constants (matching the reader in `ntb.rs`).
 const PT_DOCUMENT_SETUP: u8 = 1;
@@ -507,7 +505,9 @@ fn write_create_page(
     if let Some(prev) = prev {
         fields.push((0, FieldVal::Inline(df_inline(prev.0, prev.1, prev.2))));
     }
-    if page_count > 1 {
+    // Native files always carry pageCount on the root create (fields [2])
+    // and on multi-page PDF imports; later single-page adds omit it.
+    if page_count > 1 || prev.is_none() {
         fields.push((2, FieldVal::Inline(page_count.to_le_bytes().to_vec())));
     }
     let payload = if let Some(bg_info) = background {
@@ -695,25 +695,88 @@ fn ellipse_outline(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<[f32; 2]> {
     pts
 }
 
+/// Coordinate transform from a source page's space to the Notability page
+/// space: `ntb = (src - offset) / scale`. GoodNotes decodes everything into
+/// its own canvas (`PAGE_W`×`PAGE_H`, A4 at ~132 dpi); Notability renders
+/// PDF-bound pages at the source PDF page's own point size and ink in the
+/// same space, so geometry must be rescaled or it overflows the page.
+#[derive(Clone, Copy)]
+struct Xf {
+    s: f32,
+    ox: f32,
+    oy: f32,
+}
+
+impl Xf {
+    const IDENTITY: Xf = Xf { s: 1.0, ox: 0.0, oy: 0.0 };
+
+    fn is_identity(&self) -> bool {
+        self.s == 1.0 && self.ox == 0.0 && self.oy == 0.0
+    }
+
+    fn apply(&self, p: [f32; 2]) -> [f32; 2] {
+        [(p[0] - self.ox) / self.s, (p[1] - self.oy) / self.s]
+    }
+}
+
+/// Compute the page-space transform for one page. `target` is the page's
+/// rendered size in Notability points — the bound PDF page's own dims, or
+/// `None` for paper-only pages. A GoodNotes-sized page with no target maps
+/// onto A4 points (the app default for bare pages); anything else is
+/// already in points and stays put.
+fn page_xform(page_w: f32, page_h: f32, target: Option<(f32, f32)>) -> Xf {
+    let (tw, th) = match target {
+        Some(t) => t,
+        None => {
+            if (page_w - PAGE_W).abs() < 0.5 && (page_h - PAGE_H).abs() < 0.5 {
+                (595.28, 841.89)
+            } else {
+                (page_w, page_h)
+            }
+        }
+    };
+    let s = (page_w / tw).min(page_h / th);
+    if !s.is_finite() || s <= 0.0 {
+        return Xf::IDENTITY;
+    }
+    Xf {
+        s,
+        ox: (page_w - tw * s) / 2.0,
+        oy: (page_h - th * s) / 2.0,
+    }
+}
+
 /// Build the `noteBundle` FlatBuffer from pages and document.
 /// `hashes` maps each background attachment key to its precomputed content
-/// hash (computed once per unique attachment, not per page).
+/// hash (computed once per unique attachment, not per page). Returns the
+/// buffer plus the generated title, GUID, timestamp and subject id.
 fn build_note_bundle(
     pages: &[Page],
     doc: &Document,
     hashes: &HashMap<String, [u8; 64]>,
-) -> (Vec<u8>, [u8; 16], u64, [u8; 16]) {
+) -> (Vec<u8>, String, [u8; 16], u64, [u8; 16]) {
     let mut ids = EntityGen::new();
     let mut specs: Vec<OpSpec> = Vec::new();
     let mut ink_id: u32 = 0;
     macro_rules! ink {
-        ($page:expr, $pts:expr, $width:expr, $rgba:expr) => {{
+        ($page:expr, $pts:expr, $width:expr, $rgba:expr, $xf:expr) => {{
             ink_id += 1;
+            let xf: Xf = $xf;
+            let pts = match $pts {
+                InkPts::Ref(r) if xf.is_identity() => InkPts::Ref(r),
+                InkPts::Ref(r) => {
+                    InkPts::Owned(r.iter().map(|&p| xf.apply(p)).collect())
+                }
+                InkPts::Owned(v) if xf.is_identity() => InkPts::Owned(v),
+                InkPts::Owned(v) => {
+                    InkPts::Owned(v.iter().map(|&p| xf.apply(p)).collect())
+                }
+            };
             specs.push(OpSpec::Ink {
                 entity: ids.next(),
                 page: $page,
-                pts: $pts,
-                width: $width,
+                pts,
+                width: $width / xf.s,
                 rgba: $rgba,
                 ink_id,
             });
@@ -721,10 +784,11 @@ fn build_note_bundle(
     }
 
     // First op: DocumentSetup (pt=1). Required by Notability.
+    let title = format!("Note {}", chrono_like_timestamp());
     let setup_entity = ids.next();
     specs.push(OpSpec::Setup {
         entity: setup_entity,
-        title: format!("Note {}", chrono_like_timestamp()),
+        title: title.clone(),
         locale: "en_US".to_string(),
     });
 
@@ -771,9 +835,11 @@ fn build_note_bundle(
     // Native pageCount semantics: one CreatePage op can materialise several
     // sibling pages — SeqIds (site, seq, 0..N-1). PDF-imported notes use one
     // op per PDF: sibling i shows source page i+1. Group consecutive pages
-    // that share an attachment with consecutive source-page numbers (and
-    // consecutive un-bound pages) into one op, as real exports do.
+    // that share an attachment with consecutive source-page numbers into
+    // one op, as real exports do; paper-only pages are emitted as bare
+    // single ops linked to their predecessor (also matching real exports).
     let mut page_ids: Vec<(u16, u32, u32)> = Vec::with_capacity(pages.len());
+    let mut xforms: Vec<Xf> = Vec::with_capacity(pages.len());
     {
         let mut prev_loc: Option<(u16, u32, u32)> = None;
         let mut i = 0;
@@ -783,28 +849,40 @@ fn build_note_bundle(
             let att = cfg.map(|c| c.attachment.as_str());
             let first_pdf = cfg.and_then(|c| c.pdf_page).unwrap_or(0) as u32;
 
-            // Extend the run while pages share the same binding.
+            // Extend the run only while pages share a PDF binding.
             let mut count = 1usize;
-            while i + count < pages.len() {
-                let c2 = cfg_of(&pages[i + count]);
-                let same = match (att, c2.map(|c| c.attachment.as_str())) {
-                    (Some(a), Some(b)) if a == b => {
-                        let expect = first_pdf + count as u32;
-                        c2.and_then(|c| c.pdf_page).unwrap_or(0) as u32 == expect
+            if att.is_some() {
+                while i + count < pages.len() {
+                    let c2 = cfg_of(&pages[i + count]);
+                    let same = match c2.map(|c| c.attachment.as_str()) {
+                        Some(b) if b == att.unwrap() => {
+                            let expect = first_pdf + count as u32;
+                            c2.and_then(|c| c.pdf_page).unwrap_or(0) as u32
+                                == expect
+                        }
+                        _ => false,
+                    };
+                    if !same {
+                        break;
                     }
-                    (None, None) => true,
-                    _ => false,
-                };
-                if !same {
-                    break;
+                    count += 1;
                 }
-                count += 1;
             }
 
             let page_entity = ids.next();
             let seq = page_entity.1;
             for sib in 0..count {
                 page_ids.push((page_entity.0, seq, sib as u32));
+                let target = cfg_of(&pages[i + sib]).and_then(|c| {
+                    c.pdf_page.and_then(|p| {
+                        bg_boxes
+                            .get(&c.attachment)?
+                            .get(p.saturating_sub(1) as usize)
+                            .copied()
+                    })
+                });
+                let page = &pages[i + sib];
+                xforms.push(page_xform(page.width, page.height, target));
             }
 
             let bg = cfg.and_then(|cfg| {
@@ -822,11 +900,18 @@ fn build_note_bundle(
                 })
             });
 
+            // The page dims the app renders are the bound PDF page's own
+            // point size, not the source canvas size.
+            let (disp_w, disp_h) = bg
+                .as_ref()
+                .and_then(|b| b.boxes.get(b.page_offset as usize).copied())
+                .unwrap_or((pages[i].width, pages[i].height));
+
             specs.push(OpSpec::Page {
                 entity: page_entity,
                 prev: prev_loc,
-                width: pages[i].width,
-                height: pages[i].height,
+                width: disp_w,
+                height: disp_h,
                 background: bg,
                 page_count: count as u32,
             });
@@ -835,13 +920,14 @@ fn build_note_bundle(
         }
     }
 
-    for (page, &page_id) in pages.iter().zip(&page_ids) {
+    for (pi, (page, &page_id)) in pages.iter().zip(&page_ids).enumerate() {
+        let xf = xforms[pi];
 
         for item in &page.items {
             match item {
                 Item::Stroke(s) => {
                     if s.points.len() >= 2 {
-                        ink!(page_id, InkPts::Ref(&s.points), s.width, s.rgba);
+                        ink!(page_id, InkPts::Ref(&s.points), s.width, s.rgba, xf);
                     }
                 }
                 Item::Shape(sh) => {
@@ -862,18 +948,18 @@ fn build_note_bundle(
                         }
                     };
                     if pts.len() >= 2 {
-                        ink!(page_id, InkPts::Owned(pts), sh.width, sh.stroke);
+                        ink!(page_id, InkPts::Owned(pts), sh.width, sh.stroke, xf);
                     }
                 }
                 Item::Path(p) => {
                     if p.points.len() >= 2 {
-                        ink!(page_id, InkPts::Ref(&p.points), p.width, p.rgba);
+                        ink!(page_id, InkPts::Ref(&p.points), p.width, p.rgba, xf);
                     }
                 }
                 Item::FillPath(fp) => {
                     for contour in &fp.contours {
                         if contour.len() >= 2 {
-                            ink!(page_id, InkPts::Ref(contour), 1.0, fp.rgba);
+                            ink!(page_id, InkPts::Ref(contour), 1.0, fp.rgba, xf);
                         }
                     }
                 }
@@ -885,7 +971,8 @@ fn build_note_bundle(
                             [c.anchor[0], c.anchor[1]],
                         ]),
                         c.width,
-                        c.rgba
+                        c.rgba,
+                        xf
                     );
                 }
                 // Backgrounds, PDF backgrounds, images, text, stickies: not
@@ -954,7 +1041,7 @@ fn build_note_bundle(
     fb.patch_uoffset(root, ROOT_F6_OPS, ops_vec);
 
     let bundle = fb.finish(root);
-    (bundle, note_guid, timestamp_ms, subject_id)
+    (bundle, title, note_guid, timestamp_ms, subject_id)
 }
 
 /// Current wall-clock time in milliseconds. The root table stores ms while
@@ -1074,7 +1161,8 @@ pub fn write_ntb(pages: &[Page], doc: &Document, mut w: impl Write) -> Result<()
         })
         .collect();
 
-    let (bundle, _note_guid, _ts_ms, subject_id) = build_note_bundle(pages, doc, &hashes);
+    let (bundle, title, _note_guid, _ts_ms, subject_id) =
+        build_note_bundle(pages, doc, &hashes);
     if bundle.len() as u64 > MOBILE_MAX_ENTRY {
         eprintln!(
             "warning: noteBundle is {} MiB; Notability's Android importer rejects entries over 64 MiB",
@@ -1082,43 +1170,20 @@ pub fn write_ntb(pages: &[Page], doc: &Document, mut w: impl Write) -> Result<()
         );
     }
 
-    let deflated = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    // Assets are PDF/images — already compressed, so deflate gains nothing
-    // but takes most of the write time on large notebooks.
-    let stored = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    // Native .ntb archives store every member uncompressed with the UTF-8
+    // flag set, in this exact order: version, noteBundle, assets, manifest,
+    // indexes, thumbnail. zip-rs can't force flag bits, so the container is
+    // written by hand — matching real exports exactly.
+    let mut entries: Vec<(String, &[u8])> = Vec::new();
+    entries.push(("version".into(), b"1"));
 
-    // Version file: Notability's NTB parser decodes this as a UTF-8 string and
-    // requires it to equal "1" (ASCII 0x31), not a single byte 0x01.
-    zip.start_file("version", deflated)?;
-    zip.write_all(b"1")?;
+    entries.push(("noteBundle".into(), &bundle));
 
-    zip.start_file("noteBundle", deflated)?;
-    zip.write_all(&bundle)?;
-
-    // Manifest with required fields (subjectId, subjectName, appVersion).
-    // subjectId is unique per converted note — recycling one ID made every
-    // output collide in libraries that dedupe by subject.
-    let manifest = format!(
-        "{{\n  \"subjectId\" : \"{}\",\n  \"subjectName\" : \"Imported\",\n  \"appVersion\" : \"16.12.5\"\n}}",
-        format_guid(&subject_id)
-    );
-    zip.start_file("manifest.json", deflated)?;
-    zip.write_all(manifest.as_bytes())?;
-
-    // HandwritingIndex.fb — required by Notability import.
-    // Structure from real samples: 4-field table with version/flags.
-    zip.start_file("index/ios/HandwritingIndex.fb", deflated)?;
-    zip.write_all(&build_handwriting_index())?;
-
-    // Thumbnail — generate a minimal valid PNG (64x64 white).
-    zip.start_file("thumbnail.png", deflated)?;
-    zip.write_all(&generate_thumbnail(pages, doc))?;
-
-    // Assets: copy any PDF attachments referenced by page configs. Entries are
-    // named by content hash, so deduplicate by that name rather than by the
-    // attachment UUID: a GoodNotes export can use several UUIDs for the very
-    // same PDF bytes, which would otherwise produce duplicate zip entries.
+    // Assets: copy any PDF/image attachments referenced by page configs.
+    // Entries are named by content hash, so deduplicate by that name rather
+    // than by the attachment UUID: a GoodNotes export can use several UUIDs
+    // for the very same PDF bytes, which would otherwise produce duplicate
+    // zip entries.
     let mut written_assets = HashSet::new();
     for (key, bytes) in &atts {
         let hash = &hashes[key];
@@ -1126,18 +1191,36 @@ pub fn write_ntb(pages: &[Page], doc: &Document, mut w: impl Write) -> Result<()
         if !written_assets.insert(hex.clone()) {
             continue;
         }
+        let (ext, _mime) = sniff_asset(bytes);
         if bytes.len() as u64 > MOBILE_MAX_ENTRY {
             eprintln!(
-                "warning: asset {hex}.pdf is {} MiB; Notability's Android importer rejects entries over 64 MiB",
+                "warning: asset {hex}.{ext} is {} MiB; Notability's Android importer rejects entries over 64 MiB",
                 bytes.len() / 1024 / 1024
             );
         }
-        zip.start_file(format!("assets/{hex}.pdf"), stored)?;
-        zip.write_all(bytes)?;
+        entries.push((format!("assets/{hex}.{ext}"), bytes.as_slice()));
     }
 
-    let cursor = zip.finish().context("finish ntb zip")?;
-    let bytes = cursor.into_inner();
+    // Manifest with required fields (subjectId, subjectName, appVersion).
+    // subjectId is unique per converted note — recycling one ID made every
+    // output collide in libraries that dedupe by subject.
+    let manifest = format!(
+        "{{\n  \"subjectId\" : \"{}\",\n  \"subjectName\" : \"{}\",\n  \"appVersion\" : \"16.12.5\"\n}}",
+        format_guid(&subject_id),
+        title.replace('"', "\\\"")
+    );
+    entries.push(("manifest.json".into(), manifest.as_bytes()));
+
+    // HandwritingIndex.fb — required by Notability import.
+    // Structure from real samples: 4-field table with version/flags.
+    let hw_index = build_handwriting_index();
+    entries.push(("index/ios/HandwritingIndex.fb".into(), &hw_index));
+
+    // Thumbnail — generate a minimal valid PNG (64x64 white).
+    let thumbnail = generate_thumbnail(pages, doc);
+    entries.push(("thumbnail.png".into(), &thumbnail));
+
+    let bytes = write_stored_zip(&entries);
     if bytes.len() as u64 > MOBILE_MAX_ARCHIVE {
         eprintln!(
             "warning: .ntb is {} MB; Notability's Android picker rejects files over 500 MB",
@@ -1153,6 +1236,81 @@ pub fn write_ntb_to_vec(pages: &[Page], doc: &Document) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     write_ntb(pages, doc, &mut out)?;
     Ok(out)
+}
+
+/// CRC-32 (IEEE) lookup table for zip member checksums.
+fn crc32(data: &[u8]) -> u32 {
+    let mut table = [0u32; 256];
+    for (i, e) in table.iter_mut().enumerate() {
+        let mut c = i as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+        }
+        *e = c;
+    }
+    let mut crc = !0u32;
+    for &b in data {
+        crc = table[((crc ^ b as u32) & 0xff) as usize] ^ (crc >> 8);
+    }
+    !crc
+}
+
+/// Write a zip container with every member Stored (uncompressed) and the
+/// UTF-8 flag set — the exact layout native Notability exports use. The
+/// flag bit can't be forced through zip-rs, so headers are written by hand.
+fn write_stored_zip(entries: &[(String, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(entries.iter().map(|(_, d)| d.len() + 96).sum());
+    let mut central = Vec::with_capacity(entries.len() * 64);
+    for (name, data) in entries {
+        let name = name.as_bytes();
+        let crc = crc32(data);
+        let len = data.len() as u32;
+        let offset = out.len() as u32;
+
+        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes()); // local sig
+        out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        out.extend_from_slice(&0x800u16.to_le_bytes()); // UTF-8 flag
+        out.extend_from_slice(&0u16.to_le_bytes()); // method: Stored
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        out.extend_from_slice(&0x21u16.to_le_bytes()); // mod date: 1980-01-01
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        out.extend_from_slice(name);
+        out.extend_from_slice(data);
+
+        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes()); // central sig
+        central.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        central.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        central.extend_from_slice(&0x800u16.to_le_bytes()); // UTF-8 flag
+        central.extend_from_slice(&0u16.to_le_bytes()); // method: Stored
+        central.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        central.extend_from_slice(&0x21u16.to_le_bytes()); // mod date
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&len.to_le_bytes());
+        central.extend_from_slice(&len.to_le_bytes());
+        central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        central.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        central.extend_from_slice(&0u16.to_le_bytes()); // disk
+        central.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+        central.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(name);
+    }
+    let cd_offset = out.len() as u32;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes()); // EOCD sig
+    out.extend_from_slice(&0u16.to_le_bytes()); // disk
+    out.extend_from_slice(&0u16.to_le_bytes()); // cd start disk
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+    out.extend_from_slice(&cd_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+    out
 }
 
 /// Build HandwritingIndex.fb — a minimal FlatBuffer required by Notability.

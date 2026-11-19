@@ -573,6 +573,22 @@ validated by round-tripping through the real applications. No writer should be
 considered correct until it has been opened and re-saved by Notability /
 GoodNotes on a device.
 
+**Coordinate space (writer — VERIFIED by native imports):** every dimension in
+the `noteBundle` is in PDF points. `PageBackground.f3` is the *bound PDF
+page's own* point size (612×792 for letter, 596×842 for A4, exact cropbox
+dims for odd sizes), not the source app's canvas size — writing e.g. a
+GoodNotes 1091.35×1543.5 canvas there makes the app draw the PDF at its
+native size while ink lands ~1.83× too large (the "overflow" bug). Ink
+anchors, `qT` path points, stroke widths and shape geometry must all be
+rescaled into the same space: for GoodNotes input the map is the reverse of
+the reader's PDF fit, `s = min(canvas_w/pdf_w, canvas_h/pdf_h)`,
+`ntb = (gn − centre_offset)/s`; paper-only GoodNotes pages map onto the A4
+default the app uses for bare creates. Pages bound to no asset are emitted
+as bare `pl=[0]` creates (one op each), and the first create op always
+carries `f2` (pageCount). The zip container stores every member
+uncompressed (`method=0`) with the UTF-8 flag (`0x800`) set, in the order
+version → noteBundle → assets → manifest → index/ios/* → thumbnail.png.
+
 ## 7. Rust reader — IMPLEMENTED
 
 `src/ntb.rs` provides a schema-less FlatBuffer walker and a `.ntb` container
