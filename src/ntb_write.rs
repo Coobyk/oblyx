@@ -24,10 +24,10 @@ use zip::write::SimpleFileOptions;
 use crate::doc::{Document, Item, Page, ShapeKind};
 
 // PayloadType constants (matching the reader in `ntb.rs`).
+const PT_DOCUMENT_SETUP: u8 = 1;
+const PT_CREATE_ASSET: u8 = 2;
 const PT_CREATE_PAGE: u8 = 3;
 const PT_CREATE_INK: u8 = 15;
-const PT_CREATE_SHAPE: u8 = 18;
-const PT_DOCUMENT_SETUP: u8 = 1;
 
 // Root table field indices (verified against real samples).
 const ROOT_F0_NOTE_GUID: usize = 0; // 16-byte inline GUID
@@ -95,9 +95,40 @@ impl Fb {
         pos
     }
 
+    /// Write a string: u32 length + data + NUL terminator, padded to 4.
+    /// FlatBuffers strings must be NUL-terminated or the native verifier
+    /// rejects the buffer (web import accepts them anyway).
+    fn write_fb_string(&mut self, data: &[u8]) -> usize {
+        self.align(4);
+        let pos = self.buf.len();
+        self.buf
+            .extend_from_slice(&(data.len() as u32).to_le_bytes());
+        self.buf.extend_from_slice(data);
+        self.buf.push(0);
+        pos
+    }
+
+    /// Natural alignment for an inline field of `size` bytes. FlatBuffers
+    /// requires every member to be aligned to its largest scalar; we only
+    /// know the byte length, so align to the largest power of two (≤8) that
+    /// divides it — never under-aligns for scalar/struct members, and the
+    /// native verifier rejects under-aligned objects.
+    fn field_align(size: usize) -> usize {
+        if size.is_multiple_of(8) {
+            8
+        } else if size.is_multiple_of(4) {
+            4
+        } else if size.is_multiple_of(2) {
+            2
+        } else {
+            1
+        }
+    }
+
     /// Write a FlatBuffer table with the given fields. Returns the table
-    /// position. The vtable is written immediately after the table with a
-    /// negative soffset (vtable after table).
+    /// position. The vtable is written after the table (negative soffset).
+    /// The table start is aligned to its most-aligned member so every
+    /// field lands on a properly aligned absolute offset.
     fn write_table(&mut self, fields: &[(usize, FieldVal)]) -> usize {
         let mut sorted: Vec<(usize, FieldVal)> = fields.to_vec();
         sorted.sort_by_key(|(i, _)| *i);
@@ -106,20 +137,21 @@ impl Fb {
         // Table layout: [i32 soffset] [field_data ...]
         let mut field_offs: Vec<(usize, usize)> = Vec::new();
         let mut data_off = 4usize; // after soffset
+        let mut max_align = 4usize;
         for &(idx, ref val) in &sorted {
             let size = match val {
                 FieldVal::Inline(b) => b.len(),
             };
-            let align = match size {
-                1 => 1,
-                2 => 2,
-                _ => 4,
-            };
+            let align = Self::field_align(size);
+            max_align = max_align.max(align);
             data_off = data_off.next_multiple_of(align);
             field_offs.push((idx, data_off));
             data_off += size;
         }
         let table_size = data_off;
+
+        // Align the table so every member's absolute offset is aligned.
+        self.align(max_align);
 
         // Write table body.
         let tp = self.buf.len();
@@ -289,33 +321,50 @@ fn gf_color(rgba: &[f32; 4]) -> Vec<u8> {
     ]
 }
 
-/// Entity id counter: (site, timestamp) pairs.
+/// Entity id counter: (site, seq) pairs — seq is a plain per-note op
+/// ordinal, matching both the wrapper entity and `df` reference ts fields.
 struct EntityGen {
     site: u16,
-    ts: u32,
+    seq: u32,
 }
 
 impl EntityGen {
     fn new() -> Self {
-        // Real samples start at site=0, ts=0.
-        Self { site: 0, ts: 0 }
+        // Real samples start at site=0, seq=0.
+        Self { site: 0, seq: 0 }
     }
 
     fn next(&mut self) -> (u16, u32) {
-        let id = (self.site, self.ts);
-        self.ts += 1;
+        let id = (self.site, self.seq);
+        self.seq += 1;
         id
     }
+}
+
+/// Write the shared op wrapper table: entity + µs timestamps + payloadType +
+/// payload uoffset placeholder. Native exports carry f1/f2 wall-clock
+/// timestamps on every op; the web-importer layout omits them but the mobile
+/// importer's verifier expects the native field set.
+fn write_op_table(fb: &mut Fb, entity: (u16, u32), ts_us: u64, pt: u8) -> usize {
+    fb.write_table(&[
+        (0, FieldVal::Inline(sf_inline(entity.0, entity.1))),
+        (1, FieldVal::Inline(ts_us.to_le_bytes().to_vec())),
+        (2, FieldVal::Inline(ts_us.to_le_bytes().to_vec())),
+        (4, FieldVal::Inline(vec![pt])),
+        (5, FieldVal::Inline(vec![0; 4])), // payload placeholder
+    ])
 }
 
 /// Write one CreateInk op into the buffer. Returns the op table position.
 fn write_create_ink(
     fb: &mut Fb,
     entity: (u16, u32),
+    ts_us: u64,
     page: (u16, u32, u32),
     points: &[[f32; 2]],
     width: f32,
     rgba: &[f32; 4],
+    ink_id: u32,
 ) -> usize {
     // Colour struct (inline Gf, 4 bytes).
     let color = gf_color(rgba);
@@ -328,23 +377,21 @@ fn write_create_ink(
 
     // Write the op table FIRST, then the payload, then the leaf blob, so every
     // uoffset points forward (required by real FlatBuffers readers).
-    // Op table: f0 = entity id (sf 8B inline), f4 = payloadType (u8), f5 = payload uoffset.
-    let op = fb.write_table(&[
-        (0, FieldVal::Inline(sf_inline(entity.0, entity.1))),
-        (4, FieldVal::Inline(vec![PT_CREATE_INK])),
-        (5, FieldVal::Inline(vec![0; 4])), // placeholder
-    ]);
+    // Op table (native layout): f0 = entity (sf 8B inline), f1/f2 = op
+    // created/modified timestamps (u64 µs), f4 = payloadType (u8),
+    // f5 = payload uoffset.
+    let op = write_op_table(fb, entity, ts_us, PT_CREATE_INK);
 
-    // CreateInk payload: f0 page (df inline), f1 origin (Sf inline),
-    // f4 tool, f5 style, f7 colour (gf inline), f8 width, f9 path blob.
+    // CreateInk payload (native): f0 page (df inline), f1 origin (Sf inline),
+    // f5 style, f7 colour (packed RGBA), f8 width, f9 path blob, f15 stroke id.
     let payload = fb.write_table(&[
         (0, FieldVal::Inline(df_inline(page.0, page.1, page.2))),
         (1, FieldVal::Inline(sf_xy(origin[0], origin[1]))),
-        (4, FieldVal::Inline(vec![0])), // tool = Pen
-        (5, FieldVal::Inline(vec![0])), // style = VariableWidth
+        (5, FieldVal::Inline(vec![1])),
         (7, FieldVal::Inline(color)),
         (8, FieldVal::Inline(width.to_le_bytes().to_vec())),
         (9, FieldVal::Inline(vec![0; 4])), // placeholder
+        (15, FieldVal::Inline(ink_id.to_le_bytes().to_vec())),
     ]);
 
     let path_pos = fb.write_byte_vector(&build_path_stream(points));
@@ -353,79 +400,46 @@ fn write_create_ink(
     op
 }
 
-/// Write one CreateShape op (box/ellipse). Returns the op table position.
-#[allow(clippy::too_many_arguments)]
-fn write_create_shape(
-    fb: &mut Fb,
-    entity: (u16, u32),
-    page: (u16, u32, u32),
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    ellipse: bool,
-    fill: &[f32; 4],
-    stroke: &[f32; 4],
-    border_width: f32,
-) -> usize {
-    let color = gf_color(stroke);
-    let fill_color = gf_color(fill);
-
-    // Op table first, then payload, then definition table (forward uoffsets).
-    let op = fb.write_table(&[
-        (0, FieldVal::Inline(sf_inline(entity.0, entity.1))),
-        (4, FieldVal::Inline(vec![PT_CREATE_SHAPE])),
-        (5, FieldVal::Inline(vec![0; 4])), // placeholder
-    ]);
-
-    // CreateShape payload: f0 page, f1 origin, f2 rotation, f4 defType,
-    // f5 def (uoffset), f9 colour, f10 border, f11 fill.
-    let payload = fb.write_table(&[
-        (0, FieldVal::Inline(df_inline(page.0, page.1, page.2))),
-        (1, FieldVal::Inline(sf_xy(x, y))),
-        (2, FieldVal::Inline(0f32.to_le_bytes().to_vec())), // rotation = 0
-        (4, FieldVal::Inline(vec![3])),                     // DEF_NORMAL
-        (5, FieldVal::Inline(vec![0; 4])),                  // placeholder
-        (9, FieldVal::Inline(color)),
-        (10, FieldVal::Inline(border_width.to_le_bytes().to_vec())),
-        (11, FieldVal::Inline(fill_color)),
-    ]);
-
-    // NormalShape definition: f0 type (0=Ellipse, 1=Rect), f1 size (Sf inline).
-    let def_type: u8 = if ellipse { 0 } else { 1 };
-    let def = fb.write_table(&[
-        (0, FieldVal::Inline(vec![def_type])),
-        (1, FieldVal::Inline(sf_xy(w, h))),
-    ]);
-
-    fb.patch_uoffset(payload, 5, def);
+/// Write a CreateAsset op (pt=2). Native exports register every background
+/// attachment before pages reference it; the payload is just the 64-byte
+/// content hash, and the entity uses the reserved site id 0xffff.
+fn write_create_asset(fb: &mut Fb, entity: (u16, u32), ts_us: u64, hash: &[u8; 64]) -> usize {
+    let op = write_op_table(fb, entity, ts_us, PT_CREATE_ASSET);
+    let payload = fb.write_table(&[(0, FieldVal::Inline(hash.to_vec()))]);
     fb.patch_uoffset(op, 5, payload);
     op
 }
 
-/// Write a string field (uoffset to u32-len + bytes).
+/// Write a string field (uoffset to u32-len + bytes + NUL terminator).
 fn write_string(fb: &mut Fb, s: &str) -> usize {
-    fb.write_byte_vector(s.as_bytes())
+    fb.write_fb_string(s.as_bytes())
 }
 
 /// Write a DocumentSetup op (pt=1). This is the first op in real files and
 /// configures the notebook metadata (title, locale, default settings).
-fn write_document_setup(fb: &mut Fb, entity: (u16, u32), title: &str, locale: &str) -> usize {
+/// Native payload: f0 title table, f1 subject table, f2 locale table,
+/// f3 flags u8, f4 default font name string, f5 default font size,
+/// f6/f7 u8 flags.
+fn write_document_setup(
+    fb: &mut Fb,
+    entity: (u16, u32),
+    ts_us: u64,
+    title: &str,
+    locale: &str,
+) -> usize {
     // Op → payload → sub-tables → strings, all written referrer-first so
     // their uoffsets point forward.
-    let op = fb.write_table(&[
-        (0, FieldVal::Inline(sf_inline(entity.0, entity.1))),
-        (4, FieldVal::Inline(vec![PT_DOCUMENT_SETUP])),
-        (5, FieldVal::Inline(vec![0; 4])), // placeholder
-    ]);
+    let op = write_op_table(fb, entity, ts_us, PT_DOCUMENT_SETUP);
 
-    // Payload: f0=title, f1=subject, f2=locale, f3=flags, f5=default_font_size.
     let payload = fb.write_table(&[
-        (0, FieldVal::Inline(vec![0; 4])), // placeholder
-        (1, FieldVal::Inline(vec![0; 4])), // placeholder
-        (2, FieldVal::Inline(vec![0; 4])), // placeholder
-        (3, FieldVal::Inline(6145u32.to_le_bytes().to_vec())), // flags
+        (0, FieldVal::Inline(vec![0; 4])), // title placeholder
+        (1, FieldVal::Inline(vec![0; 4])), // subject placeholder
+        (2, FieldVal::Inline(vec![0; 4])), // locale placeholder
+        (3, FieldVal::Inline(vec![1])),    // flags
+        (4, FieldVal::Inline(vec![0; 4])), // font placeholder
         (5, FieldVal::Inline(14.0f32.to_le_bytes().to_vec())), // default font size
+        (6, FieldVal::Inline(vec![0])),
+        (7, FieldVal::Inline(vec![0])),
     ]);
 
     let title_tbl = fb.write_table(&[(0, FieldVal::Inline(vec![0; 4]))]);
@@ -436,86 +450,124 @@ fn write_document_setup(fb: &mut Fb, entity: (u16, u32), title: &str, locale: &s
     let locale_str = write_string(fb, locale);
     fb.patch_uoffset(locale_tbl, 0, locale_str);
 
-    // Subject name placeholder (binary-ish data observed in samples).
-    let subject_tbl = fb.write_table(&[(0, FieldVal::Inline(vec![0x20; 16]))]);
+    // f1 sub-table: f0 → f32 vector (native files carry five 36.0 values —
+    // likely default margins/grid metrics).
+    let subject_tbl = fb.write_table(&[(0, FieldVal::Inline(vec![0; 4]))]);
+    let mut metrics = Vec::with_capacity(20);
+    for _ in 0..5 {
+        metrics.extend_from_slice(&36.0f32.to_le_bytes());
+    }
+    let vec_pos = fb.write_struct_vector(&metrics, 4);
+    fb.patch_uoffset(subject_tbl, 0, vec_pos);
+
+    let font_str = write_string(fb, "Inter");
 
     fb.patch_uoffset(payload, 0, title_tbl);
     fb.patch_uoffset(payload, 1, subject_tbl);
     fb.patch_uoffset(payload, 2, locale_tbl);
+    fb.patch_uoffset(payload, 4, font_str);
     fb.patch_uoffset(op, 5, payload);
     op
 }
 
-/// Write one CreatePage op. Returns the op table position.
+/// Everything a page needs to bind its background asset: content hash,
+/// byte size, file extension/mime, and the source PDF's per-page crop boxes
+/// (one per page, as native exports record).
+struct Bg<'a> {
+    hash: [u8; 64],
+    size: u32,
+    ext: &'a str,
+    mime: &'a str,
+    boxes: &'a [(f32, f32)],
+    /// 0-based index of the first source page this op consumes.
+    page_offset: u32,
+}
+
+/// Write one CreatePage op (native layout). Returns the op table position.
 ///
-/// When `background_hash` is `Some`, the page gets a `PageBackground` table
-/// with the 64-byte asset hash and page size. `pdf_page` is the 1-based
-/// index within the asset (stored implicitly by page_count / ordering).
+/// Native pages are ordered by location: payload f0 is a df reference to
+/// the page the new ones follow (absent on the first op). f2 is the
+/// pageCount — how many sibling pages the op materialises (default 1).
+/// Ops bound to a PDF background carry f1 → PageBackground → PDFAsset →
+/// AssetMetadata; siblings show consecutive source pages.
+#[allow(clippy::too_many_arguments)]
 fn write_create_page(
     fb: &mut Fb,
     entity: (u16, u32),
+    ts_us: u64,
+    prev: Option<(u16, u32, u32)>,
     width: f32,
     height: f32,
-    background_hash: Option<&[u8; 64]>,
-    background_size: u32,
+    background: Option<&Bg>,
     page_count: u32,
 ) -> usize {
-    let op = fb.write_table(&[
-        (0, FieldVal::Inline(sf_inline(entity.0, entity.1))),
-        (4, FieldVal::Inline(vec![PT_CREATE_PAGE])),
-        (5, FieldVal::Inline(vec![0; 4])), // placeholder
-    ]);
+    let op = write_op_table(fb, entity, ts_us, PT_CREATE_PAGE);
 
-    let payload = match background_hash {
-        Some(hash) => {
-            // Referrer-first order: payload → bg → nested → inner.
-            let payload = fb.write_table(&[
-                (1, FieldVal::Inline(vec![0; 4])), // placeholder
-                (2, FieldVal::Inline(page_count.to_le_bytes().to_vec())),
-            ]);
-            // PageBackground: f1 = uoffset to nested, f3 = size (Sf inline).
-            let bg = fb.write_table(&[
-                (1, FieldVal::Inline(vec![0; 4])), // placeholder
-                (3, FieldVal::Inline(sf_xy(width, height))),
-            ]);
-            // Nested table is the PDFAsset: f0 metadata, f2 totalPageCount,
-            // f3 pagesConsumed, f4 pageOffset, f5 cropBoxes (vector of 8-byte
-            // width/height structs). Notability requires one crop box per
-            // page consumed when it copies a page background.
-            let nested = fb.write_table(&[
-                (0, FieldVal::Inline(vec![0; 4])),  // metadata placeholder
-                (2, FieldVal::Inline(1u32.to_le_bytes().to_vec())), // totalPageCount
-                (3, FieldVal::Inline(1u32.to_le_bytes().to_vec())), // pagesConsumed
-                (4, FieldVal::Inline(0u32.to_le_bytes().to_vec())), // pageOffset
-                (5, FieldVal::Inline(vec![0; 4])),  // cropBoxes placeholder
-            ]);
-            // AssetMetadata: f0 = 64-byte hash (inline struct), f1 = fileName,
-            // f2 = mimeType. Notability requires all three when it copies the
-            // page background; omitting f1/f2 makes import fail with
-            // "FlatBuffers: field 6 must be set".
-            let inner = fb.write_table(&[
-                (0, FieldVal::Inline(hash.to_vec())),
-                (1, FieldVal::Inline(vec![0; 4])), // fileName placeholder
-                (2, FieldVal::Inline(vec![0; 4])), // mimeType placeholder
-                (3, FieldVal::Inline(background_size.to_le_bytes().to_vec())),
-            ]);
-            let file_name: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-            let file_name = format!("{file_name}.pdf");
-            let name_pos = fb.write_byte_vector(file_name.as_bytes());
-            let mime_pos = fb.write_byte_vector(b"application/pdf");
-            fb.patch_uoffset(inner, 1, name_pos);
-            fb.patch_uoffset(inner, 2, mime_pos);
-            let mut crop = Vec::with_capacity(8);
-            crop.extend_from_slice(&width.to_le_bytes());
-            crop.extend_from_slice(&height.to_le_bytes());
-            let crop_vec = fb.write_struct_vector(&crop, 8);
-            fb.patch_uoffset(nested, 5, crop_vec);
-            fb.patch_uoffset(nested, 0, inner);
-            fb.patch_uoffset(bg, 1, nested);
-            fb.patch_uoffset(payload, 1, bg);
-            payload
+    let mut fields: Vec<(usize, FieldVal)> = Vec::new();
+    if let Some(prev) = prev {
+        fields.push((0, FieldVal::Inline(df_inline(prev.0, prev.1, prev.2))));
+    }
+    if page_count > 1 {
+        fields.push((2, FieldVal::Inline(page_count.to_le_bytes().to_vec())));
+    }
+    let payload = if let Some(bg_info) = background {
+        fields.push((1, FieldVal::Inline(vec![0; 4]))); // bg placeholder
+        let payload = fb.write_table(&fields);
+
+        // PageBackground: f1 = uoffset to PDFAsset, f3 = size (Sf inline).
+        let bg = fb.write_table(&[
+            (1, FieldVal::Inline(vec![0; 4])), // placeholder
+            (3, FieldVal::Inline(sf_xy(width, height))),
+        ]);
+        // PDFAsset: f0 = metadata uoffset, f2/f3 = total source-page count
+        // (native files omit it for 1-page PDFs), f5 = cropBoxes — one
+        // 8-byte {width,height} struct per source PDF page.
+        let mut asset_fields: Vec<(usize, FieldVal)> =
+            vec![(0, FieldVal::Inline(vec![0; 4]))];
+        if bg_info.boxes.len() > 1 {
+            let n = (bg_info.boxes.len() as u32).to_le_bytes().to_vec();
+            asset_fields.push((2, FieldVal::Inline(n.clone())));
+            asset_fields.push((3, FieldVal::Inline(n)));
         }
-        None => fb.write_table(&[(2, FieldVal::Inline(page_count.to_le_bytes().to_vec()))]),
+        if bg_info.page_offset > 0 {
+            asset_fields.push((
+                4,
+                FieldVal::Inline(bg_info.page_offset.to_le_bytes().to_vec()),
+            ));
+        }
+        asset_fields.push((5, FieldVal::Inline(vec![0; 4]))); // cropBoxes placeholder
+        let nested = fb.write_table(&asset_fields);
+        // AssetMetadata: f0 = 64-byte hash, f1 = fileName, f2 = mimeType,
+        // f3 = byte size. All required by the native importer.
+        let inner = fb.write_table(&[
+            (0, FieldVal::Inline(bg_info.hash.to_vec())),
+            (1, FieldVal::Inline(vec![0; 4])), // fileName placeholder
+            (2, FieldVal::Inline(vec![0; 4])), // mimeType placeholder
+            (3, FieldVal::Inline(bg_info.size.to_le_bytes().to_vec())),
+        ]);
+        let file_name: String = bg_info
+            .hash
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let file_name = format!("{file_name}.{}", bg_info.ext);
+        let name_pos = fb.write_fb_string(file_name.as_bytes());
+        let mime_pos = fb.write_fb_string(bg_info.mime.as_bytes());
+        fb.patch_uoffset(inner, 1, name_pos);
+        fb.patch_uoffset(inner, 2, mime_pos);
+        let mut crop = Vec::with_capacity(bg_info.boxes.len() * 8);
+        for &(w, h) in bg_info.boxes {
+            crop.extend_from_slice(&w.to_le_bytes());
+            crop.extend_from_slice(&h.to_le_bytes());
+        }
+        let crop_vec = fb.write_struct_vector(&crop, 8);
+        fb.patch_uoffset(nested, 5, crop_vec);
+        fb.patch_uoffset(nested, 0, inner);
+        fb.patch_uoffset(bg, 1, nested);
+        fb.patch_uoffset(payload, 1, bg);
+        payload
+    } else {
+        fb.write_table(&fields)
     };
 
     fb.patch_uoffset(op, 5, payload);
@@ -546,12 +598,16 @@ enum OpSpec<'a> {
         title: String,
         locale: String,
     },
+    Asset {
+        entity: (u16, u32),
+        hash: [u8; 64],
+    },
     Page {
         entity: (u16, u32),
+        prev: Option<(u16, u32, u32)>,
         width: f32,
         height: f32,
-        background: Option<[u8; 64]>,
-        background_size: u32,
+        background: Option<Bg<'a>>,
         page_count: u32,
     },
     Ink {
@@ -560,18 +616,7 @@ enum OpSpec<'a> {
         pts: InkPts<'a>,
         width: f32,
         rgba: [f32; 4],
-    },
-    Shape {
-        entity: (u16, u32),
-        page: (u16, u32, u32),
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        ellipse: bool,
-        fill: [f32; 4],
-        stroke: [f32; 4],
-        border_width: f32,
+        ink_id: u32,
     },
 }
 
@@ -579,28 +624,30 @@ enum OpSpec<'a> {
 /// relative to field positions inside the buffer, so the whole buffer can be
 /// appended to the main one and its references stay valid; the ops vector
 /// just needs slot `i` patched to `base + op_table_pos`.
-fn serialize_op(spec: &OpSpec) -> (usize, Vec<u8>) {
+fn serialize_op(spec: &OpSpec, ts_us: u64) -> (usize, Vec<u8>) {
     let mut fb = Fb::bare();
     let op = match spec {
         OpSpec::Setup {
             entity,
             title,
             locale,
-        } => write_document_setup(&mut fb, *entity, title, locale),
+        } => write_document_setup(&mut fb, *entity, ts_us, title, locale),
+        OpSpec::Asset { entity, hash } => write_create_asset(&mut fb, *entity, ts_us, hash),
         OpSpec::Page {
             entity,
+            prev,
             width,
             height,
             background,
-            background_size,
             page_count,
         } => write_create_page(
             &mut fb,
             *entity,
+            ts_us,
+            *prev,
             *width,
             *height,
             background.as_ref(),
-            *background_size,
             *page_count,
         ),
         OpSpec::Ink {
@@ -609,23 +656,43 @@ fn serialize_op(spec: &OpSpec) -> (usize, Vec<u8>) {
             pts,
             width,
             rgba,
-        } => write_create_ink(&mut fb, *entity, *page, pts.points(), *width, rgba),
-        OpSpec::Shape {
-            entity,
-            page,
-            x,
-            y,
-            w,
-            h,
-            ellipse,
-            fill,
-            stroke,
-            border_width,
-        } => write_create_shape(
-            &mut fb, *entity, *page, *x, *y, *w, *h, *ellipse, fill, stroke, *border_width,
+            ink_id,
+        } => write_create_ink(
+            &mut fb,
+            *entity,
+            ts_us,
+            *page,
+            pts.points(),
+            *width,
+            rgba,
+            *ink_id,
         ),
     };
     (op, fb.into_buf())
+}
+
+/// Approximate a rectangle as a closed 5-point polyline.
+fn rect_outline(x: f32, y: f32, w: f32, h: f32) -> Vec<[f32; 2]> {
+    vec![
+        [x, y],
+        [x + w, y],
+        [x + w, y + h],
+        [x, y + h],
+        [x, y],
+    ]
+}
+
+/// Approximate an ellipse (center cx/cy, half-axes w/h) as a 25-point
+/// polyline. GoodNotes shapes become strokes — the native shape schema is
+/// only partially decoded, and visual fidelity beats an unimportable note.
+fn ellipse_outline(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<[f32; 2]> {
+    const N: usize = 24;
+    let mut pts = Vec::with_capacity(N + 1);
+    for i in 0..=N {
+        let a = (i as f32) * std::f32::consts::TAU / (N as f32);
+        pts.push([cx + rx * a.cos(), cy + ry * a.sin()]);
+    }
+    pts
 }
 
 /// Build the `noteBundle` FlatBuffer from pages and document.
@@ -635,9 +702,23 @@ fn build_note_bundle(
     pages: &[Page],
     doc: &Document,
     hashes: &HashMap<String, [u8; 64]>,
-) -> Vec<u8> {
+) -> (Vec<u8>, [u8; 16], u64, [u8; 16]) {
     let mut ids = EntityGen::new();
     let mut specs: Vec<OpSpec> = Vec::new();
+    let mut ink_id: u32 = 0;
+    macro_rules! ink {
+        ($page:expr, $pts:expr, $width:expr, $rgba:expr) => {{
+            ink_id += 1;
+            specs.push(OpSpec::Ink {
+                entity: ids.next(),
+                page: $page,
+                pts: $pts,
+                width: $width,
+                rgba: $rgba,
+                ink_id,
+            });
+        }};
+    }
 
     // First op: DocumentSetup (pt=1). Required by Notability.
     let setup_entity = ids.next();
@@ -647,117 +728,165 @@ fn build_note_bundle(
         locale: "en_US".to_string(),
     });
 
-    for (_page_idx, page) in pages.iter().enumerate() {
-        let page_entity = ids.next();
-        let page_id = (page_entity.0, page_entity.1, 0u32);
+    // Register every referenced background asset (pt=2). Native exports emit
+    // one asset op per unique attachment hash before the pages that use it.
+    // Asset entities live on the reserved site 0xffff with their own seq
+    // counter starting at 1.
+    let mut asset_entities: HashMap<[u8; 64], u32> = HashMap::new();
+    // Per-attachment extension/mime and (for PDFs) the per-page crop boxes
+    // native files record inside the PDFAsset table.
+    let mut bg_kinds: HashMap<String, (&'static str, &'static str)> = HashMap::new();
+    let mut bg_boxes: HashMap<String, Vec<(f32, f32)>> = HashMap::new();
+    {
+        let mut seen = HashSet::new();
+        for page in pages {
+            let Some(cfg) = doc.page_cfg().get(&page.uuid) else {
+                continue;
+            };
+            let Some(&hash) = hashes.get(&cfg.attachment) else {
+                continue;
+            };
+            if seen.insert(hash) {
+                let n = asset_entities.len() as u32 + 1;
+                asset_entities.insert(hash, n);
+                specs.push(OpSpec::Asset {
+                    entity: (0xffff, n),
+                    hash,
+                });
+            }
+            let Some(bytes) = doc.attachments.get(&cfg.attachment) else {
+                continue;
+            };
+            bg_kinds
+                .entry(cfg.attachment.clone())
+                .or_insert_with(|| sniff_asset(bytes));
+            bg_boxes
+                .entry(cfg.attachment.clone())
+                .or_insert_with(|| {
+                    doc.pdf_page_boxes(&cfg.attachment).unwrap_or_default()
+                });
+        }
+    }
 
-        // Background hash: look up via page_cfg if the page has a PDF background.
-        let bg = doc
-            .page_cfg()
-            .get(&page.uuid)
-            .and_then(|cfg| {
-                let hash = hashes.get(&cfg.attachment).copied()?;
+    // Native pageCount semantics: one CreatePage op can materialise several
+    // sibling pages — SeqIds (site, seq, 0..N-1). PDF-imported notes use one
+    // op per PDF: sibling i shows source page i+1. Group consecutive pages
+    // that share an attachment with consecutive source-page numbers (and
+    // consecutive un-bound pages) into one op, as real exports do.
+    let mut page_ids: Vec<(u16, u32, u32)> = Vec::with_capacity(pages.len());
+    {
+        let mut prev_loc: Option<(u16, u32, u32)> = None;
+        let mut i = 0;
+        while i < pages.len() {
+            let cfg_of = |p: &Page| doc.page_cfg().get(&p.uuid);
+            let cfg = cfg_of(&pages[i]);
+            let att = cfg.map(|c| c.attachment.as_str());
+            let first_pdf = cfg.and_then(|c| c.pdf_page).unwrap_or(0) as u32;
+
+            // Extend the run while pages share the same binding.
+            let mut count = 1usize;
+            while i + count < pages.len() {
+                let c2 = cfg_of(&pages[i + count]);
+                let same = match (att, c2.map(|c| c.attachment.as_str())) {
+                    (Some(a), Some(b)) if a == b => {
+                        let expect = first_pdf + count as u32;
+                        c2.and_then(|c| c.pdf_page).unwrap_or(0) as u32 == expect
+                    }
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !same {
+                    break;
+                }
+                count += 1;
+            }
+
+            let page_entity = ids.next();
+            let seq = page_entity.1;
+            for sib in 0..count {
+                page_ids.push((page_entity.0, seq, sib as u32));
+            }
+
+            let bg = cfg.and_then(|cfg| {
+                let hash = *hashes.get(&cfg.attachment)?;
                 let size = doc.attachments.get(&cfg.attachment)?.len() as u32;
-                Some((hash, size))
+                let &(ext, mime) = bg_kinds.get(&cfg.attachment)?;
+                let boxes = bg_boxes.get(&cfg.attachment).map(Vec::as_slice)?;
+                Some(Bg {
+                    hash,
+                    size,
+                    ext,
+                    mime,
+                    boxes,
+                    page_offset: first_pdf.saturating_sub(1),
+                })
             });
 
-        specs.push(OpSpec::Page {
-            entity: page_entity,
-            width: page.width,
-            height: page.height,
-            background: bg.as_ref().map(|(h, _)| *h),
-            background_size: bg.map(|(_, size)| size).unwrap_or(0),
-            page_count: 1,
-        });
+            specs.push(OpSpec::Page {
+                entity: page_entity,
+                prev: prev_loc,
+                width: pages[i].width,
+                height: pages[i].height,
+                background: bg,
+                page_count: count as u32,
+            });
+            prev_loc = Some((page_entity.0, seq, count as u32 - 1));
+            i += count;
+        }
+    }
+
+    for (page, &page_id) in pages.iter().zip(&page_ids) {
 
         for item in &page.items {
             match item {
                 Item::Stroke(s) => {
-                    if s.points.len() < 2 {
-                        continue;
+                    if s.points.len() >= 2 {
+                        ink!(page_id, InkPts::Ref(&s.points), s.width, s.rgba);
                     }
-                    specs.push(OpSpec::Ink {
-                        entity: ids.next(),
-                        page: page_id,
-                        pts: InkPts::Ref(&s.points),
-                        width: s.width,
-                        rgba: s.rgba,
-                    });
                 }
                 Item::Shape(sh) => {
-                    let (sx, sy, sw, sh2, ellipse) = match sh.kind {
+                    let pts = match sh.kind {
                         ShapeKind::Ellipse => {
-                            (sh.x - sh.w, sh.y - sh.h, sh.w * 2.0, sh.h * 2.0, true)
+                            ellipse_outline(sh.x, sh.y, sh.w.abs(), sh.h.abs())
                         }
-                        ShapeKind::Rect => (sh.x, sh.y, sh.w, sh.h, false),
+                        ShapeKind::Rect => rect_outline(sh.x, sh.y, sh.w, sh.h),
                         _ => {
-                            // Polygon → emit as a stroke (closed polyline).
-                            if sh.points.len() >= 2 {
-                                let mut pts = sh.points.clone();
+                            // Polygon → closed polyline.
+                            let mut pts = sh.points.clone();
+                            if pts.len() >= 2 {
                                 if let Some(f) = pts.first().copied() {
                                     pts.push(f);
                                 }
-                                specs.push(OpSpec::Ink {
-                                    entity: ids.next(),
-                                    page: page_id,
-                                    pts: InkPts::Owned(pts),
-                                    width: sh.width,
-                                    rgba: sh.stroke,
-                                });
                             }
-                            continue;
+                            pts
                         }
                     };
-                    specs.push(OpSpec::Shape {
-                        entity: ids.next(),
-                        page: page_id,
-                        x: sx,
-                        y: sy,
-                        w: sw,
-                        h: sh2,
-                        ellipse,
-                        fill: sh.fill,
-                        stroke: sh.stroke,
-                        border_width: sh.width,
-                    });
+                    if pts.len() >= 2 {
+                        ink!(page_id, InkPts::Owned(pts), sh.width, sh.stroke);
+                    }
                 }
                 Item::Path(p) => {
-                    if p.points.len() < 2 {
-                        continue;
+                    if p.points.len() >= 2 {
+                        ink!(page_id, InkPts::Ref(&p.points), p.width, p.rgba);
                     }
-                    specs.push(OpSpec::Ink {
-                        entity: ids.next(),
-                        page: page_id,
-                        pts: InkPts::Ref(&p.points),
-                        width: p.width,
-                        rgba: p.rgba,
-                    });
                 }
                 Item::FillPath(fp) => {
                     for contour in &fp.contours {
-                        if contour.len() < 2 {
-                            continue;
+                        if contour.len() >= 2 {
+                            ink!(page_id, InkPts::Ref(contour), 1.0, fp.rgba);
                         }
-                        specs.push(OpSpec::Ink {
-                            entity: ids.next(),
-                            page: page_id,
-                            pts: InkPts::Ref(contour),
-                            width: 1.0,
-                            rgba: fp.rgba,
-                        });
                     }
                 }
                 Item::Connector(c) => {
-                    specs.push(OpSpec::Ink {
-                        entity: ids.next(),
-                        page: page_id,
-                        pts: InkPts::Owned(vec![
+                    ink!(
+                        page_id,
+                        InkPts::Owned(vec![
                             [c.anchor[0], c.anchor[1]],
                             [c.anchor[0], c.anchor[1]],
                         ]),
-                        width: c.width,
-                        rgba: c.rgba,
-                    });
+                        c.width,
+                        c.rgba
+                    );
                 }
                 // Backgrounds, PDF backgrounds, images, text, stickies: not
                 // yet encoded as Notability ops. Skipped for now.
@@ -770,13 +899,27 @@ fn build_note_bundle(
         }
     }
 
+    // Ops vector is written before the op tables it references. Each op is
+    // serialised into its own buffer in parallel — uoffsets are all relative,
+    // so appending each buffer whole keeps its internal references valid.
+    // Op buffers are built first so the note GUID can derive from a content
+    // hash: every converted note gets a unique, stable identity instead of
+    // recycling the sample's GUID.
+    let timestamp_ms = now_ms();
+    let ts_us = timestamp_ms * 1_000;
+    let op_bufs = crate::par::map(&specs, |s| serialize_op(s, ts_us));
+
+    let mut guid_src = Vec::with_capacity(op_bufs.iter().map(|(_, b)| b.len()).sum::<usize>() + 8);
+    guid_src.extend_from_slice(&timestamp_ms.to_le_bytes());
+    for (_, b) in &op_bufs {
+        guid_src.extend_from_slice(b);
+    }
+    let note_guid = derive_guid(&guid_src);
+    let device_uuid = format_guid(&note_guid);
+    let subject_id = derive_guid(&[&note_guid[..], &timestamp_ms.to_le_bytes()].concat());
+
     // Root table first, with placeholder uoffsets for fields 3/5/6.
     let mut fb = Fb::new();
-    let note_guid: [u8; 16] = [
-        0xb7, 0xaf, 0xff, 0x54, 0xb0, 0xce, 0xb0, 0x85, 0x10, 0x41, 0x94, 0xc5, 0x81, 0xb7, 0x1b,
-        0x23,
-    ];
-    let timestamp_ms: u64 = 1789453933593; // Matches sample files.
     let root = fb.write_table(&[
         (ROOT_F0_NOTE_GUID, FieldVal::Inline(note_guid.to_vec())),
         (ROOT_F3_DEVICE_UUID_UPPER, FieldVal::Inline(vec![0; 4])),
@@ -793,30 +936,84 @@ fn build_note_bundle(
     ]);
 
     // Referenced data follows the root table, so all uoffsets point forward.
-    let device_uuid_upper = write_string(&mut fb, "798E2A39-80A9-4BBE-B95C-B205F461CDB1");
-    let device_uuid_lower = write_string(&mut fb, "798e2a39-80a9-4bbe-b95c-b205f461cdb1");
+    let device_uuid_upper = write_string(&mut fb, &device_uuid.to_uppercase());
+    let device_uuid_lower = write_string(&mut fb, &device_uuid);
     fb.patch_uoffset(root, ROOT_F3_DEVICE_UUID_UPPER, device_uuid_upper);
     fb.patch_uoffset(root, ROOT_F5_DEVICE_UUID_LOWER, device_uuid_lower);
 
-    // Ops vector is written before the op tables it references. Each op is
-    // serialised into its own buffer in parallel — uoffsets are all relative,
-    // so appending each buffer whole keeps its internal references valid.
     let ops_vec = fb.write_uoffset_slots(specs.len());
-    let op_bufs = crate::par::map(&specs, serialize_op);
     for (i, (op_pos, buf)) in op_bufs.iter().enumerate() {
+        // Each op buffer was built with objects aligned relative to its own
+        // start; appending at an 8-aligned offset preserves that alignment
+        // for the strictest member any op payload contains (u64/8B structs).
+        fb.align(8);
         let base = fb.buf.len();
         fb.buf.extend_from_slice(buf);
         fb.patch_uoffset_slot(ops_vec, i, base + op_pos);
     }
     fb.patch_uoffset(root, ROOT_F6_OPS, ops_vec);
 
-    fb.finish(root)
+    let bundle = fb.finish(root);
+    (bundle, note_guid, timestamp_ms, subject_id)
+}
+
+/// Current wall-clock time in milliseconds. The root table stores ms while
+/// per-op timestamps use µs; on wasm we take what `js_sys::Date` gives.
+#[cfg(not(target_arch = "wasm32"))]
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn now_ms() -> u64 {
+    // Raw WASM has no clock import (no wasm-bindgen). Identity still comes
+    // from the content-derived GUID, so a fixed plausible value is fine.
+    1_789_453_933_593
+}
+
+/// Content-derive a 16-byte note GUID with UUID v4 version/variant bits so
+/// repeated conversions of the same source produce a stable, unique identity.
+fn derive_guid(seed: &[u8]) -> [u8; 16] {
+    let hash = compute_hash(seed);
+    let mut g = [0u8; 16];
+    g.copy_from_slice(&hash[..16]);
+    g[6] = (g[6] & 0x0f) | 0x40; // version 4
+    g[8] = (g[8] & 0x3f) | 0x80; // variant 10xx
+    g
+}
+
+/// Format raw 16 GUID bytes as a lowercase `xxxxxxxx-…` UUID string.
+fn format_guid(g: &[u8; 16]) -> String {
+    let h = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
+    format!(
+        "{}-{}-{}-{}-{}",
+        h(&g[0..4]),
+        h(&g[4..6]),
+        h(&g[6..8]),
+        h(&g[8..10]),
+        h(&g[10..16])
+    )
 }
 
 /// Generate a simple timestamp string for note titles.
 fn chrono_like_timestamp() -> String {
-    // Use a fixed timestamp matching the sample files for reproducibility.
+    // Titles are display-only; keep a fixed, sample-like format.
     "Sep 15, 2026".to_string()
+}
+
+/// Identify a background attachment by magic bytes → (extension, mime).
+/// Native files store real types (`.pdf`, `.webp`, …) in AssetMetadata.
+fn sniff_asset(bytes: &[u8]) -> (&'static str, &'static str) {
+    match bytes {
+        b if b.starts_with(b"%PDF") => ("pdf", "application/pdf"),
+        b if b.starts_with(b"RIFF") && b.get(8..12) == Some(b"WEBP") => ("webp", "image/webp"),
+        b if b.starts_with(b"\x89PNG") => ("png", "image/png"),
+        b if b.starts_with(b"\xff\xd8\xff") => ("jpg", "image/jpeg"),
+        _ => ("pdf", "application/pdf"),
+    }
 }
 
 /// Compute a 64-byte content hash (SHA-512).
@@ -877,7 +1074,7 @@ pub fn write_ntb(pages: &[Page], doc: &Document, mut w: impl Write) -> Result<()
         })
         .collect();
 
-    let bundle = build_note_bundle(pages, doc, &hashes);
+    let (bundle, _note_guid, _ts_ms, subject_id) = build_note_bundle(pages, doc, &hashes);
     if bundle.len() as u64 > MOBILE_MAX_ENTRY {
         eprintln!(
             "warning: noteBundle is {} MiB; Notability's Android importer rejects entries over 64 MiB",
@@ -900,11 +1097,12 @@ pub fn write_ntb(pages: &[Page], doc: &Document, mut w: impl Write) -> Result<()
     zip.write_all(&bundle)?;
 
     // Manifest with required fields (subjectId, subjectName, appVersion).
-    let manifest = r#"{
-  "subjectId" : "f662d1e9-a300-45b4-affe-bb36e2a825c3",
-  "subjectName" : "Imported",
-  "appVersion" : "16.12.5"
-}"#;
+    // subjectId is unique per converted note — recycling one ID made every
+    // output collide in libraries that dedupe by subject.
+    let manifest = format!(
+        "{{\n  \"subjectId\" : \"{}\",\n  \"subjectName\" : \"Imported\",\n  \"appVersion\" : \"16.12.5\"\n}}",
+        format_guid(&subject_id)
+    );
     zip.start_file("manifest.json", deflated)?;
     zip.write_all(manifest.as_bytes())?;
 
@@ -958,17 +1156,25 @@ pub fn write_ntb_to_vec(pages: &[Page], doc: &Document) -> Result<Vec<u8>> {
 }
 
 /// Build HandwritingIndex.fb — a minimal FlatBuffer required by Notability.
-/// Structure reverse-engineered from real samples: 4-field table.
+/// Empty handwriting search index, matching the 60-byte stub native
+/// exports write when a note has no recognised text: a root table
+/// `{u8 4, u8 5, uoffset→inner, u32 0}` and an inner `{u32 4, u32 8}`.
+/// The dword at offset 24 is undeclared padding in real files.
 fn build_handwriting_index() -> Vec<u8> {
-    let mut fb = Fb::new();
-    // Simple table with version and count fields.
-    let root = fb.write_table(&[
-        (0, FieldVal::Inline(vec![0x04, 0x00, 0x00, 0x00])), // version-ish
-        (1, FieldVal::Inline(vec![0x00, 0x00, 0x00, 0x00])), // count = 0
-        (2, FieldVal::Inline(vec![0x00, 0x00, 0x00, 0x00])), // offset
-        (3, FieldVal::Inline(vec![0x00, 0x00, 0x00, 0x00])), // flags
-    ]);
-    fb.finish(root)
+    vec![
+        0x10, 0x00, 0x00, 0x00, // root uoffset → table @16
+        0x0c, 0x00, 0x14, 0x00, 0x13, 0x00, 0x12, 0x00, 0x0c, 0x00, 0x04, 0x00, // vtable
+        0x0c, 0x00, 0x00, 0x00, // soffset → vtable @4
+        0x00, 0x00, 0x00, 0x00, // f3 = 0
+        0x00, 0x00, 0x00, 0x00, // padding (undeclared)
+        0x10, 0x00, 0x00, 0x00, // f2 uoffset → inner table @44
+        0x00, 0x00, 0x05, 0x04, // f1 = 5 (@34), f0 = 4 (@35)
+        0x08, 0x00, 0x0c, 0x00, 0x08, 0x00, 0x04, 0x00, // inner vtable
+        0x08, 0x00, 0x00, 0x00, // inner soffset → vtable @36
+        0x08, 0x00, 0x00, 0x00, // inner f1 = 8
+        0x04, 0x00, 0x00, 0x00, // inner f0 = 4
+        0x00, 0x00, 0x00, 0x00, // trailing pad
+    ]
 }
 
 /// Generate a minimal valid PNG thumbnail (64x64 white background).

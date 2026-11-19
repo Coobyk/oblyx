@@ -114,7 +114,9 @@ The inner table's field count (`nf`) determines the element type:
 
 **nf=2 (page definition):** The f1 vector's first two f32s are the page width
 and height in points. The CreatePage **payload f2** is a u32 holding the
-**1-based PDF page index** within the bound asset (default 1 when absent).
+**pageCount** — the number of sibling pages the op materialises, SeqIds
+`(site, seq, 0..N-1)` (default 1 when absent). For PDF-bound ops siblings
+show consecutive source pages starting at the asset's page offset.
 Verified across samples:
 
 | sample | pages | dimensions (pt) | orientation |

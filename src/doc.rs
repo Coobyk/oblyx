@@ -403,6 +403,21 @@ impl Document {
         pdfinput::page_size_of(&lp, pdf_page)
     }
 
+    /// Width × height (PDF points) of every page of a PDF attachment, in
+    /// page order. Returns `None` when the attachment is absent or not a
+    /// parseable PDF. Used by the `.ntb` writer to emit the full cropbox
+    /// vector native exports record per PDF asset.
+    pub(crate) fn pdf_page_boxes(&self, attachment: &str) -> Option<Vec<(f32, f32)>> {
+        let att = self.attachments.get(attachment)?;
+        let lp = self.cached_pdf(att)?;
+        let n = lp.pages.len() as u64;
+        let mut out = Vec::with_capacity(n as usize);
+        for p in 1..=n {
+            out.push(pdfinput::page_size_of(&lp, p)?);
+        }
+        Some(out)
+    }
+
     /// JPEG raster of a background PDF page for SVG/PNG output at `dpi`.
     /// Serves a caller-supplied raster (JavaScript on the web) when one was
     /// stored with [`set_page_raster`], otherwise runs `pdftoppm`.
