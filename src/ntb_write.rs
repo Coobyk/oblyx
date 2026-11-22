@@ -52,6 +52,7 @@ const MOBILE_MAX_ENTRY: u64 = 64 * 1024 * 1024;
 const MOBILE_MAX_ARCHIVE: u64 = 500 * 1024 * 1024;
 
 // Path element types (non-attributed, to avoid the 6-byte attribute tail).
+const PATH_CUBIC: u8 = 4;
 const PATH_LINE: u8 = 6;
 const PATH_MOVETO: u8 = 7;
 
@@ -262,29 +263,167 @@ impl Fb {
     }
 }
 
+/// Collapse consecutive duplicate points and near-collinear intermediate
+/// samples (such as GoodNotes's midpoint insertions) within `eps` points of
+/// the chord between the last kept point and the next point.
+fn simplify_stroke_points(points: &[[f32; 2]], eps: f32) -> Vec<[f32; 2]> {
+    let mut dedup: Vec<[f32; 2]> = Vec::with_capacity(points.len());
+    for &p in points {
+        if !p[0].is_finite() || !p[1].is_finite() {
+            continue;
+        }
+        if let Some(&last) = dedup.last()
+            && (p[0] - last[0]).hypot(p[1] - last[1]) < 1e-3
+        {
+            continue;
+        }
+        dedup.push(p);
+    }
+    if dedup.len() <= 2 {
+        return dedup;
+    }
+    let mut out = Vec::with_capacity(dedup.len());
+    out.push(dedup[0]);
+    for i in 1..dedup.len() - 1 {
+        let prev = *out.last().unwrap();
+        let curr = dedup[i];
+        let next = dedup[i + 1];
+        let vx = next[0] - prev[0];
+        let vy = next[1] - prev[1];
+        let len2 = vx * vx + vy * vy;
+        if len2 > 1e-8 {
+            let dx = curr[0] - prev[0];
+            let dy = curr[1] - prev[1];
+            let t = (dx * vx + dy * vy) / len2;
+            let perp = (dx * vy - dy * vx).abs() / len2.sqrt();
+            if (0.0..=1.0).contains(&t) && perp < eps {
+                continue;
+            }
+        }
+        out.push(curr);
+    }
+    out.push(*dedup.last().unwrap());
+    out
+}
+
 /// Build a `qT` path stream blob (f32 precision, non-attributed elements).
 ///
 /// Stream: version/precision byte (0<<3|1=1) ‖ `u16` LE element count ‖ elements.
 /// Each element: `u8` type ‖ anchor-relative points (8 B each for f32).
-/// Caller wraps this in a byte vector (`write_byte_vector` adds the u32 length).
-fn build_path_stream(points: &[[f32; 2]]) -> Vec<u8> {
+/// When `smooth` is true and the stroke has ≥ 3 points, emits C¹-smooth
+/// quadratic B-spline curves degree-elevated to exact `PATH_CUBIC` elements
+/// (matching native Notability's cubic-Bézier ink paths) with corner radii
+/// capped on long straight segments.
+fn build_path_stream(points: &[[f32; 2]], smooth: bool) -> Vec<u8> {
     if points.is_empty() {
         return Vec::new();
     }
     let anchor = points[0];
-    let mut stream = Vec::with_capacity(3 + points.len() * 9);
-    stream.push(1); // version 0 << 3 | precision 1 (f32)
-    stream.extend_from_slice(&(points.len() as u16).to_le_bytes());
-    // First element: moveto at (0, 0) relative to anchor.
-    stream.push(PATH_MOVETO);
-    stream.extend_from_slice(&0f32.to_le_bytes());
-    stream.extend_from_slice(&0f32.to_le_bytes());
-    // Remaining: line-to each point (relative to anchor).
-    for p in &points[1..] {
-        stream.push(PATH_LINE);
+    let push_pt = |stream: &mut Vec<u8>, p: [f32; 2]| {
         stream.extend_from_slice(&(p[0] - anchor[0]).to_le_bytes());
         stream.extend_from_slice(&(p[1] - anchor[1]).to_le_bytes());
+    };
+
+    if !smooth || points.len() <= 2 {
+        let count = points.len().min(u16::MAX as usize);
+        let mut stream = Vec::with_capacity(3 + count * 9);
+        stream.push(1); // version 0 << 3 | precision 1 (f32)
+        stream.extend_from_slice(&(count as u16).to_le_bytes());
+        stream.push(PATH_MOVETO);
+        push_pt(&mut stream, anchor);
+        for &p in &points[1..count] {
+            stream.push(PATH_LINE);
+            push_pt(&mut stream, p);
+        }
+        return stream;
     }
+
+    let pts = simplify_stroke_points(points, 0.05);
+    if pts.len() <= 2 {
+        let count = pts.len().max(1);
+        let mut stream = Vec::with_capacity(3 + count * 9);
+        stream.push(1);
+        stream.extend_from_slice(&(count as u16).to_le_bytes());
+        stream.push(PATH_MOVETO);
+        push_pt(&mut stream, anchor);
+        if pts.len() == 2 {
+            stream.push(PATH_LINE);
+            push_pt(&mut stream, pts[1]);
+        }
+        return stream;
+    }
+
+    let mut stream = Vec::with_capacity(3 + pts.len() * 25);
+    stream.push(1); // version 0 << 3 | precision 1 (f32)
+    stream.extend_from_slice(&0u16.to_le_bytes()); // element count placeholder
+    let mut elems: u16 = 0;
+
+    // Start at anchor (0, 0).
+    stream.push(PATH_MOVETO);
+    push_pt(&mut stream, anchor);
+    elems += 1;
+
+    let mut cur = pts[0];
+    const MAX_CORNER_R: f32 = 6.0;
+    for i in 1..pts.len() - 1 {
+        if elems >= u16::MAX - 2 {
+            break;
+        }
+        let prev = pts[i - 1];
+        let curr = pts[i];
+        let next = pts[i + 1];
+        let d_in = (curr[0] - prev[0]).hypot(curr[1] - prev[1]);
+        let d_out = (next[0] - curr[0]).hypot(next[1] - curr[1]);
+        if d_in < 1e-4 || d_out < 1e-4 {
+            continue;
+        }
+        let r_in = (d_in * 0.5).min(MAX_CORNER_R);
+        let r_out = (d_out * 0.5).min(MAX_CORNER_R);
+        let a = if i == 1 && d_in <= MAX_CORNER_R * 2.0 {
+            prev
+        } else {
+            [
+                curr[0] + (prev[0] - curr[0]) * (r_in / d_in),
+                curr[1] + (prev[1] - curr[1]) * (r_in / d_in),
+            ]
+        };
+        let b = if i == pts.len() - 2 && d_out <= MAX_CORNER_R * 2.0 {
+            next
+        } else {
+            [
+                curr[0] + (next[0] - curr[0]) * (r_out / d_out),
+                curr[1] + (next[1] - curr[1]) * (r_out / d_out),
+            ]
+        };
+        if (a[0] - cur[0]).hypot(a[1] - cur[1]) > 1e-3 {
+            stream.push(PATH_LINE);
+            push_pt(&mut stream, a);
+            elems += 1;
+        }
+        // Degree-elevate quadratic Bézier (a, curr, b) to exact cubic Bézier.
+        let c1 = [
+            a[0] + (2.0 / 3.0) * (curr[0] - a[0]),
+            a[1] + (2.0 / 3.0) * (curr[1] - a[1]),
+        ];
+        let c2 = [
+            b[0] + (2.0 / 3.0) * (curr[0] - b[0]),
+            b[1] + (2.0 / 3.0) * (curr[1] - b[1]),
+        ];
+        stream.push(PATH_CUBIC);
+        push_pt(&mut stream, c1);
+        push_pt(&mut stream, c2);
+        push_pt(&mut stream, b);
+        elems += 1;
+        cur = b;
+    }
+
+    let last = *pts.last().unwrap();
+    if (last[0] - cur[0]).hypot(last[1] - cur[1]) > 1e-3 && elems < u16::MAX {
+        stream.push(PATH_LINE);
+        push_pt(&mut stream, last);
+        elems += 1;
+    }
+    stream[1..3].copy_from_slice(&elems.to_le_bytes());
     stream
 }
 
@@ -361,6 +500,7 @@ fn write_op_table(fb: &mut Fb, entity: (u16, u32), ts_us: u64, pt: u8) -> usize 
 }
 
 /// Write one CreateInk op into the buffer. Returns the op table position.
+#[allow(clippy::too_many_arguments)]
 fn write_create_ink(
     fb: &mut Fb,
     entity: (u16, u32),
@@ -369,6 +509,7 @@ fn write_create_ink(
     points: &[[f32; 2]],
     width: f32,
     rgba: &[f32; 4],
+    smooth: bool,
 ) -> usize {
     // Colour struct (inline Gf, 4 bytes).
     let color = gf_color(rgba);
@@ -397,7 +538,7 @@ fn write_create_ink(
         (9, FieldVal::Inline(vec![0; 4])), // placeholder
     ]);
 
-    let path_pos = fb.write_byte_vector(&build_path_stream(points));
+    let path_pos = fb.write_byte_vector(&build_path_stream(points, smooth));
     fb.patch_uoffset(payload, 9, path_pos);
     fb.patch_uoffset(op, 5, payload);
     op
@@ -639,6 +780,7 @@ enum OpSpec<'a> {
         pts: InkPts<'a>,
         width: f32,
         rgba: [f32; 4],
+        smooth: bool,
     },
 }
 
@@ -678,6 +820,7 @@ fn serialize_op(spec: &OpSpec, ts_us: u64) -> (usize, Vec<u8>) {
             pts,
             width,
             rgba,
+            smooth,
         } => write_create_ink(
             &mut fb,
             *entity,
@@ -686,6 +829,7 @@ fn serialize_op(spec: &OpSpec, ts_us: u64) -> (usize, Vec<u8>) {
             pts.points(),
             *width,
             rgba,
+            *smooth,
         ),
     };
     (op, fb.into_buf())
@@ -783,7 +927,7 @@ fn build_note_bundle(
     let mut ids = EntityGen::new();
     let mut specs: Vec<OpSpec> = Vec::new();
     macro_rules! ink {
-        ($page:expr, $pts:expr, $width:expr, $rgba:expr, $xf:expr) => {{
+        ($page:expr, $pts:expr, $width:expr, $rgba:expr, $xf:expr, $smooth:expr) => {{
             let xf: Xf = $xf;
             let pts = match $pts {
                 InkPts::Ref(r) if xf.is_identity() => InkPts::Ref(r),
@@ -801,6 +945,7 @@ fn build_note_bundle(
                 pts,
                 width: $width / xf.s,
                 rgba: $rgba,
+                smooth: $smooth,
             });
         }};
     }
@@ -948,15 +1093,16 @@ fn build_note_bundle(
             match item {
                 Item::Stroke(s) => {
                     if s.points.len() >= 2 {
-                        ink!(page_id, InkPts::Ref(&s.points), s.width, s.rgba, xf);
+                        ink!(page_id, InkPts::Ref(&s.points), s.width, s.rgba, xf, true);
                     }
                 }
                 Item::Shape(sh) => {
-                    let pts = match sh.kind {
-                        ShapeKind::Ellipse => {
-                            ellipse_outline(sh.x, sh.y, sh.w.abs(), sh.h.abs())
-                        }
-                        ShapeKind::Rect => rect_outline(sh.x, sh.y, sh.w, sh.h),
+                    let (pts, smooth) = match sh.kind {
+                        ShapeKind::Ellipse => (
+                            ellipse_outline(sh.x, sh.y, sh.w.abs(), sh.h.abs()),
+                            true,
+                        ),
+                        ShapeKind::Rect => (rect_outline(sh.x, sh.y, sh.w, sh.h), false),
                         _ => {
                             // Polygon → closed polyline.
                             let mut pts = sh.points.clone();
@@ -965,22 +1111,22 @@ fn build_note_bundle(
                                     pts.push(f);
                                 }
                             }
-                            pts
+                            (pts, false)
                         }
                     };
                     if pts.len() >= 2 {
-                        ink!(page_id, InkPts::Owned(pts), sh.width, sh.stroke, xf);
+                        ink!(page_id, InkPts::Owned(pts), sh.width, sh.stroke, xf, smooth);
                     }
                 }
                 Item::Path(p) => {
                     if p.points.len() >= 2 {
-                        ink!(page_id, InkPts::Ref(&p.points), p.width, p.rgba, xf);
+                        ink!(page_id, InkPts::Ref(&p.points), p.width, p.rgba, xf, true);
                     }
                 }
                 Item::FillPath(fp) => {
                     for contour in &fp.contours {
                         if contour.len() >= 2 {
-                            ink!(page_id, InkPts::Ref(contour), 1.0, fp.rgba, xf);
+                            ink!(page_id, InkPts::Ref(contour), 1.0, fp.rgba, xf, true);
                         }
                     }
                 }
@@ -993,7 +1139,8 @@ fn build_note_bundle(
                         ]),
                         c.width,
                         c.rgba,
-                        xf
+                        xf,
+                        false
                     );
                 }
                 // Backgrounds, PDF backgrounds, images, text, stickies: not
@@ -1387,16 +1534,38 @@ mod tests {
 
     #[test]
     fn path_stream_encodes_points() {
+        // Non-smoothed polyline emits moveto + straight lines.
         let points = vec![[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]];
-        let stream = build_path_stream(&points);
-        // Stream: header byte + u16 count + elements.
+        let stream = build_path_stream(&points, false);
         assert!(stream.len() > 3);
-        // Header: precision 1, count 3.
         assert_eq!(stream[0], 1);
         let count = u16::from_le_bytes(stream[1..3].try_into().unwrap());
         assert_eq!(count, 3);
-        // First element: moveto (type 7).
         assert_eq!(stream[3], PATH_MOVETO);
+
+        // Smoothed curved stroke emits cubic Bezier elements (PATH_CUBIC = 4).
+        let curve = vec![[0.0, 0.0], [5.0, 10.0], [10.0, 0.0], [15.0, 10.0]];
+        let cstream = build_path_stream(&curve, true);
+        assert_eq!(cstream[0], 1);
+        assert_eq!(cstream[3], PATH_MOVETO);
+        // Walk elements to verify at least one PATH_CUBIC is present.
+        let ce = u16::from_le_bytes(cstream[1..3].try_into().unwrap());
+        let mut off = 3;
+        let mut cubics = 0;
+        for _ in 0..ce {
+            let t = cstream[off];
+            off += 1;
+            match t {
+                PATH_MOVETO | PATH_LINE => off += 8,
+                PATH_CUBIC => {
+                    cubics += 1;
+                    off += 24;
+                }
+                other => panic!("unexpected element type {other}"),
+            }
+        }
+        assert_eq!(off, cstream.len());
+        assert_eq!(cubics, 2);
     }
 
     #[test]
