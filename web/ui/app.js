@@ -178,6 +178,9 @@ async function convert() {
 
   try {
     const bytes = preloadedBytes ? await preloadedBytes : null
+    // convertFile transfers `bytes` to the worker, which detaches it — force
+    // a fresh read if the user converts the same file again.
+    preloadedBytes = null
     const fmtCode = { pdf: 0, svg: 1, goodnotes: 2, ntb: 3 }[outputFormat] ?? 0
     const { files, meta } = await convertFile(
       selectedFile.name,

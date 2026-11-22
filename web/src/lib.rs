@@ -28,6 +28,7 @@ unsafe extern "Rust" fn __getrandom_v03_custom(
 use std::cell::RefCell;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use oblyx::convert::{Sink, ZipSink, zip_member_layout};
 use oblyx::doc::{Document, Page};
@@ -74,11 +75,11 @@ thread_local! {
     static ENTRIES: RefCell<Vec<ArchEntry>> = const { RefCell::new(Vec::new()) };
     static CURRENT: RefCell<Option<ArchEntry>> = const { RefCell::new(None) };
     static SINK: RefCell<Option<ZipSink<Cursor<Vec<u8>>>>> = const { RefCell::new(None) };
-    /// Pre-built pages from a `.ntb` (None for GoodNotes, which uses `decode_page`).
-    static NTB_PAGES: RefCell<Option<Vec<Page>>> = const { RefCell::new(None) };
     /// Decoded + background-injected pages, cached after first use so
     /// `oblyx_render_page` and `oblyx_convert` share one decode pass.
-    static DECODED_PAGES: RefCell<Option<Vec<Page>>> = const { RefCell::new(None) };
+    /// `Rc` keeps cache hits cheap: cloning hundreds of pages of strokes on
+    /// every thumbnail/convert call spikes wasm memory on large notebooks.
+    static DECODED_PAGES: RefCell<Option<Rc<Vec<Page>>>> = const { RefCell::new(None) };
 }
 
 fn set_out(bytes: Vec<u8>) -> i32 {
@@ -124,7 +125,12 @@ fn clear_archive() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn oblyx_alloc(len: usize) -> *mut u8 {
-    Box::into_raw(vec![0u8; len].into_boxed_slice()) as *mut u8
+    // JS writes all `len` bytes before Rust reads them, so skip the
+    // `vec![0; len]` memset — a full extra pass over multi-hundred-MB inputs.
+    let mut v = Vec::<u8>::with_capacity(len);
+    let ptr = v.as_mut_ptr();
+    std::mem::forget(v);
+    ptr
 }
 
 #[unsafe(no_mangle)]
@@ -146,7 +152,6 @@ fn open_doc(data: Vec<u8>) -> i32 {
     if is_ntb_bytes(&data) {
         return open_ntb(data);
     }
-    NTB_PAGES.with(|p| *p.borrow_mut() = None);
     DECODED_PAGES.with(|p| *p.borrow_mut() = None);
     match Document::from_bytes(data) {
         Ok(doc) => {
@@ -192,8 +197,7 @@ fn open_ntb(data: Vec<u8>) -> i32 {
             json.push_str("]}");
             JOBS.with(|j| *j.borrow_mut() = raster_jobs);
             DOC.with(|d| *d.borrow_mut() = Some(doc));
-            NTB_PAGES.with(|p| *p.borrow_mut() = Some(pages));
-            DECODED_PAGES.with(|p| *p.borrow_mut() = None);
+            DECODED_PAGES.with(|p| *p.borrow_mut() = Some(Rc::new(pages)));
             set_out(json.into_bytes())
         }
         Err(e) => fail(format!("could not open Notability notebook: {e}")),
@@ -234,12 +238,14 @@ fn parse_ntb(bytes: Vec<u8>) -> Result<(Document, Vec<Page>), String> {
         thumbnail: None,
         assets,
     };
-    let pages = oblyx::ntb::to_pages(&ntb_doc, oblyx::ntb::NTB_PAGE_H);
+    let mut pages = oblyx::ntb::to_pages(&ntb_doc, oblyx::ntb::NTB_PAGE_H);
     let mut doc = Document::empty();
     let mut hash_to_key: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    for (name, bytes) in &ntb_doc.assets {
-        let key = name.rsplit('/').next().unwrap_or(name).to_string();
+    // Move asset bytes into the attachment map — cloning them would double
+    // the memory footprint of large notebooks during load.
+    for (name, bytes) in ntb_doc.assets {
+        let key = name.rsplit('/').next().unwrap_or(&name).to_string();
         if let Some(hex) = name
             .rsplit('/')
             .next()
@@ -248,7 +254,7 @@ fn parse_ntb(bytes: Vec<u8>) -> Result<(Document, Vec<Page>), String> {
         {
             hash_to_key.insert(hex.to_ascii_lowercase(), key.clone());
         }
-        doc.insert_attachment(key, bytes.clone());
+        doc.insert_attachment(key, bytes);
     }
     for page in &pages {
         let bg = page.uuid.split_once('#').and_then(|(_, rest)| {
@@ -262,8 +268,9 @@ fn parse_ntb(bytes: Vec<u8>) -> Result<(Document, Vec<Page>), String> {
             doc.set_page_cfg(&page.uuid, key.clone(), Some(pdf_page));
         }
     }
-    // Backgrounds are injected later in oblyx_convert once JS has rendered
-    // the PDF pages via pdf.js and stored them with oblyx_set_raster.
+    // Background placements are vector refs, so inject them now — rasters
+    // for SVG/PNG rendering still arrive later via oblyx_set_raster.
+    doc.inject_pdf_backgrounds(&mut pages);
     Ok((doc, pages))
 }
 
@@ -420,32 +427,22 @@ pub extern "C" fn oblyx_set_raster(index: u32, ptr: *mut u8, len: usize) -> i32 
 /// rasters. Returns the cached page list. Both `oblyx_render_page` and
 /// `oblyx_convert` go through here so a single decode pass serves thumbnails
 /// and the final output.
-fn ensure_pages(doc: &Document) -> Result<Vec<Page>, String> {
-    let cached = DECODED_PAGES.with(|p| p.borrow().clone());
-    if let Some(pages) = cached {
+fn ensure_pages(doc: &Document) -> Result<Rc<Vec<Page>>, String> {
+    if let Some(pages) = DECODED_PAGES.with(|p| p.borrow().clone()) {
         return Ok(pages);
     }
-    let ntb_pages = NTB_PAGES.with(|p| p.borrow().clone());
-    let total = if let Some(ref np) = ntb_pages {
-        np.len() as u32
-    } else {
-        doc.pages.len() as u32
-    };
-    let mut pages = if let Some(np) = ntb_pages {
-        np
-    } else {
-        let mut pages = Vec::with_capacity(doc.pages.len());
-        for (i, src) in doc.pages.iter().enumerate() {
-            match doc.decode_page(src, false) {
-                Ok(page) => pages.push(page),
-                Err(e) => return Err(format!("decode page {}: {e:#}", src.uuid)),
-            }
-            report(PHASE_DECODE, i as u32 + 1, total);
+    let total = doc.pages.len() as u32;
+    let mut pages = Vec::with_capacity(doc.pages.len());
+    for (i, src) in doc.pages.iter().enumerate() {
+        match doc.decode_page(src, false) {
+            Ok(page) => pages.push(page),
+            Err(e) => return Err(format!("decode page {}: {e:#}", src.uuid)),
         }
-        pages
-    };
+        report(PHASE_DECODE, i as u32 + 1, total);
+    }
     doc.inject_pdf_backgrounds(&mut pages);
-    DECODED_PAGES.with(|p| *p.borrow_mut() = Some(pages.clone()));
+    let pages = Rc::new(pages);
+    DECODED_PAGES.with(|p| *p.borrow_mut() = Some(Rc::clone(&pages)));
     Ok(pages)
 }
 

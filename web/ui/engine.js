@@ -142,9 +142,6 @@ function entryOutputName(entry, pages, fmt) {
 export function formatSize(bytes) {
     return `${(bytes / MB).toFixed(1)} MB`;
 }
-function copyBytes(bytes) {
-    return bytes.slice(0);
-}
 function memberLayout(name) {
     const parts = [];
     for (const part of name.replaceAll("\\", "/").split("/")) {
@@ -222,6 +219,8 @@ async function readMember(blob, entry) {
     const data = new Uint8Array(await blob.slice(start, start + entry.compSize).arrayBuffer());
     if (entry.method === 0)
         return data;
+    if (typeof DecompressionStream === "undefined")
+        throw new Error("Compressed zip members need Safari 16.4+ — update iPadOS.");
     const inflated = new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
     return new Uint8Array(await new Response(inflated).arrayBuffer());
 }
@@ -293,16 +292,14 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
                     worker.postMessage({ type: "set_member", path: entry.name });
                     await named;
                     const openedP = expect("opened");
-                    const buf = copyBytes(raw);
-                    worker.postMessage({ type: "open_member", buffer: buf }, [buf]);
+                    worker.postMessage({ type: "open_member", buffer: raw }, [raw]);
                     const memberMeta = await openedP;
                     totalPages += memberMeta.pages ?? 0;
                     await convertCurrent(label);
                 }
                 else {
                     const openedP = expect("opened");
-                    const buf = copyBytes(raw);
-                    worker.postMessage({ type: "open", buffer: buf }, [buf]);
+                    worker.postMessage({ type: "open", buffer: raw }, [raw]);
                     const meta = await openedP;
                     totalPages += meta.pages ?? 0;
                     const buffer = await convertCurrent(label);
@@ -321,10 +318,12 @@ export async function convertFile(name, blob, preloaded, fmt, packZip, onProgres
             return { files: results, meta: { pages: totalPages } };
         }
         show("Opening notebook…");
+        // Freshly-read buffers are transferred, not copied — on large files
+        // the extra full-size copy is what pushes mobile Safari over its
+        // memory limit and kills the tab.
         const bytes = preloaded ?? (await blob.arrayBuffer());
-        const buf = copyBytes(bytes);
         const openedP = expect("opened");
-        worker.postMessage({ type: "open", buffer: buf }, [buf]);
+        worker.postMessage({ type: "open", buffer: bytes }, [bytes]);
         const meta = await openedP;
         const buffer = await convertCurrent("");
         const pages = meta.pages ?? 1;

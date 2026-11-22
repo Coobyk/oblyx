@@ -8,8 +8,10 @@ const dec = new TextDecoder();
 const enc = new TextEncoder();
 
 function outBytes() {
-  const p = W.oblyx_out_ptr();
-  const n = W.oblyx_out_len();
+  // wasm pointers/lengths are i32 on the JS side: `>>> 0` reinterprets them
+  // as u32 so buffers living above the 2 GiB mark don't turn negative.
+  const p = W.oblyx_out_ptr() >>> 0;
+  const n = W.oblyx_out_len() >>> 0;
   const bytes = new Uint8Array(mem.buffer, p, n).slice();
   W.oblyx_out_clear();
   return bytes;
@@ -21,7 +23,7 @@ function outText() {
 
 // Input-taking exports consume the buffer (no double free).
 function withInput(bytes, fn) {
-  const p = W.oblyx_alloc(bytes.length);
+  const p = W.oblyx_alloc(bytes.length) >>> 0;
   new Uint8Array(mem.buffer, p, bytes.length).set(bytes);
   return fn(p, bytes.length);
 }
@@ -29,7 +31,7 @@ function withInput(bytes, fn) {
 async function init() {
   // Query string is the wasm hash. worker.js revalidates; the wasm file is
   // cached, so a new worker must not keep calling exports the cached module lacks.
-  const resp = await fetch("oblyx_web.wasm?v=6c2433ceefa9");
+  const resp = await fetch("oblyx_web.wasm?v=1ddb921e349e");
   if (!resp.ok) throw new Error(`wasm download failed: HTTP ${resp.status}`);
   const imports = {
     oblyx: {
