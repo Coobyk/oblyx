@@ -15,6 +15,9 @@ use crate::tpl;
 
 pub const PAGE_W: f32 = 1091.35;
 pub const PAGE_H: f32 = 1543.5;
+/// GoodNotes canvas units per PDF point (132 DPI / 72 DPI = 11/6).
+/// Every PDF-backed GoodNotes page uses a canvas of `(pdf_w * GN_DPI_SCALE, pdf_h * GN_DPI_SCALE)`.
+pub const GN_DPI_SCALE: f32 = 132.0 / 72.0;
 
 const KIND22_WIDTH: f32 = 1.5591;
 const FRAME_WIDTH: f32 = 1.5591;
@@ -794,9 +797,23 @@ impl Document {
             }
         }
 
+        let (page_w, page_h) = self
+            .page_cfg
+            .get(&src.uuid)
+            .and_then(|cfg| {
+                let att = self.attachments.get(&cfg.attachment)?;
+                if !att.starts_with(b"%PDF-") {
+                    return None;
+                }
+                let pdf_page = cfg.pdf_page.unwrap_or(1);
+                let (pw, ph) = self.cached_page_size(att, pdf_page)?;
+                (pw > 0.0 && ph > 0.0).then_some((pw * GN_DPI_SCALE, ph * GN_DPI_SCALE))
+            })
+            .unwrap_or((PAGE_W, PAGE_H));
+
         if let Some(cfg) = self.page_cfg.get(&src.uuid)
             && let Some(pdf_page) = cfg.pdf_page
-            && let Some(bg) = self.place_background(&cfg.attachment, pdf_page, PAGE_W, PAGE_H)
+            && let Some(bg) = self.place_background(&cfg.attachment, pdf_page, page_w, page_h)
         {
             out.insert(0, Item::PdfBackground(bg));
         }
@@ -849,8 +866,8 @@ impl Document {
         Ok(Page {
             uuid: src.uuid.clone(),
             items: out,
-            width: PAGE_W,
-            height: PAGE_H,
+            width: page_w,
+            height: page_h,
         })
     }
 }

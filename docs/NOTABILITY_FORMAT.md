@@ -195,7 +195,7 @@ Decoded fields (offsets differ per subtype; shown for Type A → Type B):
 | f7 | 19 | 16 | u32 | **stroke colour** `0xAABBGGRR` (§4.6); f5 is noise (low byte always `0x01`) |
 | f8 | 12 | 12 | f32 | **stroke width** in points |
 | f9 | 8 | 8 | uoffset | **uoffset from its field slot** to the point-data blob: `P = (tp + fo5[9]) + u32(at slot)`. Equals `tp + tsize` only for layout A; shifted Type B layouts point *past* the table. Follow the uoffset — never assume `tp + tsize`. |
-| f15 | 4 | 4 | u32 | id-like, varies per stroke |
+| f15 | 4 | 4 | u32 | optional `audioDuration` |
 
 The f1 struct covers 8 bytes (two f32s). For Type A the second f32 sits at
 offset 28 (not listed in the vtable — it is part of the struct, not a separate
@@ -573,21 +573,29 @@ validated by round-tripping through the real applications. No writer should be
 considered correct until it has been opened and re-saved by Notability /
 GoodNotes on a device.
 
-**Coordinate space (writer — VERIFIED by native imports):** every dimension in
-the `noteBundle` is in PDF points. `PageBackground.f3` is the *bound PDF
-page's own* point size (612×792 for letter, 596×842 for A4, exact cropbox
-dims for odd sizes), not the source app's canvas size — writing e.g. a
-GoodNotes 1091.35×1543.5 canvas there makes the app draw the PDF at its
-native size while ink lands ~1.83× too large (the "overflow" bug). Ink
-anchors, `qT` path points, stroke widths and shape geometry must all be
-rescaled into the same space: for GoodNotes input the map is the reverse of
-the reader's PDF fit, `s = min(canvas_w/pdf_w, canvas_h/pdf_h)`,
-`ntb = (gn − centre_offset)/s`; paper-only GoodNotes pages map onto the A4
-default the app uses for bare creates. Pages bound to no asset are emitted
-as bare `pl=[0]` creates (one op each), and the first create op always
-carries `f2` (pageCount). The zip container stores every member
-uncompressed (`method=0`) with the UTF-8 flag (`0x800`) set, in the order
-version → noteBundle → assets → manifest → index/ios/* → thumbnail.png.
+**Coordinate space & native schema (writer — VERIFIED on Android Notability):**
+- **GoodNotes canvas**: every PDF-backed GoodNotes page uses a 132-DPI canvas of
+  `(pdf_w × 11/6, pdf_h × 11/6)` with zero centering offset (A4 `595.28×841.89`
+  × `11/6` = `1091.35×1543.5`; GoodNotes Standard `455.04×588.45` × `11/6` =
+  `834.24×1078.83`; Letter `612×792` × `11/6` = `1122×1452`).
+- **Notability page space**: `SetMetadata` (`pt=1`) sets `f1` to a
+  `SetPageBackground { f0: PageBackground { f0: Paper, f3: (595.2765, 841.89105),
+  f4: margins(36, 36, 36, 36) } }` table (emitting a raw float vector here crashes
+  native `NtbImporter` with `IndexOutOfBoundsException` when reading
+  `PageBackground.paper`). On each PDF-backed `CreatePage`, `PageBackground.f3`
+  carries the PDF page's own point size `(pw, ph)` and `PDFAsset` carries
+  `totalPageCount` (`f2`), `pagesConsumed` (`f3`, validated to equal
+  `CreatePage.pageCount`), `pageOffset` (`f4`), and `cropBoxes` (`f5`, at least
+  `pageOffset + pagesConsumed` entries). Notability renders every PDF page scaled
+  to the note width `NOTE_W = 595.2765`, so ink coordinates on that page live in
+  `(NOTE_W, NOTE_W × ph / pw)`; ink anchors, `qT` path points, stroke widths, and
+  shape geometry are rescaled into that width-normalized space (while `.ntb`
+  round-trips stay identity).
+- Pages bound to no asset are emitted as bare `pl=[0]` creates (one op each),
+  and the first create op always carries `f2` (`pageCount`). The zip container
+  stores every member uncompressed (`method=0`) with the UTF-8 flag (`0x800`)
+  set, in the order version → noteBundle → assets → manifest → index/ios/* →
+  thumbnail.png.
 
 ## 7. Rust reader — IMPLEMENTED
 

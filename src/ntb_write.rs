@@ -38,6 +38,13 @@ const ROOT_F7_VERSION: usize = 7; // u32 version
 /// Version observed in real samples: 0x800012.
 const NTB_VERSION: u32 = 0x800012;
 
+/// Default note page size (A4 in PDF points) emitted in `SetMetadata.pageBackground`.
+/// Notability renders every PDF-backed page scaled to width `NOTE_W` (with height
+/// `NOTE_W * pdf_h / pdf_w`), and ink coordinates on that page live in that same
+/// width-normalized coordinate space.
+const NOTE_W: f32 = 595.2765;
+const NOTE_H: f32 = 841.89105;
+
 /// Notability's Android importer (`NtbImporter`/`ope.c`) refuses any single
 /// zip entry larger than 64 MiB, and its picker (`hb9.d`) refuses `.ntb`
 /// streams larger than 500 MB. Warn when output would hit either limit.
@@ -362,7 +369,6 @@ fn write_create_ink(
     points: &[[f32; 2]],
     width: f32,
     rgba: &[f32; 4],
-    ink_id: u32,
 ) -> usize {
     // Colour struct (inline Gf, 4 bytes).
     let color = gf_color(rgba);
@@ -381,7 +387,7 @@ fn write_create_ink(
     let op = write_op_table(fb, entity, ts_us, PT_CREATE_INK);
 
     // CreateInk payload (native): f0 page (df inline), f1 origin (Sf inline),
-    // f5 style, f7 colour (packed RGBA), f8 width, f9 path blob, f15 stroke id.
+    // f5 style, f7 colour (packed RGBA), f8 width, f9 encodedCenterPath blob.
     let payload = fb.write_table(&[
         (0, FieldVal::Inline(df_inline(page.0, page.1, page.2))),
         (1, FieldVal::Inline(sf_xy(origin[0], origin[1]))),
@@ -389,7 +395,6 @@ fn write_create_ink(
         (7, FieldVal::Inline(color)),
         (8, FieldVal::Inline(width.to_le_bytes().to_vec())),
         (9, FieldVal::Inline(vec![0; 4])), // placeholder
-        (15, FieldVal::Inline(ink_id.to_le_bytes().to_vec())),
     ]);
 
     let path_pos = fb.write_byte_vector(&build_path_stream(points));
@@ -448,20 +453,29 @@ fn write_document_setup(
     let locale_str = write_string(fb, locale);
     fb.patch_uoffset(locale_tbl, 0, locale_str);
 
-    // f1 sub-table: f0 → f32 vector (native files carry five 36.0 values —
-    // likely default margins/grid metrics).
-    let subject_tbl = fb.write_table(&[(0, FieldVal::Inline(vec![0; 4]))]);
-    let mut metrics = Vec::with_capacity(20);
-    for _ in 0..5 {
-        metrics.extend_from_slice(&36.0f32.to_le_bytes());
+    // f1: SetPageBackground { f0: PageBackground { f0: Paper, f3: size, f4: margins } }.
+    let set_bg_tbl = fb.write_table(&[(0, FieldVal::Inline(vec![0; 4]))]);
+    let mut margins = Vec::with_capacity(16);
+    for _ in 0..4 {
+        margins.extend_from_slice(&36.0f32.to_le_bytes());
     }
-    let vec_pos = fb.write_struct_vector(&metrics, 4);
-    fb.patch_uoffset(subject_tbl, 0, vec_pos);
+    let page_bg_tbl = fb.write_table(&[
+        (0, FieldVal::Inline(vec![0; 4])), // paper placeholder
+        (3, FieldVal::Inline(sf_xy(NOTE_W, NOTE_H))),
+        (4, FieldVal::Inline(margins)),
+    ]);
+    let paper_tbl = fb.write_table(&[
+        (2, FieldVal::Inline(vec![1])),    // flairBleeds = true
+        (3, FieldVal::Inline(vec![0])),    // flairCentered = false
+        (5, FieldVal::Inline(vec![0x0d])), // legacyPaperIndex = 13
+    ]);
+    fb.patch_uoffset(page_bg_tbl, 0, paper_tbl);
+    fb.patch_uoffset(set_bg_tbl, 0, page_bg_tbl);
 
     let font_str = write_string(fb, "Inter");
 
     fb.patch_uoffset(payload, 0, title_tbl);
-    fb.patch_uoffset(payload, 1, subject_tbl);
+    fb.patch_uoffset(payload, 1, set_bg_tbl);
     fb.patch_uoffset(payload, 2, locale_tbl);
     fb.patch_uoffset(payload, 4, font_str);
     fb.patch_uoffset(op, 5, payload);
@@ -519,15 +533,19 @@ fn write_create_page(
             (1, FieldVal::Inline(vec![0; 4])), // placeholder
             (3, FieldVal::Inline(sf_xy(width, height))),
         ]);
-        // PDFAsset: f0 = metadata uoffset, f2/f3 = total source-page count
-        // (native files omit it for 1-page PDFs), f5 = cropBoxes — one
-        // 8-byte {width,height} struct per source PDF page.
+        // PDFAsset: f0 = metadata uoffset, f2 = totalPageCount, f3 = pagesConsumed
+        // (must match CreatePage.pageCount), f4 = pageOffset, f5 = cropBoxes.
+        // Native validator requires at least `pageOffset + pagesConsumed` crop boxes
+        // and `totalPageCount >= pageOffset + pagesConsumed`.
+        let needed_boxes = (bg_info.page_offset + page_count) as usize;
+        let total_pages = (bg_info.boxes.len().max(needed_boxes)) as u32;
         let mut asset_fields: Vec<(usize, FieldVal)> =
             vec![(0, FieldVal::Inline(vec![0; 4]))];
-        if bg_info.boxes.len() > 1 {
-            let n = (bg_info.boxes.len() as u32).to_le_bytes().to_vec();
-            asset_fields.push((2, FieldVal::Inline(n.clone())));
-            asset_fields.push((3, FieldVal::Inline(n)));
+        if total_pages > 1 {
+            asset_fields.push((2, FieldVal::Inline(total_pages.to_le_bytes().to_vec())));
+        }
+        if page_count > 1 {
+            asset_fields.push((3, FieldVal::Inline(page_count.to_le_bytes().to_vec())));
         }
         if bg_info.page_offset > 0 {
             asset_fields.push((
@@ -555,10 +573,15 @@ fn write_create_page(
         let mime_pos = fb.write_fb_string(bg_info.mime.as_bytes());
         fb.patch_uoffset(inner, 1, name_pos);
         fb.patch_uoffset(inner, 2, mime_pos);
-        let mut crop = Vec::with_capacity(bg_info.boxes.len() * 8);
+        let box_count = bg_info.boxes.len().max(needed_boxes);
+        let mut crop = Vec::with_capacity(box_count * 8);
         for &(w, h) in bg_info.boxes {
             crop.extend_from_slice(&w.to_le_bytes());
             crop.extend_from_slice(&h.to_le_bytes());
+        }
+        for _ in bg_info.boxes.len()..box_count {
+            crop.extend_from_slice(&width.to_le_bytes());
+            crop.extend_from_slice(&height.to_le_bytes());
         }
         let crop_vec = fb.write_struct_vector(&crop, 8);
         fb.patch_uoffset(nested, 5, crop_vec);
@@ -616,7 +639,6 @@ enum OpSpec<'a> {
         pts: InkPts<'a>,
         width: f32,
         rgba: [f32; 4],
-        ink_id: u32,
     },
 }
 
@@ -656,7 +678,6 @@ fn serialize_op(spec: &OpSpec, ts_us: u64) -> (usize, Vec<u8>) {
             pts,
             width,
             rgba,
-            ink_id,
         } => write_create_ink(
             &mut fb,
             *entity,
@@ -665,7 +686,6 @@ fn serialize_op(spec: &OpSpec, ts_us: u64) -> (usize, Vec<u8>) {
             pts.points(),
             *width,
             rgba,
-            *ink_id,
         ),
     };
     (op, fb.into_buf())
@@ -719,30 +739,35 @@ impl Xf {
     }
 }
 
-/// Compute the page-space transform for one page. `target` is the page's
-/// rendered size in Notability points — the bound PDF page's own dims, or
-/// `None` for paper-only pages. A GoodNotes-sized page with no target maps
-/// onto A4 points (the app default for bare pages); anything else is
-/// already in points and stays put.
-fn page_xform(page_w: f32, page_h: f32, target: Option<(f32, f32)>) -> Xf {
-    let (tw, th) = match target {
-        Some(t) => t,
-        None => {
-            if (page_w - PAGE_W).abs() < 0.5 && (page_h - PAGE_H).abs() < 0.5 {
-                (595.28, 841.89)
+/// Compute the page-space transform for one page.
+///
+/// Notability scales every PDF-backed page to fill the note's standard width
+/// (`NOTE_W = 595.2765`) preserving the PDF page's aspect ratio (`NOTE_W × (ph/pw)`),
+/// and ink coordinates live in that width-normalized space. GoodNotes pages live
+/// in 132-DPI coordinates (`11/6 × (pw, ph)`). Pages already decoded from `.ntb`
+/// (`uuid` starting with `"ntb-"`) are already in Notability space and stay identity.
+fn page_xform(page: &Page, pdf_box: Option<(f32, f32)>) -> Xf {
+    if page.uuid.starts_with("ntb-") {
+        return Xf::IDENTITY;
+    }
+    let (tw, th) = match pdf_box {
+        Some((pw, ph)) if pw > 0.0 && ph > 0.0 => (NOTE_W, NOTE_W * (ph / pw)),
+        _ => {
+            if (page.width - PAGE_W).abs() < 0.5 && (page.height - PAGE_H).abs() < 0.5 {
+                (NOTE_W, NOTE_H)
             } else {
-                (page_w, page_h)
+                (page.width, page.height)
             }
         }
     };
-    let s = (page_w / tw).min(page_h / th);
+    let s = (page.width / tw).min(page.height / th);
     if !s.is_finite() || s <= 0.0 {
         return Xf::IDENTITY;
     }
     Xf {
         s,
-        ox: (page_w - tw * s) / 2.0,
-        oy: (page_h - th * s) / 2.0,
+        ox: (page.width - tw * s) / 2.0,
+        oy: (page.height - th * s) / 2.0,
     }
 }
 
@@ -757,10 +782,8 @@ fn build_note_bundle(
 ) -> (Vec<u8>, String, [u8; 16], u64, [u8; 16]) {
     let mut ids = EntityGen::new();
     let mut specs: Vec<OpSpec> = Vec::new();
-    let mut ink_id: u32 = 0;
     macro_rules! ink {
         ($page:expr, $pts:expr, $width:expr, $rgba:expr, $xf:expr) => {{
-            ink_id += 1;
             let xf: Xf = $xf;
             let pts = match $pts {
                 InkPts::Ref(r) if xf.is_identity() => InkPts::Ref(r),
@@ -778,7 +801,6 @@ fn build_note_bundle(
                 pts,
                 width: $width / xf.s,
                 rgba: $rgba,
-                ink_id,
             });
         }};
     }
@@ -873,16 +895,15 @@ fn build_note_bundle(
             let seq = page_entity.1;
             for sib in 0..count {
                 page_ids.push((page_entity.0, seq, sib as u32));
-                let target = cfg_of(&pages[i + sib]).and_then(|c| {
-                    c.pdf_page.and_then(|p| {
-                        bg_boxes
-                            .get(&c.attachment)?
-                            .get(p.saturating_sub(1) as usize)
-                            .copied()
-                    })
+                let pdf_box = cfg_of(&pages[i + sib]).and_then(|c| {
+                    let p = c.pdf_page.unwrap_or(1);
+                    bg_boxes
+                        .get(&c.attachment)?
+                        .get(p.saturating_sub(1) as usize)
+                        .copied()
                 });
                 let page = &pages[i + sib];
-                xforms.push(page_xform(page.width, page.height, target));
+                xforms.push(page_xform(page, pdf_box));
             }
 
             let bg = cfg.and_then(|cfg| {
@@ -1499,6 +1520,85 @@ mod tests {
         assert_eq!(s.points.len(), 2);
         assert!((s.points[0][0] - 10.0).abs() < 0.1);
         assert!((s.points[1][1] - 40.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn set_metadata_f1_is_valid_set_page_background_table() {
+        // Native Notability parses SetMetadata.f1 as SetPageBackground(f0: PageBackground)
+        // and dereferences PageBackground.f0 (Paper). Verify the table chain is well-formed
+        // and within buffer bounds.
+        let doc = Document::empty();
+        let pages = vec![Page {
+            uuid: "p0".into(),
+            items: vec![],
+            width: PAGE_W,
+            height: PAGE_H,
+        }];
+        let out = write_ntb_to_vec(&pages, &doc).unwrap();
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(out)).unwrap();
+        let mut b = Vec::new();
+        z.by_name("noteBundle").unwrap().read_to_end(&mut b).unwrap();
+
+        let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as usize;
+        let i32_at = |o: usize| i32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as isize;
+        let u16_at = |o: usize| u16::from_le_bytes(b[o..o + 2].try_into().unwrap()) as usize;
+        let f32_at = |o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let field = |tp: usize, fi: usize| -> Option<usize> {
+            let vt = (tp as isize - i32_at(tp)) as usize;
+            let vsz = u16_at(vt);
+            let slot = 4 + fi * 2;
+            if slot + 2 > vsz {
+                return None;
+            }
+            let off = u16_at(vt + slot);
+            (off > 0).then_some(tp + off)
+        };
+        let deref = |fpos: usize| fpos + u32_at(fpos);
+
+        let root = u32_at(0);
+        let ops_vec = deref(field(root, ROOT_F6_OPS).unwrap());
+        let op0 = deref(ops_vec + 4);
+        assert_eq!(b[field(op0, 4).unwrap()], PT_DOCUMENT_SETUP);
+        let setup = deref(field(op0, 5).unwrap());
+        let set_bg = deref(field(setup, 1).unwrap());
+        let page_bg = deref(field(set_bg, 0).unwrap());
+        let paper = deref(field(page_bg, 0).unwrap());
+        assert_eq!(b[field(paper, 2).unwrap()], 1);
+        assert_eq!(b[field(paper, 5).unwrap()], 0x0d);
+        let sz = field(page_bg, 3).unwrap();
+        assert!((f32_at(sz) - NOTE_W).abs() < 1e-3);
+        assert!((f32_at(sz + 4) - NOTE_H).abs() < 1e-3);
+        let margins = field(page_bg, 4).unwrap();
+        for k in 0..4 {
+            assert_eq!(f32_at(margins + k * 4), 36.0);
+        }
+    }
+
+    #[test]
+    fn page_xform_normalizes_goodnotes_pdf_to_note_width_and_preserves_ntb() {
+        // GoodNotes 455.04x588.45 template canvas is 11/6x = 834.24x1078.825.
+        // Center x = 417.12 must land at NOTE_W / 2 with zero vertical offset.
+        let pw = 455.04f32;
+        let ph = 588.45f32;
+        let gn_page = Page {
+            uuid: "FF15F00E".into(),
+            items: vec![],
+            width: pw * crate::doc::GN_DPI_SCALE,
+            height: ph * crate::doc::GN_DPI_SCALE,
+        };
+        let xf = page_xform(&gn_page, Some((pw, ph)));
+        assert!(xf.ox.abs() < 1e-3 && xf.oy.abs() < 1e-3);
+        let mid = xf.apply([gn_page.width * 0.5, 34.2]);
+        assert!((mid[0] - NOTE_W * 0.5).abs() < 0.05);
+        assert!(mid[1] > 20.0, "top-of-page ink must stay positive, got {}", mid[1]);
+
+        let ntb_page = Page {
+            uuid: "ntb-p0000#abc:1".into(),
+            items: vec![],
+            width: 842.0,
+            height: 595.0,
+        };
+        assert!(page_xform(&ntb_page, Some((842.0, 595.0))).is_identity());
     }
 }
 // appended debug test
