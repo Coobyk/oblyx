@@ -86,11 +86,20 @@ fn decode_png(bytes: &[u8]) -> Option<RgbaImage> {
     Some((w, h, rgba))
 }
 
+fn decode_webp(bytes: &[u8]) -> Option<RgbaImage> {
+    let img = image::load_from_memory_with_format(bytes, image::ImageFormat::WebP).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+    Some((w, h, rgba.into_raw()))
+}
+
 pub(crate) fn decode_rgba_image(bytes: &[u8]) -> Option<RgbaImage> {
     if bytes.len() > 3 && bytes[..3] == [0xff, 0xd8, 0xff] {
         decode_jpeg(bytes)
     } else if bytes.len() > 4 && &bytes[..4] == b"\x89PNG" {
         decode_png(bytes)
+    } else if bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        decode_webp(bytes)
     } else {
         None
     }

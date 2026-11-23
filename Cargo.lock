@@ -4954,6 +4954,7 @@ dependencies = [
  "fontdue",
  "getrandom 0.4.3",
  "gpui-kit",
+ "image",
  "jpeg-decoder",
  "jpeg-encoder",
  "lopdf",

@@ -90,8 +90,8 @@ fn prepare_image(bytes: &[u8]) -> Option<(u32, u32, bool, Vec<u8>)> {
                 Some((w as u32, h as u32, false, data))
             }
         }
-    } else if bytes.len() > 4 && &bytes[..4] == b"\x89PNG" {
-        let (w, h, rgba) = decode_rgba_image(bytes)?;
+    } else if let Some((w, h, rgba)) = decode_rgba_image(bytes) {
+        // PNG/WebP/other rasters: composite over white, re-encode as JPEG.
         let mut rgb = Vec::with_capacity((w * h * 3) as usize);
         for px in rgba.chunks_exact(4) {
             let a = px[3] as u32;

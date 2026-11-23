@@ -41,7 +41,7 @@ fn scan_for_nonfinite() {
                 continue;
             }
         }
-        let Ok((_meta, strokes, pages, texts, shapes)) =
+        let Ok((_meta, strokes, pages, texts, shapes, _blocks, _note_text)) =
             oblyx::ntb::parse_bundle_public(&bundle)
         else {
             eprintln!("{path}: parse_bundle failed");

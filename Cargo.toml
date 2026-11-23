@@ -19,6 +19,7 @@ base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }
 flate2 = "1.1"
 fontdue = "0.9.4"
+image = { version = "0.25", default-features = false, features = ["webp"] }
 jpeg-encoder = "0.7.1"
 png = "0.18.1"
 rayon = "1.12.0"

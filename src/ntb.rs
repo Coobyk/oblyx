@@ -121,10 +121,17 @@ const OP_F5_PAYLOAD: usize = 5; // uoffset to payload union table
 
 // PayloadType enum (from the web-app schema; see §4.2).
 const PT_CREATE_PAGE: u8 = 3;
+const PT_INSERT_CHAR: u8 = 7;
+const PT_INSERT_STRING: u8 = 8;
+const PT_REMOVE_CHAR: u8 = 9;
+const PT_REMOVE_CHARS: u8 = 10;
+const PT_REVIVE_CHARS: u8 = 11;
 const PT_CREATE_INK: u8 = 15;
 const PT_MODIFY_INK: u8 = 17;
 const PT_CREATE_SHAPE: u8 = 18;
 const PT_MODIFY_SHAPE: u8 = 19;
+const PT_CREATE_BLOCK: u8 = 22;
+const PT_MODIFY_BLOCK: u8 = 23;
 const PT_MODIFY_POSITIONS: u8 = 24;
 const PT_DELETE_ENTITIES: u8 = 25;
 
@@ -386,6 +393,41 @@ pub struct NtbShape {
     pub border_width: f32,
 }
 
+/// A placed block element (CreateBlock, payloadType 22).
+///
+/// `kind` is the block-type enum (`x71`): 0=Text, 1=Image, 2=Math, 3=Table.
+/// Image blocks carry the content hash of their ImageAsset — the metadata
+/// table's f0 holds the inline 64-byte hash, matching the zip member
+/// `assets/<hex>.<ext>` (verified on M1.ntb).
+///
+/// `text` holds the f13/f12 payload string — Math blocks store their LaTeX
+/// source there. Text-block *content* lives in the note-level text CRDT
+/// (InsertChar/InsertString/RemoveChars ops, folded into
+/// [`NtbDocument::note_text`]); those ops carry no field reference, so note
+/// text folds into one stream and binds to the first Text block.
+#[derive(Debug, Clone)]
+pub struct NtbBlock {
+    /// Page id (f2 df SeqId); `None` when the field is absent.
+    pub page: Option<PageId>,
+    /// Block-type enum (f0): 0=Text, 1=Image, 2=Math, 3=Table.
+    pub kind: u8,
+    /// Top-left origin in page points (f3 Sf).
+    pub x: f32,
+    /// Top-left origin in page points (f3 Sf).
+    pub y: f32,
+    /// Rotation (f4), 0 when absent.
+    pub rotation: f32,
+    /// Rendered size in page points (f6 Sf, required in native files).
+    pub w: f32,
+    /// Rendered size in page points (f6 Sf).
+    pub h: f32,
+    /// Image asset content hash (f10 → ImageAsset → AssetMetadata f0).
+    pub asset_hash: Option<[u8; 64]>,
+    /// String payload (f13, falling back to f12): LaTeX source for Math
+    /// blocks, caption text where present.
+    pub text: Option<String>,
+}
+
 /// Metadata extracted from the noteBundle root table.
 #[derive(Debug, Clone, Default)]
 pub struct NtbMeta {
@@ -418,6 +460,14 @@ pub struct NtbDocument {
     pub texts: Vec<NtbText>,
     /// Live shapes, in creation order.
     pub shapes: Vec<NtbShape>,
+    /// Live block elements (text boxes, images, math, tables), in creation
+    /// order.
+    pub blocks: Vec<NtbBlock>,
+    /// Note-level text content folded from the text CRDT (insert/remove char
+    /// ops). Notability keeps one character stream per note; the ops carry
+    /// no field reference, so all surviving characters fold into this single
+    /// string in insertion order.
+    pub note_text: String,
     /// Raw `manifest.json` bytes.
     pub manifest: Vec<u8>,
     /// Raw `thumbnail.png` bytes, if present.
@@ -460,13 +510,15 @@ pub fn parse_bytes(data: &[u8]) -> Result<NtbDocument> {
         .filter_map(|(n, b)| b.map(|b| (n, b)))
         .collect();
 
-    let (meta, strokes, pages, texts, shapes) = parse_bundle(&bundle)?;
+    let (meta, strokes, pages, texts, shapes, blocks, note_text) = parse_bundle(&bundle)?;
     Ok(NtbDocument {
         meta,
         strokes,
         pages,
         texts,
         shapes,
+        blocks,
+        note_text,
         manifest,
         thumbnail,
         assets,
@@ -492,22 +544,42 @@ fn read_member<R: std::io::Read + std::io::Seek>(
 // ---------------------------------------------------------------------------
 
 /// Parsed contents of a noteBundle: metadata, live strokes, pages, texts,
-/// live shapes. `(meta, strokes, pages, texts, shapes)`.
+/// live shapes, live blocks, folded note text. `(meta, strokes, pages,
+/// texts, shapes, blocks, note_text)`.
 pub type BundleParts = (
     NtbMeta,
     Vec<NtbStroke>,
     Vec<NtbPageDef>,
     Vec<NtbText>,
     Vec<NtbShape>,
+    Vec<NtbBlock>,
+    String,
 );
 
 /// Mutable fold state while walking the op log.
 struct Fold {
     strokes: HashMap<EntityId, NtbStroke>,
     shapes: HashMap<EntityId, NtbShape>,
+    blocks: HashMap<EntityId, NtbBlock>,
     stroke_order: Vec<EntityId>,
     shape_order: Vec<EntityId>,
+    block_order: Vec<EntityId>,
     deleted: HashSet<EntityId>,
+    /// Ordered character stream of the note-level text CRDT.
+    chars: Vec<TextChar>,
+    /// Character entity ids removed by RemoveChar(s) and not revived.
+    removed_chars: HashSet<PageId>,
+}
+
+/// One character entity in the note-level text CRDT. Its id is the df SeqId
+/// `(site, ts, index)` it was inserted as; inserts anchor after a
+/// referenced SeqId.
+#[derive(Debug, Clone)]
+struct TextChar {
+    site: u16,
+    ts: u32,
+    idx: u32,
+    ch: char,
 }
 
 fn parse_bundle(d: &[u8]) -> Result<BundleParts> {
@@ -566,9 +638,13 @@ fn parse_bundle(d: &[u8]) -> Result<BundleParts> {
     let mut fold = Fold {
         strokes: HashMap::new(),
         shapes: HashMap::new(),
+        blocks: HashMap::new(),
         stroke_order: Vec::new(),
         shape_order: Vec::new(),
+        block_order: Vec::new(),
         deleted: HashSet::new(),
+        chars: Vec::new(),
+        removed_chars: HashSet::new(),
     };
     let mut pages = Vec::new();
     let mut texts = Vec::new();
@@ -601,8 +677,22 @@ fn parse_bundle(d: &[u8]) -> Result<BundleParts> {
             shapes.push(s.clone());
         }
     }
+    let mut blocks = Vec::with_capacity(fold.block_order.len());
+    for id in &fold.block_order {
+        if !fold.deleted.contains(id)
+            && let Some(bl) = fold.blocks.get(id)
+        {
+            blocks.push(bl.clone());
+        }
+    }
+    let note_text: String = fold
+        .chars
+        .iter()
+        .filter(|c| !fold.removed_chars.contains(&(c.site, c.ts, c.idx)))
+        .map(|c| c.ch)
+        .collect();
 
-    Ok((meta, strokes, pages, texts, shapes))
+    Ok((meta, strokes, pages, texts, shapes, blocks, note_text))
 }
 
 /// Apply one op to the fold state. Errors on a single op are non-fatal
@@ -655,6 +745,25 @@ fn fold_op(
         }
         PT_MODIFY_SHAPE => {
             apply_shape_patch(b, payload_pos, &pf, fold)?;
+        }
+        PT_CREATE_BLOCK => {
+            if let Some(id) = id
+                && let Ok(block) = parse_block(b, payload_pos, &pf)
+            {
+                if !fold.blocks.contains_key(&id) {
+                    fold.block_order.push(id);
+                }
+                fold.blocks.insert(id, block);
+            }
+        }
+        PT_MODIFY_BLOCK => {
+            apply_block_patch(b, payload_pos, &pf, fold)?;
+        }
+        PT_INSERT_CHAR | PT_INSERT_STRING => {
+            apply_text_insert(b, payload_pos, &pf, id, payload_type, fold)?;
+        }
+        PT_REMOVE_CHAR | PT_REMOVE_CHARS | PT_REVIVE_CHARS => {
+            apply_text_remove(b, payload_pos, &pf, payload_type, fold)?;
         }
         PT_MODIFY_POSITIONS => {
             apply_positions(b, payload_pos, &pf, fold)?;
@@ -897,6 +1006,219 @@ fn apply_deletes(b: &Buf, tp: usize, fields: &[u16], fold: &mut Fold) -> Result<
     }
     for id in read_id_vector(b, tp, Buf::field_off(fields, DEL_F1_UNDELETES)) {
         fold.deleted.remove(&id);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Blocks (CreateBlock/ModifyBlock) and the note-level text CRDT
+// ---------------------------------------------------------------------------
+
+// CreateBlock payload field indices (Lz34, dex-verified).
+const BLOCK_F0_TYPE: usize = 0; // u8 enum: 0 Text, 1 Image, 2 Math, 3 Table
+const BLOCK_F2_PAGE: usize = 2; // nik SeqId (site u16, ts u32, index u32), 12B inline
+const BLOCK_F3_ORIGIN: usize = 3; // aah Sf (2×f32) inline
+const BLOCK_F4_ROTATION: usize = 4; // f32
+const BLOCK_F6_SIZE: usize = 6; // dal Sf (2×f32) inline, required
+const BLOCK_F10_IMAGE: usize = 10; // uoffset → ImageAsset (p89)
+const BLOCK_F12_STRING: usize = 12; // string (caption)
+const BLOCK_F13_STRING: usize = 13; // string (LaTeX for Math blocks)
+
+/// Read a vector of df SeqIds (12-byte inline elements) at `tp + field_off`.
+/// Same layout as [`read_id_vector`] but elements carry the index word.
+fn read_seqid_vector(b: &Buf, tp: usize, field_off: usize) -> Vec<PageId> {
+    let mut out = Vec::new();
+    if field_off == 0 {
+        return out;
+    }
+    let Ok(vec_pos) = b.follow(tp + field_off) else {
+        return out;
+    };
+    let Ok(n) = b.u32(vec_pos) else { return out };
+    for k in 0..n as usize {
+        let s = vec_pos + 4 + 12 * k;
+        if let (Ok(site), Ok(ts), Ok(idx)) = (b.u16(s), b.u32(s + 4), b.u32(s + 8)) {
+            out.push((site, ts, idx));
+        }
+    }
+    out
+}
+
+/// Parse a CreateBlock op into an [`NtbBlock`]. Image blocks carry their
+/// asset's 64-byte content hash inline inside `f10 → ImageAsset f0 →
+/// AssetMetadata f0` (verified on M1.ntb).
+fn parse_block(b: &Buf, tp: usize, fields: &[u16]) -> Result<NtbBlock> {
+    let field = |i: usize| Buf::field_off(fields, i);
+    let kind = if field(BLOCK_F0_TYPE) != 0 {
+        b.u8(tp + field(BLOCK_F0_TYPE))?
+    } else {
+        0
+    };
+    let page = read_page_id(b, tp, field(BLOCK_F2_PAGE));
+    let [x, y] = read_sf(b, tp, field(BLOCK_F3_ORIGIN)).unwrap_or([0.0, 0.0]);
+    let rotation = read_f32_field(b, tp, field(BLOCK_F4_ROTATION)).unwrap_or(0.0);
+    let [w, h] = read_sf(b, tp, field(BLOCK_F6_SIZE)).unwrap_or([0.0, 0.0]);
+    let asset_hash = if field(BLOCK_F10_IMAGE) != 0 {
+        let ip = b.follow(tp + field(BLOCK_F10_IMAGE))?;
+        let (_is, _it, iof) = b.table(ip)?;
+        let meta_off = Buf::field_off(&iof, 0);
+        let mut hash = None;
+        if meta_off != 0
+            && let Ok(mp) = b.follow(ip + meta_off)
+            && let Ok((_ms, _mt, mf)) = b.table(mp)
+        {
+            let h_off = Buf::field_off(&mf, 0);
+            if h_off != 0 && b.d.len() >= mp + h_off + 64 {
+                let mut h = [0u8; 64];
+                h.copy_from_slice(&b.d[mp + h_off..mp + h_off + 64]);
+                hash = Some(h);
+            }
+        }
+        hash
+    } else {
+        None
+    };
+    let text = read_string(b, tp, field(BLOCK_F13_STRING))?
+        .or(read_string(b, tp, field(BLOCK_F12_STRING))?);
+    Ok(NtbBlock {
+        page,
+        kind,
+        x,
+        y,
+        rotation,
+        w,
+        h,
+        asset_hash,
+        text,
+    })
+}
+
+/// Apply a ModifyBlock op (Lhwc): patch page (f2), origin (f3) and size
+/// (f6) on each target entity listed in the f0 id vector.
+fn apply_block_patch(b: &Buf, tp: usize, fields: &[u16], fold: &mut Fold) -> Result<()> {
+    let targets = read_id_vector(b, tp, Buf::field_off(fields, 0));
+    let page = read_page_id(b, tp, Buf::field_off(fields, 2));
+    let origin = read_sf(b, tp, Buf::field_off(fields, 3));
+    let size = read_sf(b, tp, Buf::field_off(fields, 6));
+    for tid in &targets {
+        let Some(bl) = fold.blocks.get_mut(tid) else {
+            continue;
+        };
+        if page.is_some() {
+            bl.page = page;
+        }
+        if let Some([nx, ny]) = origin {
+            bl.x = nx;
+            bl.y = ny;
+        }
+        if let Some([nw, nh]) = size {
+            bl.w = nw;
+            bl.h = nh;
+        }
+    }
+    Ok(())
+}
+
+// InsertChar/InsertString payload field indices (Lmu9/Lru9, dex-verified).
+const TINS_F0_ANCHOR: usize = 0; // nik SeqId, 12B inline — insert after this char
+const TINS_F1_VALUE: usize = 1; // i32 scalar (InsertChar) or string (InsertString)
+const TINS_F2_ID: usize = 2; // d89 SeqId base id of the inserted chars
+
+/// Apply an InsertChar (7) or InsertString (8) op: splice the characters
+/// into the note text stream right after the anchor SeqId's last matching
+/// char, or at the end when the anchor is absent/unresolved.
+fn apply_text_insert(
+    b: &Buf,
+    tp: usize,
+    fields: &[u16],
+    op_id: Option<EntityId>,
+    payload_type: u8,
+    fold: &mut Fold,
+) -> Result<()> {
+    let field = |i: usize| Buf::field_off(fields, i);
+    let anchor = read_page_id(b, tp, field(TINS_F0_ANCHOR));
+    let (site, ts, base_idx) = read_page_id(b, tp, field(TINS_F2_ID))
+        .or_else(|| op_id.map(|(s, t)| (s, t, 0)))
+        .unwrap_or((0, 0, 0));
+    // Anchor resolution: the last char whose entity id sorts at or below
+    // the anchor within the same (site, ts) entity; failing that, the last
+    // char of that entity at all; failing that, the end of the stream.
+    let pos = anchor
+        .and_then(|a| {
+            fold.chars
+                .iter()
+                .rposition(|c| c.site == a.0 && c.ts == a.1 && c.idx <= a.2)
+                .or_else(|| {
+                    fold.chars
+                        .iter()
+                        .rposition(|c| c.site == a.0 && c.ts == a.1)
+                })
+        })
+        .map(|p| p + 1)
+        .unwrap_or(fold.chars.len());
+    if payload_type == PT_INSERT_CHAR {
+        let cp = if field(TINS_F1_VALUE) != 0 {
+            b.u32(tp + field(TINS_F1_VALUE))?
+        } else {
+            0
+        };
+        if let Some(ch) = char::from_u32(cp) {
+            fold.chars.insert(
+                pos,
+                TextChar {
+                    site,
+                    ts,
+                    idx: base_idx,
+                    ch,
+                },
+            );
+        }
+    } else if let Some(s) = read_string(b, tp, field(TINS_F1_VALUE))? {
+        let new_chars = s.chars().enumerate().map(|(i, ch)| TextChar {
+            site,
+            ts,
+            idx: base_idx + i as u32,
+            ch,
+        });
+        fold.chars.splice(pos..pos, new_chars);
+    }
+    Ok(())
+}
+
+// RemoveChar field indices (Lmxi). RemoveChars/ReviveChars (Lnxi/Lb9j)
+// carry a df SeqId vector at f0; RemoveChar also accepts f1.
+/// Apply RemoveChar (9), RemoveChars (10) or ReviveChars (11): mark the
+/// referenced character entities dead (or live again on revive).
+fn apply_text_remove(
+    b: &Buf,
+    tp: usize,
+    fields: &[u16],
+    payload_type: u8,
+    fold: &mut Fold,
+) -> Result<()> {
+    let revive = payload_type == PT_REVIVE_CHARS;
+    let mut ids = Vec::new();
+    if payload_type == PT_REMOVE_CHAR {
+        // RemoveChar stores its target as inline SeqIds at f0/f1 (not a
+        // vector).
+        for f in [0, 1] {
+            if let Some(id) = read_page_id(b, tp, Buf::field_off(fields, f)) {
+                ids.push(id);
+            }
+        }
+    } else {
+        // RemoveChars/ReviveChars carry a df SeqId vector at f0.
+        ids.extend(read_seqid_vector(b, tp, Buf::field_off(fields, 0)));
+        if let Some(id) = read_page_id(b, tp, Buf::field_off(fields, 1)) {
+            ids.push(id);
+        }
+    }
+    for id in ids {
+        if revive {
+            fold.removed_chars.remove(&id);
+        } else {
+            fold.removed_chars.insert(id);
+        }
     }
     Ok(())
 }
@@ -1588,6 +1910,8 @@ fn f16_to_f32(bits: u16) -> f32 {
 pub struct NtbPage {
     pub strokes: Vec<NtbStroke>,
     pub shapes: Vec<NtbShape>,
+    /// Block elements (text boxes, images, math) placed on this page.
+    pub blocks: Vec<NtbBlock>,
     pub width: f32,
     pub height: f32,
     /// 64-byte content hash of the background asset, when the page def
@@ -1610,15 +1934,21 @@ pub fn paginate(doc: &NtbDocument, page_h: f32) -> Vec<NtbPage> {
     let a4 = || NtbPage {
         strokes: Vec::new(),
         shapes: Vec::new(),
+            blocks: Vec::new(),
         width: NTB_PAGE_W,
         height: if page_h > 0.0 { page_h } else { NTB_PAGE_H },
         asset_hash: None,
         pdf_page: 1,
     };
-    if doc.strokes.is_empty() && doc.shapes.is_empty() && doc.pages.is_empty() {
+    if doc.strokes.is_empty()
+        && doc.shapes.is_empty()
+        && doc.pages.is_empty()
+        && doc.blocks.is_empty()
+    {
         return vec![NtbPage {
             strokes: Vec::new(),
             shapes: Vec::new(),
+            blocks: Vec::new(),
             width: NTB_PAGE_W,
             height: if page_h > 0.0 { page_h } else { NTB_PAGE_H },
             asset_hash: None,
@@ -1627,8 +1957,9 @@ pub fn paginate(doc: &NtbDocument, page_h: f32) -> Vec<NtbPage> {
     }
 
     // Page-id grouping when every entity carries one.
-    let all_have_ids =
-        doc.strokes.iter().all(|s| s.page.is_some()) && doc.shapes.iter().all(|s| s.page.is_some());
+    let all_have_ids = doc.strokes.iter().all(|s| s.page.is_some())
+        && doc.shapes.iter().all(|s| s.page.is_some())
+        && doc.blocks.iter().all(|b| b.page.is_some());
     if all_have_ids {
         return paginate_by_page_id(doc, page_h);
     }
@@ -1638,6 +1969,7 @@ pub fn paginate(doc: &NtbDocument, page_h: f32) -> Vec<NtbPage> {
         return vec![NtbPage {
             strokes: doc.strokes.clone(),
             shapes: doc.shapes.clone(),
+            blocks: doc.blocks.clone(),
             width: NTB_PAGE_W,
             height: NTB_PAGE_H,
             asset_hash: None,
@@ -1649,6 +1981,7 @@ pub fn paginate(doc: &NtbDocument, page_h: f32) -> Vec<NtbPage> {
         .iter()
         .map(|s| s.anchor_y)
         .chain(doc.shapes.iter().map(shape_anchor_y))
+        .chain(doc.blocks.iter().map(|b| b.y))
         .fold(0.0f32, f32::max);
     let n_pages = ((max_y / page_h).ceil() as usize).max(1);
     let mut pages: Vec<NtbPage> = (0..n_pages).map(|_| a4()).collect();
@@ -1659,6 +1992,10 @@ pub fn paginate(doc: &NtbDocument, page_h: f32) -> Vec<NtbPage> {
     for s in &doc.shapes {
         let idx = ((shape_anchor_y(s) / page_h).floor() as usize).min(n_pages - 1);
         pages[idx].shapes.push(s.clone());
+    }
+    for b in &doc.blocks {
+        let idx = ((b.y / page_h).floor() as usize).min(n_pages - 1);
+        pages[idx].blocks.push(b.clone());
     }
     pages
 }
@@ -1699,6 +2036,7 @@ fn paginate_by_page_id(doc: &NtbDocument, fallback_h: f32) -> Vec<NtbPage> {
             NtbPage {
                 strokes: Vec::new(),
                 shapes: Vec::new(),
+            blocks: Vec::new(),
                 width: w,
                 height: h,
                 asset_hash: def.asset_hash,
@@ -1714,6 +2052,7 @@ fn paginate_by_page_id(doc: &NtbDocument, fallback_h: f32) -> Vec<NtbPage> {
             NtbPage {
                 strokes: Vec::new(),
                 shapes: Vec::new(),
+            blocks: Vec::new(),
                 width: a4_dims.0,
                 height: a4_dims.1,
                 asset_hash: None,
@@ -1731,6 +2070,7 @@ fn paginate_by_page_id(doc: &NtbDocument, fallback_h: f32) -> Vec<NtbPage> {
             NtbPage {
                 strokes: Vec::new(),
                 shapes: Vec::new(),
+            blocks: Vec::new(),
                 width: a4_dims.0,
                 height: a4_dims.1,
                 asset_hash: None,
@@ -1739,6 +2079,24 @@ fn paginate_by_page_id(doc: &NtbDocument, fallback_h: f32) -> Vec<NtbPage> {
         });
         if let Some(p) = groups.get_mut(&id) {
             p.shapes.push(s.clone());
+        }
+    }
+    for b in &doc.blocks {
+        let Some(id) = b.page else { continue };
+        groups.entry(id).or_insert_with(|| {
+            order.push(id);
+            NtbPage {
+                strokes: Vec::new(),
+                shapes: Vec::new(),
+            blocks: Vec::new(),
+                width: a4_dims.0,
+                height: a4_dims.1,
+                asset_hash: None,
+                pdf_page: 1,
+            }
+        });
+        if let Some(p) = groups.get_mut(&id) {
+            p.blocks.push(b.clone());
         }
     }
     // Emit sibling pages of a multi-page import when any sibling carries ink.
@@ -1752,7 +2110,7 @@ fn paginate_by_page_id(doc: &NtbDocument, fallback_h: f32) -> Vec<NtbPage> {
     for (id, e) in &id_entity {
         if groups
             .get(id)
-            .map(|p| !p.strokes.is_empty() || !p.shapes.is_empty())
+            .map(|p| !p.strokes.is_empty() || !p.shapes.is_empty() || !p.blocks.is_empty())
             .unwrap_or(false)
         {
             ink_entities.insert(*e);
@@ -1764,6 +2122,7 @@ fn paginate_by_page_id(doc: &NtbDocument, fallback_h: f32) -> Vec<NtbPage> {
             let p = groups.remove(&id)?;
             let keep = !p.strokes.is_empty()
                 || !p.shapes.is_empty()
+                || !p.blocks.is_empty()
                 || p.asset_hash.is_some()
                 || id_entity
                     .get(&id)
@@ -1776,6 +2135,7 @@ fn paginate_by_page_id(doc: &NtbDocument, fallback_h: f32) -> Vec<NtbPage> {
         out.push(NtbPage {
             strokes: Vec::new(),
             shapes: Vec::new(),
+            blocks: Vec::new(),
             width: a4_dims.0,
             height: a4_dims.1,
             asset_hash: None,
@@ -1850,7 +2210,10 @@ fn grid_rects(w: f32, h: f32) -> Vec<(f32, f32, f32, f32, [f32; 3])> {
 
 pub fn to_pages(doc: &NtbDocument, page_h: f32) -> Vec<Page> {
     let page_h = if page_h > 0.0 { page_h } else { NTB_PAGE_H };
-    paginate(doc, page_h)
+    // The folded note text binds to the first Text block encountered across
+    // pages (or to no block at all when the stream is only whitespace).
+    let mut text_state = TextEmit { emitted: false };
+    let mut out: Vec<Page> = paginate(doc, page_h)
         .into_iter()
         .enumerate()
         .map(|(i, np)| {
@@ -1880,6 +2243,9 @@ pub fn to_pages(doc: &NtbDocument, page_h: f32) -> Vec<Page> {
                 })
                 .collect();
             items.extend(np.shapes.iter().map(shape_to_item));
+            items.extend(np.blocks.iter().filter_map(|b| {
+                block_to_item(b, &mut text_state, &doc.note_text)
+            }));
             // Notability's default paper style is an 18 pt grid. Pages that
             // carry no PDF/image background get the grid drawn as coloured
             // rects (Item::Background), matching the GT exports' built-in
@@ -1908,11 +2274,87 @@ pub fn to_pages(doc: &NtbDocument, page_h: f32) -> Vec<Page> {
             }
             page
         })
-        .collect()
+        .collect();
+    // Folded note text with no Text block to bind to: emit at the top of
+    // the first page rather than dropping it silently.
+    if !text_state.emitted
+        && !doc.note_text.trim().is_empty()
+        && let Some(first) = out.first_mut()
+    {
+        first.items.push(Item::Text(crate::doc::TextBox {
+            x: 36.0,
+            y: 36.0,
+            size: 14.0,
+            text: doc.note_text.clone(),
+            font: None,
+            rgb: [0.0, 0.0, 0.0],
+            bold: false,
+        }));
+    }
+    out
 }
 
 const BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 const TRANSPARENT: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+
+/// One-shot emitter state for the folded note text (binds to the first
+/// Text-kind block across all pages).
+struct TextEmit {
+    emitted: bool,
+}
+
+/// Map an [`NtbBlock`] onto the portable IR.
+///
+/// - Image blocks (kind 1) become [`Item::Image`] whose `attachment` is the
+///   lowercase hex of the asset's 64-byte content hash — callers resolve it
+///   to the real attachment key via their hash→key map (same convention as
+///   the `#<hex>` page-uuid tags).
+/// - Math blocks (kind 2) degrade to [`Item::Text`] carrying their LaTeX
+///   source (the IR has no math type).
+/// - Text blocks (kind 0) emit the folded note text once, at the first
+///   text block's position.
+/// - Table blocks (kind 3) are not decoded.
+fn block_to_item(b: &NtbBlock, text_emit: &mut TextEmit, note_text: &str) -> Option<Item> {
+    match b.kind {
+        1 => {
+            let hash = b.asset_hash?;
+            let hex: String = hash.iter().map(|v| format!("{v:02x}")).collect();
+            Some(Item::Image(crate::doc::ImageEl {
+                attachment: hex,
+                x: b.x,
+                y: b.y,
+                w: b.w,
+                h: b.h,
+                from_frame: false,
+                bytes: None,
+            }))
+        }
+        2 => b.text.as_ref().filter(|t| !t.trim().is_empty()).map(|t| {
+            Item::Text(crate::doc::TextBox {
+                x: b.x,
+                y: b.y,
+                size: 14.0,
+                text: t.clone(),
+                font: None,
+                rgb: [0.0, 0.0, 0.0],
+                bold: false,
+            })
+        }),
+        0 if !text_emit.emitted && !note_text.trim().is_empty() => {
+            text_emit.emitted = true;
+            Some(Item::Text(crate::doc::TextBox {
+                x: b.x,
+                y: b.y,
+                size: 14.0,
+                text: note_text.to_string(),
+                font: None,
+                rgb: [0.0, 0.0, 0.0],
+                bold: false,
+            }))
+        }
+        _ => None,
+    }
+}
 
 /// Map an [`NtbShape`] onto the portable IR.
 fn shape_to_item(s: &NtbShape) -> Item {
@@ -2264,6 +2706,8 @@ mod tests {
             pages: vec![],
             texts: vec![],
             shapes: vec![],
+            blocks: vec![],
+            note_text: String::new(),
             manifest: vec![],
             thumbnail: None,
             assets: vec![],
@@ -2311,6 +2755,8 @@ mod tests {
             ],
             texts: vec![],
             shapes: vec![],
+            blocks: vec![],
+            note_text: String::new(),
             manifest: vec![],
             thumbnail: None,
             assets: vec![],
@@ -2411,6 +2857,8 @@ mod tests {
             ],
             texts: vec![],
             shapes: vec![],
+            blocks: vec![],
+            note_text: String::new(),
             manifest: vec![],
             thumbnail: None,
             assets: vec![],

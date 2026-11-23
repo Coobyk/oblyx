@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use crate::doc::{Document, Page, PageSource};
+use crate::doc::{Document, Item, Page, PageSource};
 use crate::render::{pdf::document_to_pdf_with, png::page_to_png, svg::page_to_svg};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -760,6 +760,17 @@ fn load_ntb_pages(job: &Job) -> Result<(Document, Vec<Page>)> {
     if bg_bound > 0 {
         crate::vlog!(1, "{label}: bound {bg_bound} page(s) to PDF backgrounds");
         doc.inject_pdf_backgrounds(&mut pages);
+    }
+    // Resolve image-block attachments: `to_pages` emits the asset content
+    // hash (lowercase hex); the attachment map is keyed by zip basename.
+    for page in &mut pages {
+        for item in &mut page.items {
+            if let Item::Image(im) = item
+                && let Some(key) = hash_to_key.get(&im.attachment)
+            {
+                im.attachment = key.clone();
+            }
+        }
     }
     Ok((doc, pages))
 }

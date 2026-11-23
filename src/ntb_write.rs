@@ -25,7 +25,9 @@ use crate::doc::{Document, Item, PAGE_H, PAGE_W, Page, ShapeKind};
 const PT_DOCUMENT_SETUP: u8 = 1;
 const PT_CREATE_ASSET: u8 = 2;
 const PT_CREATE_PAGE: u8 = 3;
+const PT_INSERT_STRING: u8 = 8;
 const PT_CREATE_INK: u8 = 15;
+const PT_CREATE_BLOCK: u8 = 22;
 
 // Root table field indices (verified against real samples).
 const ROOT_F0_NOTE_GUID: usize = 0; // 16-byte inline GUID
@@ -648,6 +650,136 @@ fn write_document_setup(
     op
 }
 
+/// Write a CreateBlock op (pt=22) — a placed text/image/math/table element.
+/// `image` carries `(content_hash, file_name, mime, intrinsic_px_size,
+/// byte_len)` for Image blocks (kind 1); `None` for Text blocks (kind 0).
+///
+/// Native payload (Lz34, dex-verified): f0 type u8, f2 page df SeqId,
+/// f3 origin Sf, f6 size Sf, f10 → ImageAsset { f0 → AssetMetadata
+/// { f0 inline 64B hash, f1 fileName, f2 mimeType, f3 fileSize u32 },
+/// f1 intrinsic size Sf }. The importer hard-validates f3 > 0.
+#[allow(clippy::too_many_arguments)]
+fn write_create_block(
+    fb: &mut Fb,
+    entity: (u16, u32),
+    ts_us: u64,
+    page: (u16, u32, u32),
+    kind: u8,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    image: Option<(&[u8; 64], &str, &str, Option<(f32, f32)>, u32)>,
+) -> usize {
+    let op = write_op_table(fb, entity, ts_us, PT_CREATE_BLOCK);
+    let mut fields = vec![
+        (0, FieldVal::Inline(vec![kind])),
+        (2, FieldVal::Inline(df_inline(page.0, page.1, page.2))),
+        (3, FieldVal::Inline(sf_xy(x, y))),
+        (6, FieldVal::Inline(sf_xy(w, h))),
+    ];
+    if image.is_some() {
+        fields.push((10, FieldVal::Inline(vec![0; 4]))); // ImageAsset placeholder
+    }
+    let payload = fb.write_table(&fields);
+    if let Some((hash, file_name, mime, dims, size)) = image {
+        // FlatBuffers uoffsets must point forward: write the ImageAsset
+        // table first, then AssetMetadata after it, then patch.
+        let mut img_fields = vec![(0, FieldVal::Inline(vec![0; 4]))];
+        if let Some((iw, ih)) = dims {
+            img_fields.push((1, FieldVal::Inline(sf_xy(iw, ih))));
+        }
+        let img = fb.write_table(&img_fields);
+        let meta = fb.write_table(&[
+            (0, FieldVal::Inline(hash.to_vec())),
+            (1, FieldVal::Inline(vec![0; 4])),
+            (2, FieldVal::Inline(vec![0; 4])),
+            (3, FieldVal::Inline(size.to_le_bytes().to_vec())),
+        ]);
+        let fname_pos = write_string(fb, file_name);
+        let mime_pos = write_string(fb, mime);
+        fb.patch_uoffset(meta, 1, fname_pos);
+        fb.patch_uoffset(meta, 2, mime_pos);
+        fb.patch_uoffset(img, 0, meta);
+        fb.patch_uoffset(payload, 10, img);
+    }
+    fb.patch_uoffset(op, 5, payload);
+    op
+}
+
+/// Write an InsertString op (pt=8): append `text` to the note-level text
+/// stream, anchored after `anchor` — for new text boxes the owning block's
+/// entity SeqId acts as the field root.
+fn write_insert_string(
+    fb: &mut Fb,
+    entity: (u16, u32),
+    ts_us: u64,
+    anchor: (u16, u32, u32),
+    text: &str,
+) -> usize {
+    let op = write_op_table(fb, entity, ts_us, PT_INSERT_STRING);
+    let payload = fb.write_table(&[
+        (0, FieldVal::Inline(df_inline(anchor.0, anchor.1, anchor.2))),
+        (1, FieldVal::Inline(vec![0; 4])), // string placeholder
+    ]);
+    let s = write_string(fb, text);
+    fb.patch_uoffset(payload, 1, s);
+    fb.patch_uoffset(op, 5, payload);
+    op
+}
+
+/// Intrinsic pixel size of a raster image (PNG/JPEG/GIF/WebP), for the
+/// ImageAsset metadata table. `None` on unknown/unsupported formats.
+fn sniff_image_dims(bytes: &[u8]) -> Option<(f32, f32)> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") && bytes.len() >= 24 {
+        let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+        let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+        return Some((w as f32, h as f32));
+    }
+    if bytes.starts_with(b"GIF8") && bytes.len() >= 10 {
+        let w = u16::from_le_bytes(bytes[6..8].try_into().ok()?);
+        let h = u16::from_le_bytes(bytes[8..10].try_into().ok()?);
+        return Some((w as f32, h as f32));
+    }
+    if bytes.starts_with(b"RIFF") && bytes.len() >= 30 && &bytes[8..12] == b"WEBP" {
+        if &bytes[12..16] == b"VP8X" {
+            let w = 1 + (bytes[24] as u32 | (bytes[25] as u32) << 8 | (bytes[26] as u32) << 16);
+            let h = 1 + (bytes[27] as u32 | (bytes[28] as u32) << 8 | (bytes[29] as u32) << 16);
+            return Some((w as f32, h as f32));
+        }
+        if &bytes[12..16] == b"VP8 " && &bytes[23..26] == [0x9d, 0x01, 0x2a] {
+            let w = u16::from_le_bytes(bytes[26..28].try_into().ok()?) & 0x3fff;
+            let h = u16::from_le_bytes(bytes[28..30].try_into().ok()?) & 0x3fff;
+            return Some((w as f32, h as f32));
+        }
+        return None;
+    }
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        // JPEG: walk markers to a start-of-frame segment (SOF0–SOF15).
+        let mut i = 2usize;
+        while i + 9 < bytes.len() {
+            if bytes[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = bytes[i + 1];
+            if matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+                let h = u16::from_be_bytes(bytes[i + 5..i + 7].try_into().ok()?);
+                let w = u16::from_be_bytes(bytes[i + 7..i + 9].try_into().ok()?);
+                return Some((w as f32, h as f32));
+            }
+            if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+                i += 2;
+                continue;
+            }
+            let len = u16::from_be_bytes(bytes[i + 2..i + 4].try_into().ok()?) as usize;
+            i += 2 + len.max(1);
+        }
+        return None;
+    }
+    None
+}
+
 /// Everything a page needs to bind its background asset: content hash,
 /// byte size, file extension/mime, and the source PDF's per-page crop boxes
 /// (one per page, as native exports record).
@@ -807,6 +939,30 @@ enum OpSpec<'a> {
         rgba: [f32; 4],
         smooth: bool,
     },
+    Block {
+        entity: (u16, u32),
+        page: (u16, u32, u32),
+        kind: u8,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        image: Option<BlockImage>,
+    },
+    InsertText {
+        entity: (u16, u32),
+        anchor: (u16, u32, u32),
+        text: String,
+    },
+}
+
+/// Image-asset payload data for a CreateBlock op.
+struct BlockImage {
+    hash: [u8; 64],
+    file_name: String,
+    mime: &'static str,
+    dims: Option<(f32, f32)>,
+    size: u32,
 }
 
 /// Serialise one op into a self-contained buffer. All uoffsets it writes are
@@ -856,6 +1012,34 @@ fn serialize_op(spec: &OpSpec, ts_us: u64) -> (usize, Vec<u8>) {
             rgba,
             *smooth,
         ),
+        OpSpec::Block {
+            entity,
+            page,
+            kind,
+            x,
+            y,
+            w,
+            h,
+            image,
+        } => write_create_block(
+            &mut fb,
+            *entity,
+            ts_us,
+            *page,
+            *kind,
+            *x,
+            *y,
+            *w,
+            *h,
+            image
+                .as_ref()
+                .map(|i| (&i.hash, i.file_name.as_str(), i.mime, i.dims, i.size)),
+        ),
+        OpSpec::InsertText {
+            entity,
+            anchor,
+            text,
+        } => write_insert_string(&mut fb, *entity, ts_us, *anchor, text),
     };
     (op, fb.into_buf())
 }
@@ -1168,13 +1352,80 @@ fn build_note_bundle(
                         false
                     );
                 }
-                // Backgrounds, PDF backgrounds, images, text, stickies: not
-                // yet encoded as Notability ops. Skipped for now.
-                Item::Image(_)
-                | Item::Text(_)
-                | Item::Sticky(_)
-                | Item::Background(_)
-                | Item::PdfBackground(_) => {}
+                Item::Image(im) => {
+                    if let (Some(&hash), Some(bytes)) = (
+                        hashes.get(&im.attachment),
+                        doc.attachments.get(&im.attachment),
+                    ) {
+                        // Register the asset (pt=2) once per unique hash —
+                        // native exports do this for every attachment.
+                        if !asset_entities.contains_key(&hash) {
+                            let n = asset_entities.len() as u32 + 1;
+                            asset_entities.insert(hash, n);
+                            specs.push(OpSpec::Asset {
+                                entity: (0xffff, n),
+                                hash,
+                            });
+                        }
+                        let [bx, by] = xf.apply([im.x, im.y]);
+                        let (ext, mime) = sniff_asset(bytes);
+                        specs.push(OpSpec::Block {
+                            entity: ids.next(),
+                            page: page_id,
+                            kind: 1,
+                            x: bx,
+                            y: by,
+                            w: im.w / xf.s,
+                            h: im.h / xf.s,
+                            image: Some(BlockImage {
+                                hash,
+                                file_name: format!("media.{ext}"),
+                                mime,
+                                dims: sniff_image_dims(bytes),
+                                size: bytes.len() as u32,
+                            }),
+                        });
+                    }
+                }
+                Item::Text(t) => {
+                    if t.text.trim().is_empty() {
+                        continue;
+                    }
+                    let entity = ids.next();
+                    let [bx, by] = xf.apply([t.x, t.y]);
+                    let size = if t.size.is_finite() && t.size > 0.0 {
+                        t.size
+                    } else {
+                        14.0
+                    };
+                    // Estimate the rendered box from the text content; the
+                    // app reflows on edit anyway.
+                    let max_len = t
+                        .text
+                        .lines()
+                        .map(|l| l.chars().count())
+                        .max()
+                        .unwrap_or(1) as f32;
+                    let lines = t.text.lines().count().max(1) as f32;
+                    specs.push(OpSpec::Block {
+                        entity,
+                        page: page_id,
+                        kind: 0,
+                        x: bx,
+                        y: by,
+                        w: (max_len * size * 0.55).clamp(40.0, 540.0) / xf.s,
+                        h: (lines * size * 1.35).max(size * 1.5) / xf.s,
+                        image: None,
+                    });
+                    specs.push(OpSpec::InsertText {
+                        entity: ids.next(),
+                        anchor: (entity.0, entity.1, 0),
+                        text: t.text.clone(),
+                    });
+                }
+                // Backgrounds, PDF backgrounds, stickies: not encoded as
+                // Notability ops. Skipped for now.
+                Item::Sticky(_) | Item::Background(_) | Item::PdfBackground(_) => {}
             }
         }
     }
@@ -1308,16 +1559,16 @@ fn compute_hash(data: &[u8]) -> [u8; 64] {
 /// Distinct attachment keys referenced by page backgrounds, in first-seen
 /// order. Several keys can alias one byte buffer.
 fn referenced_attachments(pages: &[Page], doc: &Document) -> Vec<(String, Arc<Vec<u8>>)> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for page in pages {
-        let Some(cfg) = doc.page_cfg().get(&page.uuid) else {
-            continue;
-        };
-        if !seen.insert(cfg.attachment.clone()) {
-            continue;
+    fn push(
+        key: &str,
+        doc: &Document,
+        seen: &mut HashSet<String>,
+        out: &mut Vec<(String, Arc<Vec<u8>>)>,
+    ) {
+        if !seen.insert(key.to_string()) {
+            return;
         }
-        if let Some(bytes) = doc.attachments.get(&cfg.attachment) {
+        if let Some(bytes) = doc.attachments.get(key) {
             let bytes = if sniff_asset(bytes).0 == "pdf" {
                 repair_pdf_boxes(bytes)
                     .map(Arc::new)
@@ -1325,7 +1576,22 @@ fn referenced_attachments(pages: &[Page], doc: &Document) -> Vec<(String, Arc<Ve
             } else {
                 Arc::clone(bytes)
             };
-            out.push((cfg.attachment.clone(), bytes));
+            out.push((key.to_string(), bytes));
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for page in pages {
+        if let Some(cfg) = doc.page_cfg().get(&page.uuid) {
+            push(&cfg.attachment, doc, &mut seen, &mut out);
+        }
+        // Placed image elements share the content-addressed asset store.
+        for item in &page.items {
+            if let Item::Image(im) = item
+                && !im.attachment.is_empty()
+            {
+                push(&im.attachment, doc, &mut seen, &mut out);
+            }
         }
     }
     out
@@ -1774,7 +2040,8 @@ mod tests {
             .unwrap()
             .read_to_end(&mut bundle)
             .unwrap();
-        let (meta, strokes, page_defs, _texts, shapes) = ntb::parse_bundle_public(&bundle).unwrap();
+        let (meta, strokes, page_defs, _texts, shapes, _blocks, _note_text) =
+            ntb::parse_bundle_public(&bundle).unwrap();
         assert_eq!(meta.element_count, 3); // 1 DocumentSetup + 1 CreatePage + 1 CreateInk
         assert_eq!(strokes.len(), 1);
         assert_eq!(page_defs.len(), 1);
@@ -1784,6 +2051,79 @@ mod tests {
         assert_eq!(s.points.len(), 2);
         assert!((s.points[0][0] - 10.0).abs() < 0.1);
         assert!((s.points[1][1] - 40.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn image_and_text_blocks_parse_back() {
+        use crate::ntb;
+        // 1×1 RGBA PNG, encoded with the png crate already in-tree.
+        let mut png_bytes = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut png_bytes, 1, 1);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().unwrap();
+            w.write_image_data(&[0, 128, 255, 255]).unwrap();
+        }
+        let mut doc = Document::empty();
+        doc.insert_attachment("img1.png", png_bytes.clone());
+        let pages = vec![Page {
+            uuid: "p0".into(),
+            items: vec![
+                Item::Image(crate::doc::ImageEl {
+                    attachment: "img1.png".into(),
+                    x: 50.0,
+                    y: 60.0,
+                    w: 100.0,
+                    h: 80.0,
+                    from_frame: false,
+                    bytes: None,
+                }),
+                Item::Text(crate::doc::TextBox {
+                    x: 40.0,
+                    y: 300.0,
+                    size: 16.0,
+                    text: "Hello blocks".into(),
+                    font: None,
+                    rgb: [0.0, 0.0, 0.0],
+                    bold: false,
+                }),
+            ],
+            width: 595.28,
+            height: 841.89,
+        }];
+        let mut out = Vec::new();
+        write_ntb(&pages, &doc, &mut out).unwrap();
+
+        // The image asset must be zipped under its content hash.
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(&out)).unwrap();
+        let names: Vec<String> = (0..z.len())
+            .map(|i| z.by_index(i).unwrap().name().to_string())
+            .collect();
+        let asset = names
+            .iter()
+            .find(|n| n.starts_with("assets/") && n.ends_with(".png"))
+            .expect("image asset zip entry");
+        let want_hex: String = compute_hash(&png_bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(asset, &format!("assets/{want_hex}.png"));
+
+        let mut bundle = Vec::new();
+        z.by_name("noteBundle")
+            .unwrap()
+            .read_to_end(&mut bundle)
+            .unwrap();
+        let (_m, _s, _p, _t, _sh, blocks, note_text) =
+            ntb::parse_bundle_public(&bundle).unwrap();
+        let img = blocks.iter().find(|b| b.kind == 1).expect("image block");
+        assert_eq!(img.page, Some((0, 1, 0)));
+        assert_eq!(img.asset_hash.map(|h| h.to_vec()), Some(compute_hash(&png_bytes).to_vec()));
+        assert!((img.x - 50.0).abs() < 0.1 && (img.w - 100.0).abs() < 0.1);
+        let txt = blocks.iter().find(|b| b.kind == 0).expect("text block");
+        assert!((txt.y - 300.0).abs() < 0.1);
+        assert_eq!(note_text, "Hello blocks");
     }
 
     #[test]

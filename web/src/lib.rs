@@ -226,7 +226,7 @@ fn parse_ntb(bytes: Vec<u8>) -> Result<(Document, Vec<Page>), String> {
             assets.push((name, buf));
         }
     }
-    let (meta, strokes, pages, texts, shapes) =
+    let (meta, strokes, pages, texts, shapes, blocks, note_text) =
         oblyx::ntb::parse_bundle_public(&bundle).map_err(|e| format!("parse bundle: {e}"))?;
     let ntb_doc = oblyx::ntb::NtbDocument {
         meta,
@@ -234,6 +234,8 @@ fn parse_ntb(bytes: Vec<u8>) -> Result<(Document, Vec<Page>), String> {
         pages,
         texts,
         shapes,
+        blocks,
+        note_text,
         manifest: Vec::new(),
         thumbnail: None,
         assets,
@@ -271,6 +273,16 @@ fn parse_ntb(bytes: Vec<u8>) -> Result<(Document, Vec<Page>), String> {
     // Background placements are vector refs, so inject them now — rasters
     // for SVG/PNG rendering still arrive later via oblyx_set_raster.
     doc.inject_pdf_backgrounds(&mut pages);
+    // Resolve image-block attachments (hash hex → zip basename key).
+    for page in &mut pages {
+        for item in &mut page.items {
+            if let oblyx::doc::Item::Image(im) = item
+                && let Some(key) = hash_to_key.get(&im.attachment)
+            {
+                im.attachment = key.clone();
+            }
+        }
+    }
     Ok((doc, pages))
 }
 
