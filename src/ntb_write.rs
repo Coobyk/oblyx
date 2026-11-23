@@ -1466,7 +1466,12 @@ fn build_note_bundle(
     }
 
     // (doc-space y, doc-space x, text, size, bold, rgba) — emitted as one
-    // chained text stream after the per-page item ops.
+    // chained text stream. The stream is spliced into the op vector right
+    // after the page definitions, not appended at the end: Notability's
+    // bulk importer silently drops document-level ops that trail the last
+    // page-bound op (single-file import and the web app replay the full
+    // log, so this only shows up via + → Bulk import).
+    let text_ops_pos = specs.len();
     let mut text_items: Vec<(f32, f32, String, f32, bool, [f32; 4])> = Vec::new();
     let mut page_top = 0.0f32;
 
@@ -1706,6 +1711,7 @@ fn build_note_bundle(
     let mut line_open = false; // current line has unterminated content
     let mut cur_end_x = TEXT_LEFT;
     let mut prev_insert: Option<(u16, u32, u32)> = None;
+    let mut text_ops: Vec<OpSpec> = Vec::new();
     for (doc_y, doc_x, text, size, bold, rgba) in text_items {
         let size = size.clamp(4.0, 200.0);
         let same_line = line_open && doc_y < cur_y + cur_line_h * 0.7;
@@ -1717,7 +1723,6 @@ fn build_note_bundle(
         } else {
             if line_open {
                 cur_y += cur_line_h;
-                line_open = false;
             }
             (
                 ((doc_y - cur_y) / PAD_PITCH).round().max(0.0) as usize,
@@ -1733,12 +1738,12 @@ fn build_note_bundle(
         }
         let pad_chars = pad_content.chars().count() as u32;
         let pad_entity = ids.next();
-        specs.push(OpSpec::InsertText {
+        text_ops.push(OpSpec::InsertText {
             entity: pad_entity,
             anchor: prev_insert,
             text: pad_content,
         });
-        specs.push(OpSpec::Style {
+        text_ops.push(OpSpec::Style {
             entity: ids.next(),
             start: prev_insert,
             end: (pad_entity.0, pad_entity.1, 0),
@@ -1750,12 +1755,12 @@ fn build_note_bundle(
         let pad_anchor = (pad_entity.0, pad_entity.1, pad_chars.saturating_sub(1));
         let text_chars = text.chars().count() as u32;
         let text_entity = ids.next();
-        specs.push(OpSpec::InsertText {
+        text_ops.push(OpSpec::InsertText {
             entity: text_entity,
             anchor: Some(pad_anchor),
             text: text.clone(),
         });
-        specs.push(OpSpec::Style {
+        text_ops.push(OpSpec::Style {
             entity: ids.next(),
             start: Some(pad_anchor),
             end: (text_entity.0, text_entity.1, 0),
@@ -1790,6 +1795,9 @@ fn build_note_bundle(
         };
         line_open = true;
     }
+
+    // Splice the document-level text stream in right after the page defs.
+    specs.splice(text_ops_pos..text_ops_pos, text_ops);
 
     // Ops vector is written before the op tables it references. Each op is
     // serialised into its own buffer in parallel — uoffsets are all relative,
