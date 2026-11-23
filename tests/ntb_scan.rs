@@ -213,3 +213,108 @@ fn count_fillpath_contours() {
     }
     println!("total contour-inks={tot} translucent={lo}");
 }
+
+#[test]
+fn dump_items() {
+    let Ok(f) = std::env::var("GN_FILE") else { return };
+    let data = std::fs::read(&f).unwrap();
+    let doc = oblyx::doc::Document::from_bytes(data).unwrap();
+    for (pi, src) in doc.pages.iter().enumerate() {
+        let Ok(page) = doc.decode_page(src, false) else { continue };
+        println!("=== page {pi} ===");
+        let mut c = std::collections::HashMap::new();
+        for it in &page.items {
+            let (k, extra) = match it {
+                oblyx::doc::Item::Stroke(s) => ("stroke", format!("a={:.2} w={:.1} dash={:?}", s.rgba[3], s.width, s.dash)),
+                oblyx::doc::Item::Shape(s) => ("shape", format!("a={:.2}", s.stroke[3].min(s.fill[3]))),
+                oblyx::doc::Item::Path(p) => ("path", format!("a={:.2}", p.rgba[3])),
+                oblyx::doc::Item::FillPath(p) => ("fillpath", format!("a={:.2} n={}", p.rgba[3], p.contours.len())),
+                oblyx::doc::Item::Connector(x) => ("conn", String::new()),
+                oblyx::doc::Item::Image(im) => ("image", im.attachment.chars().take(8).collect()),
+                oblyx::doc::Item::Sticky(s) => ("sticky", format!("{}x{}", s.w, s.h)),
+                oblyx::doc::Item::Text(t) => ("text", format!("sz={:.0} {:?}", t.size, &t.text[..t.text.len().min(20)])),
+                oblyx::doc::Item::PdfBackground(_) => ("pdfbg", String::new()),
+                oblyx::doc::Item::Background(_) => ("bg", String::new()),
+            };
+            c.entry(k).or_insert(Vec::new()).push(extra);
+        }
+        for (k, v) in c { println!("  {k} x{}: {:?}", v.len(), &v[..v.len().min(6)]); }
+    }
+}
+
+#[test]
+fn dump_page_record_keys() {
+    let Ok(f) = std::env::var("GN_FILE") else { return };
+    let pi: usize = std::env::var("GN_PAGE").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+    let data = std::fs::read(&f).unwrap();
+    let doc = oblyx::doc::Document::from_bytes(data).unwrap();
+    let src = &doc.pages[pi];
+    let recs = oblyx::pb::records(&src.data).unwrap();
+    let mut c = std::collections::HashMap::new();
+    for r in &recs {
+        let keys = {let fs=oblyx::pb::parse(r).unwrap(); oblyx::pb::field_nums(&fs)};
+        *c.entry(format!("{:?}", keys)).or_insert(0usize) += 1;
+    }
+    let mut v: Vec<_> = c.into_iter().collect();
+    v.sort_by(|a,b| b.1.cmp(&a.1));
+    for (k, n) in v { println!("{k}: {n}"); }
+}
+
+#[test]
+fn dump_page_sources() {
+    let Ok(f) = std::env::var("GN_FILE") else { return };
+    let data = std::fs::read(&f).unwrap();
+    let doc = oblyx::doc::Document::from_bytes(data).unwrap();
+    for (i, src) in doc.pages.iter().enumerate() {
+        println!("page {i}: uuid={} data={}B", src.uuid, src.data.len());
+    }
+}
+
+#[test]
+fn dump_fillpath_pos() {
+    let Ok(f) = std::env::var("GN_FILE") else { return };
+    let data = std::fs::read(&f).unwrap();
+    let doc = oblyx::doc::Document::from_bytes(data).unwrap();
+    let src = &doc.pages[1];
+    let page = doc.decode_page(src, false).unwrap();
+    for it in &page.items {
+        if let oblyx::doc::Item::FillPath(p) = it {
+            let xs: Vec<f32> = p.contours.iter().flatten().map(|c| c[0]).collect();
+            let ys: Vec<f32> = p.contours.iter().flatten().map(|c| c[1]).collect();
+            let (x0,x1) = (xs.iter().cloned().fold(f32::MAX,f32::min), xs.iter().cloned().fold(f32::MIN,f32::max));
+            let (y0,y1) = (ys.iter().cloned().fold(f32::MAX,f32::min), ys.iter().cloned().fold(f32::MIN,f32::max));
+            println!("a={:.2} rgb=({:.2},{:.2},{:.2}) n={} bbox=({:.0},{:.0})-({:.0},{:.0})", p.rgba[3], p.rgba[0], p.rgba[1], p.rgba[2], p.contours.len(), x0, y0, x1, y1);
+        }
+    }
+}
+
+#[test]
+fn dump_sticky() {
+    let Ok(f) = std::env::var("GN_FILE") else { return };
+    let data = std::fs::read(&f).unwrap();
+    let doc = oblyx::doc::Document::from_bytes(data).unwrap();
+    for (pi, src) in doc.pages.iter().enumerate() {
+        let Ok(page) = doc.decode_page(src, false) else { continue };
+        for it in &page.items {
+            if let oblyx::doc::Item::Sticky(s) = it {
+                println!("page {pi}: sticky ({:.1},{:.1}) {:.1}x{:.1} rgb={:?}", s.x, s.y, s.w, s.h, s.rgb);
+            }
+        }
+    }
+}
+
+#[test]
+fn dump_text_items() {
+    let Ok(f) = std::env::var("GN_FILE") else { return };
+    let data = std::fs::read(&f).unwrap();
+    let doc = oblyx::doc::Document::from_bytes(data).unwrap();
+    for (pi, src) in doc.pages.iter().enumerate() {
+        let Ok(page) = doc.decode_page(src, false) else { continue };
+        for it in &page.items {
+            if let oblyx::doc::Item::Text(t) = it {
+                println!("p{pi} text {:?} at ({:.0},{:.0}) size {:.1}", t.text, t.x, t.y, t.size);
+            }
+        }
+        println!("p{pi} page w={:.0} h={:.0}", page.width, page.height);
+    }
+}

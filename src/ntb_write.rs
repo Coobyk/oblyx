@@ -25,8 +25,10 @@ use crate::doc::{Document, Item, PAGE_H, PAGE_W, Page, ShapeKind};
 const PT_DOCUMENT_SETUP: u8 = 1;
 const PT_CREATE_ASSET: u8 = 2;
 const PT_CREATE_PAGE: u8 = 3;
+const PT_MODIFY_STYLE: u8 = 12;
 const PT_INSERT_STRING: u8 = 8;
 const PT_CREATE_INK: u8 = 15;
+const PT_CREATE_SHAPE: u8 = 18;
 const PT_CREATE_BLOCK: u8 = 22;
 
 // Root table field indices (verified against real samples).
@@ -727,16 +729,146 @@ fn write_insert_string(
     fb: &mut Fb,
     entity: (u16, u32),
     ts_us: u64,
-    anchor: (u16, u32, u32),
+    anchor: Option<(u16, u32, u32)>,
     text: &str,
 ) -> usize {
     let op = write_op_table(fb, entity, ts_us, PT_INSERT_STRING);
-    let payload = fb.write_table(&[
-        (0, FieldVal::Inline(df_inline(anchor.0, anchor.1, anchor.2))),
-        (1, FieldVal::Inline(vec![0; 4])), // string placeholder
-    ]);
+    let payload = match anchor {
+        Some((s, t, i)) => fb.write_table(&[
+            (0, FieldVal::Inline(df_inline(s, t, i))),
+            (1, FieldVal::Inline(vec![0; 4])), // string placeholder
+        ]),
+        // Head-of-stream insert: native omits the anchor field entirely.
+        None => fb.write_table(&[(1, FieldVal::Inline(vec![0; 4]))]),
+    };
     let s = write_string(fb, text);
     fb.patch_uoffset(payload, 1, s);
+    fb.patch_uoffset(op, 5, payload);
+    op
+}
+
+/// Write a ModifyStyle op (pt=12): restyles the df range (`start`, `end`]
+/// and sets the stream's current style — later inserts inherit it.
+/// Native payload (decoded from live exports): f0/f1 = df range anchors
+/// `{site u16, pad u16, ts u32, index u32}` (index = char offset in the
+/// entity), f3 = u8 table (bold), f4/f5 = u8 tables (italic/underline),
+/// f7 = table→font name string, f8 = f32 table (point size),
+/// f9 = RGBA u32 table (text colour). Range `None` → all-zero anchor,
+/// which native uses for stream-head style ops.
+#[allow(clippy::too_many_arguments)]
+fn write_modify_style(
+    fb: &mut Fb,
+    entity: (u16, u32),
+    ts_us: u64,
+    start: Option<(u16, u32, u32)>,
+    end: (u16, u32, u32),
+    bold: u8,
+    size: f32,
+    rgba: &[f32; 4],
+    font: &str,
+) -> usize {
+    let op = write_op_table(fb, entity, ts_us, PT_MODIFY_STYLE);
+    let start_df = match start {
+        Some((s, t, i)) => df_inline(s, t, i),
+        None => vec![0; 12],
+    };
+    let payload = fb.write_table(&[
+        (0, FieldVal::Inline(df_inline(end.0, end.1, end.2))),
+        (1, FieldVal::Inline(start_df)),
+        (3, FieldVal::Inline(vec![0; 4])),
+        (4, FieldVal::Inline(vec![0; 4])),
+        (5, FieldVal::Inline(vec![0; 4])),
+        (7, FieldVal::Inline(vec![0; 4])),
+        (8, FieldVal::Inline(vec![0; 4])),
+        (9, FieldVal::Inline(vec![0; 4])),
+    ]);
+    // Sub-tables are written after the payload so uoffsets point forward.
+    let bold_t = fb.write_table(&[(0, FieldVal::Inline(vec![bold]))]);
+    let ital_t = fb.write_table(&[(0, FieldVal::Inline(vec![0]))]);
+    let uline_t = fb.write_table(&[(0, FieldVal::Inline(vec![0]))]);
+    let font_t = fb.write_table(&[(0, FieldVal::Inline(vec![0; 4]))]);
+    let fname = write_string(fb, font);
+    let size_t = fb.write_table(&[(0, FieldVal::Inline(size.to_le_bytes().to_vec()))]);
+    let col_t = fb.write_table(&[(0, FieldVal::Inline(gf_color(rgba)))]);
+    fb.patch_uoffset(font_t, 0, fname);
+    fb.patch_uoffset(payload, 3, bold_t);
+    fb.patch_uoffset(payload, 4, ital_t);
+    fb.patch_uoffset(payload, 5, uline_t);
+    fb.patch_uoffset(payload, 7, font_t);
+    fb.patch_uoffset(payload, 8, size_t);
+    fb.patch_uoffset(payload, 9, col_t);
+    fb.patch_uoffset(op, 5, payload);
+    op
+}
+
+/// Write a CreateShape op (pt=18) — a native vector shape with optional
+/// fill. `geom` selects the definition union: NormalShape (ellipse) or
+/// Polygon. Points are absolute; the op stores a top-left origin plus
+/// origin-relative geometry.
+///
+/// Native payload (reader-verified): f0 page df, f1 origin Sf (top-left),
+/// f2 rotation f32, f4 defType u8 (1=Line, 2=Polygon, 3=NormalShape),
+/// f5 → definition table, f9 stroke colour gf, f10 border width f32,
+/// f11 fill colour gf.
+fn write_create_shape(
+    fb: &mut Fb,
+    entity: (u16, u32),
+    ts_us: u64,
+    page: (u16, u32, u32),
+    geom: &ShapeGeom,
+    rotation: f32,
+    color: &[f32; 4],
+    fill: Option<[f32; 4]>,
+    border: f32,
+) -> usize {
+    let op = write_op_table(fb, entity, ts_us, PT_CREATE_SHAPE);
+
+    // Top-left origin = geometry bounding box minimum.
+    let (ox, oy) = match geom {
+        ShapeGeom::Ellipse { x, y, .. } => (*x, *y),
+        ShapeGeom::Polygon(pts) => pts.iter().fold((f32::MAX, f32::MAX), |(ax, ay), p| {
+            (ax.min(p[0]), ay.min(p[1]))
+        }),
+    };
+
+    let def_type: u8 = match geom {
+        ShapeGeom::Ellipse { .. } => 3, // NormalShape
+        ShapeGeom::Polygon(_) => 2,
+    };
+    let mut fields = vec![
+        (0, FieldVal::Inline(df_inline(page.0, page.1, page.2))),
+        (1, FieldVal::Inline(sf_xy(ox, oy))),
+        (4, FieldVal::Inline(vec![def_type])),
+        (5, FieldVal::Inline(vec![0; 4])), // def placeholder
+        (9, FieldVal::Inline(gf_color(color))),
+        (10, FieldVal::Inline(border.to_le_bytes().to_vec())),
+    ];
+    if rotation.is_finite() && rotation != 0.0 {
+        fields.push((2, FieldVal::Inline(rotation.to_le_bytes().to_vec())));
+    }
+    if let Some(f) = fill {
+        fields.push((11, FieldVal::Inline(gf_color(&f))));
+    }
+    let payload = fb.write_table(&fields);
+
+    match geom {
+        ShapeGeom::Ellipse { w, h, .. } => {
+            // NormalShape: f0 ntype (absent = Ellipse), f1 size Sf.
+            let def = fb.write_table(&[(1, FieldVal::Inline(sf_xy(*w, *h)))]);
+            fb.patch_uoffset(payload, 5, def);
+        }
+        ShapeGeom::Polygon(pts) => {
+            let def = fb.write_table(&[(0, FieldVal::Inline(vec![0; 4]))]);
+            let mut rel = Vec::with_capacity(pts.len() * 8);
+            for p in pts.iter() {
+                rel.extend_from_slice(&(p[0] - ox).to_le_bytes());
+                rel.extend_from_slice(&(p[1] - oy).to_le_bytes());
+            }
+            let vec_pos = fb.write_struct_vector(&rel, 8);
+            fb.patch_uoffset(def, 0, vec_pos);
+            fb.patch_uoffset(payload, 5, def);
+        }
+    }
     fb.patch_uoffset(op, 5, payload);
     op
 }
@@ -965,9 +1097,34 @@ enum OpSpec<'a> {
     },
     InsertText {
         entity: (u16, u32),
-        anchor: (u16, u32, u32),
+        anchor: Option<(u16, u32, u32)>,
         text: String,
     },
+    Style {
+        entity: (u16, u32),
+        start: Option<(u16, u32, u32)>,
+        end: (u16, u32, u32),
+        bold: u8,
+        size: f32,
+        rgba: [f32; 4],
+        font: String,
+    },
+    Shape {
+        entity: (u16, u32),
+        page: (u16, u32, u32),
+        geom: ShapeGeom,
+        rotation: f32,
+        color: [f32; 4],
+        fill: Option<[f32; 4]>,
+        border: f32,
+    },
+}
+
+/// CreateShape geometry: either a NormalShape ellipse (top-left + size)
+/// or a closed polygon (absolute points).
+enum ShapeGeom {
+    Ellipse { x: f32, y: f32, w: f32, h: f32 },
+    Polygon(Vec<[f32; 2]>),
 }
 
 /// Image-asset payload data for a CreateBlock op.
@@ -1056,32 +1213,28 @@ fn serialize_op(spec: &OpSpec, ts_us: u64) -> (usize, Vec<u8>) {
             anchor,
             text,
         } => write_insert_string(&mut fb, *entity, ts_us, *anchor, text),
+        OpSpec::Style {
+            entity,
+            start,
+            end,
+            bold,
+            size,
+            rgba,
+            font,
+        } => write_modify_style(&mut fb, *entity, ts_us, *start, *end, *bold, *size, rgba, font),
+        OpSpec::Shape {
+            entity,
+            page,
+            geom,
+            rotation,
+            color,
+            fill,
+            border,
+        } => write_create_shape(
+            &mut fb, *entity, ts_us, *page, geom, *rotation, color, *fill, *border,
+        ),
     };
     (op, fb.into_buf())
-}
-
-/// Approximate a rectangle as a closed 5-point polyline.
-fn rect_outline(x: f32, y: f32, w: f32, h: f32) -> Vec<[f32; 2]> {
-    vec![
-        [x, y],
-        [x + w, y],
-        [x + w, y + h],
-        [x, y + h],
-        [x, y],
-    ]
-}
-
-/// Approximate an ellipse (center cx/cy, half-axes w/h) as a 25-point
-/// polyline. GoodNotes shapes become strokes — the native shape schema is
-/// only partially decoded, and visual fidelity beats an unimportable note.
-fn ellipse_outline(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<[f32; 2]> {
-    const N: usize = 24;
-    let mut pts = Vec::with_capacity(N + 1);
-    for i in 0..=N {
-        let a = (i as f32) * std::f32::consts::TAU / (N as f32);
-        pts.push([cx + rx * a.cos(), cy + ry * a.sin()]);
-    }
-    pts
 }
 
 /// Coordinate transform from a source page's space to the Notability page
@@ -1312,8 +1465,19 @@ fn build_note_bundle(
         }
     }
 
+    // (doc-space y, doc-space x, text, size, bold, rgba) — emitted as one
+    // chained text stream after the per-page item ops.
+    let mut text_items: Vec<(f32, f32, String, f32, bool, [f32; 4])> = Vec::new();
+    let mut page_top = 0.0f32;
+
     for (pi, (page, &page_id)) in pages.iter().zip(&page_ids).enumerate() {
         let xf = xforms[pi];
+        // This page's height in note space; page tops accumulate for the
+        // note-level text stream.
+        let page_ntb_h = page.height / xf.s;
+        let this_page_top = page_top;
+        page_top += page_ntb_h;
+        let page_top = this_page_top;
 
         for item in &page.items {
             match item {
@@ -1327,35 +1491,97 @@ fn build_note_bundle(
                     }
                 }
                 Item::Shape(sh) => {
-                    let (pts, smooth) = match sh.kind {
-                        ShapeKind::Ellipse => (
-                            ellipse_outline(sh.x, sh.y, sh.w.abs(), sh.h.abs()),
-                            true,
-                        ),
-                        ShapeKind::Rect => (rect_outline(sh.x, sh.y, sh.w, sh.h), false),
-                        _ => {
-                            // Polygon → closed polyline.
-                            let mut pts = sh.points.clone();
-                            if pts.len() >= 2 {
-                                if let Some(f) = pts.first().copied() {
-                                    pts.push(f);
-                                }
-                            }
-                            (pts, false)
-                        }
+                    // Native CreateShape carries fill + border; emit real
+                    // shape ops instead of stroke outlines. Rects become
+                    // polygons (native NormalShape only defines ellipses).
+                    let geom = match sh.kind {
+                        ShapeKind::Ellipse => Some(ShapeGeom::Ellipse {
+                            x: sh.x - sh.w.abs(),
+                            y: sh.y - sh.h.abs(),
+                            w: 2.0 * sh.w.abs(),
+                            h: 2.0 * sh.h.abs(),
+                        }),
+                        ShapeKind::Rect => Some(ShapeGeom::Polygon(vec![
+                            [sh.x, sh.y],
+                            [sh.x + sh.w, sh.y],
+                            [sh.x + sh.w, sh.y + sh.h],
+                            [sh.x, sh.y + sh.h],
+                        ])),
+                        _ if sh.points.len() >= 3 => Some(ShapeGeom::Polygon(sh.points.clone())),
+                        _ => None,
                     };
-                    if pts.len() >= 2 {
-                        ink!(page_id, InkPts::Owned(pts), sh.width, sh.stroke, xf, smooth, false);
+                    if let Some(mut geom) = geom {
+                        if let ShapeGeom::Polygon(pts) = &mut geom {
+                            for p in pts.iter_mut() {
+                                *p = xf.apply(*p);
+                            }
+                        }
+                        if let ShapeGeom::Ellipse { x, y, w, h } = &mut geom {
+                            [*x, *y] = xf.apply([*x, *y]);
+                            *w /= xf.s;
+                            *h /= xf.s;
+                        }
+                        let fill = (sh.fill[3] > 0.0).then_some(sh.fill);
+                        let (color, border) = if sh.stroke[3] > 0.0 {
+                            (
+                                sh.stroke,
+                                if sh.width.is_finite() && sh.width > 0.0 {
+                                    sh.width / xf.s
+                                } else {
+                                    1.0
+                                },
+                            )
+                        } else {
+                            // Invisible border: fill colour at zero width.
+                            (fill.unwrap_or(sh.stroke), 0.0)
+                        };
+                        specs.push(OpSpec::Shape {
+                            entity: ids.next(),
+                            page: page_id,
+                            geom,
+                            rotation: sh.rotation,
+                            color,
+                            fill,
+                            border,
+                        });
                     }
                 }
                 Item::Path(p) => {
                     if p.points.len() >= 2 {
                         ink!(page_id, InkPts::Ref(&p.points), p.width, p.rgba, xf, true, false);
                     }
+                    if let Some(head) = p.head {
+                        // Arrowhead triangle → small filled polygon.
+                        specs.push(OpSpec::Shape {
+                            entity: ids.next(),
+                            page: page_id,
+                            geom: ShapeGeom::Polygon(
+                                head.iter().map(|&pt| xf.apply(pt)).collect(),
+                            ),
+                            rotation: 0.0,
+                            color: p.rgba,
+                            fill: Some(p.rgba),
+                            border: 0.0,
+                        });
+                    }
                 }
                 Item::FillPath(fp) => {
+                    // Filled regions (tape ribbons, marker fills) → filled
+                    // polygons, one per contour, no border.
                     for contour in &fp.contours {
-                        if contour.len() >= 2 {
+                        if contour.len() >= 3 {
+                            specs.push(OpSpec::Shape {
+                                entity: ids.next(),
+                                page: page_id,
+                                geom: ShapeGeom::Polygon(
+                                    contour.iter().map(|&pt| xf.apply(pt)).collect(),
+                                ),
+                                rotation: 0.0,
+                                color: fp.rgba,
+                                fill: Some(fp.rgba),
+                                border: 0.0,
+                            });
+                        } else if contour.len() == 2 {
                             ink!(page_id, InkPts::Ref(contour), 1.0, fp.rgba, xf, true, false);
                         }
                     }
@@ -1413,43 +1639,156 @@ fn build_note_bundle(
                     if t.text.trim().is_empty() {
                         continue;
                     }
-                    let entity = ids.next();
-                    let [bx, by] = xf.apply([t.x, t.y]);
-                    let size = if t.size.is_finite() && t.size > 0.0 {
-                        t.size
-                    } else {
-                        14.0
-                    };
-                    // Estimate the rendered box from the text content; the
-                    // app reflows on edit anyway.
-                    let max_len = t
-                        .text
-                        .lines()
-                        .map(|l| l.chars().count())
-                        .max()
-                        .unwrap_or(1) as f32;
-                    let lines = t.text.lines().count().max(1) as f32;
-                    specs.push(OpSpec::Block {
-                        entity,
-                        page: page_id,
-                        kind: 0,
-                        x: bx,
-                        y: by,
-                        w: (max_len * size * 0.55).clamp(40.0, 540.0) / xf.s,
-                        h: (lines * size * 1.35).max(size * 1.5) / xf.s,
-                        image: None,
-                    });
-                    specs.push(OpSpec::InsertText {
+                    // Typed text in Notability is a document-level character
+                    // stream, not a block: position comes from '\n' padding
+                    // (vertical) and space indentation (horizontal). Collect
+                    // and emit after all pages so stream order matches
+                    // document order.
+                    let [tx, ty] = xf.apply([t.x, t.y]);
+                    text_items.push((
+                        page_top + ty,
+                        tx,
+                        t.text.clone(),
+                        t.size / xf.s,
+                        t.bold,
+                        [t.rgb[0], t.rgb[1], t.rgb[2], 1.0],
+                    ));
+                }
+                Item::Sticky(s) => {
+                    // No sticky primitive in Notability — approximate as a
+                    // filled rect in the sticky's colour; the note's text
+                    // and strokes land on top via their own ops.
+                    let [sx, sy] = xf.apply([s.x, s.y]);
+                    let (sw, sh) = (s.w / xf.s, s.h / xf.s);
+                    specs.push(OpSpec::Shape {
                         entity: ids.next(),
-                        anchor: (entity.0, entity.1, 0),
-                        text: t.text.clone(),
+                        page: page_id,
+                        geom: ShapeGeom::Polygon(vec![
+                            [sx, sy],
+                            [sx + sw, sy],
+                            [sx + sw, sy + sh],
+                            [sx, sy + sh],
+                        ]),
+                        rotation: 0.0,
+                        color: [s.rgb[0], s.rgb[1], s.rgb[2], 1.0],
+                        fill: Some([s.rgb[0], s.rgb[1], s.rgb[2], 1.0]),
+                        border: 0.0,
                     });
                 }
-                // Backgrounds, PDF backgrounds, stickies: not encoded as
-                // Notability ops. Skipped for now.
-                Item::Sticky(_) | Item::Background(_) | Item::PdfBackground(_) => {}
+                // Backgrounds and PDF backgrounds are bound through page
+                // definitions, not item ops.
+                Item::Background(_) | Item::PdfBackground(_) => {}
             }
         }
+    }
+
+    // Note-level text stream (verified against live native exports): typed
+    // text is a linear character stream — no per-box entity. Vertical
+    // position comes from '\n' padding, horizontal from leading spaces, and
+    // a ModifyStyle op after each insert sets both that insert's range
+    // style and the active style later inserts inherit.
+    //
+    // Pads are emitted as their own insert styled at PAD_SIZE so their line
+    // pitch stays constant regardless of neighbouring text sizes. The text
+    // itself is a second insert styled with the GoodNotes size/bold/colour.
+    // Line heights scale with the run's font size (~LINE_FACTOR × size,
+    // measured on-device from 14 pt and 36 pt styled exports).
+    text_items.sort_by(|a, b| a.0.total_cmp(&b.0));
+    const PAD_SIZE: f32 = 14.0;
+    const LINE_FACTOR: f32 = 1.886; // measured on-device: 14pt pads render at ~26.4pt pitch
+    const PAD_PITCH: f32 = PAD_SIZE * LINE_FACTOR; // 26.4 pt
+    const TEXT_LEFT: f32 = 40.0;
+    const TEXT_SPACE_W: f32 = 4.0; // space advance at 14 pt
+    const PAD_STYLE: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+    let line_h = |size: f32| (LINE_FACTOR * size).max(8.0);
+    let mut cur_y = 0.0f32; // stream y at the top of the current open line
+    let mut cur_line_h = 0.0f32; // height of the current open line
+    let mut line_open = false; // current line has unterminated content
+    let mut cur_end_x = TEXT_LEFT;
+    let mut prev_insert: Option<(u16, u32, u32)> = None;
+    for (doc_y, doc_x, text, size, bold, rgba) in text_items {
+        let size = size.clamp(4.0, 200.0);
+        let same_line = line_open && doc_y < cur_y + cur_line_h * 0.7;
+        let (pad, indent) = if same_line {
+            (
+                0usize,
+                ((doc_x - cur_end_x) / TEXT_SPACE_W).round().max(1.0) as usize,
+            )
+        } else {
+            if line_open {
+                cur_y += cur_line_h;
+                line_open = false;
+            }
+            (
+                ((doc_y - cur_y) / PAD_PITCH).round().max(0.0) as usize,
+                ((doc_x - TEXT_LEFT) / TEXT_SPACE_W).round().max(0.0) as usize,
+            )
+        };
+        let mut pad_content = String::with_capacity(pad + indent);
+        pad_content.extend(std::iter::repeat('\n').take(pad));
+        pad_content.extend(std::iter::repeat(' ').take(indent));
+        if !same_line {
+            cur_y += pad as f32 * PAD_PITCH;
+            cur_end_x = TEXT_LEFT;
+        }
+        let pad_chars = pad_content.chars().count() as u32;
+        let pad_entity = ids.next();
+        specs.push(OpSpec::InsertText {
+            entity: pad_entity,
+            anchor: prev_insert,
+            text: pad_content,
+        });
+        specs.push(OpSpec::Style {
+            entity: ids.next(),
+            start: prev_insert,
+            end: (pad_entity.0, pad_entity.1, 0),
+            bold: 0,
+            size: PAD_SIZE,
+            rgba: PAD_STYLE,
+            font: "Inter".to_string(),
+        });
+        let pad_anchor = (pad_entity.0, pad_entity.1, pad_chars.saturating_sub(1));
+        let text_chars = text.chars().count() as u32;
+        let text_entity = ids.next();
+        specs.push(OpSpec::InsertText {
+            entity: text_entity,
+            anchor: Some(pad_anchor),
+            text: text.clone(),
+        });
+        specs.push(OpSpec::Style {
+            entity: ids.next(),
+            start: Some(pad_anchor),
+            end: (text_entity.0, text_entity.1, 0),
+            bold: bold as u8,
+            size,
+            rgba,
+            font: "Inter".to_string(),
+        });
+        prev_insert = Some((
+            text_entity.0,
+            text_entity.1,
+            text_chars.saturating_sub(1),
+        ));
+        cur_end_x += indent as f32 * TEXT_SPACE_W;
+        let n_lines = text.lines().count().max(1) as f32;
+        let last_len = text
+            .lines()
+            .last()
+            .map(|l| l.chars().count())
+            .unwrap_or(0) as f32;
+        let this_h = line_h(size);
+        if n_lines > 1.0 {
+            cur_end_x = TEXT_LEFT + last_len * size * 0.55;
+            cur_y += (n_lines - 1.0) * this_h;
+        } else {
+            cur_end_x += last_len * size * 0.55;
+        }
+        cur_line_h = if same_line {
+            cur_line_h.max(this_h)
+        } else {
+            this_h
+        };
+        line_open = true;
     }
 
     // Ops vector is written before the op tables it references. Each op is
@@ -2143,9 +2482,8 @@ mod tests {
         assert_eq!(img.page, Some((0, 1, 0)));
         assert_eq!(img.asset_hash.map(|h| h.to_vec()), Some(compute_hash(&png_bytes).to_vec()));
         assert!((img.x - 50.0).abs() < 0.1 && (img.w - 100.0).abs() < 0.1);
-        let txt = blocks.iter().find(|b| b.kind == 0).expect("text block");
-        assert!((txt.y - 300.0).abs() < 0.1);
-        assert_eq!(note_text, "Hello blocks");
+        assert!(blocks.iter().all(|b| b.kind != 0));
+        assert!(note_text.contains("Hello blocks"), "stream text: {note_text:?}");
     }
 
     #[test]
