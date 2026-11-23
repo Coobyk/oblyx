@@ -110,8 +110,9 @@ jobs:
 
       - name: Stamp release version into the crate
         # Checkouts see the pre-bump commit; the tag itself lands on the bump
-        # commit, so source archives stay consistent. (-i.bak: BSD sed needs a
-        # backup suffix on macOS runners.)
+        # commit, so source archives stay consistent. bash + -i.bak: portable
+        # across GNU/BSD sed and the Windows runner's pwsh default shell.
+        shell: bash
         run: |
           sed -i.bak "/^\[package\]/,/^\[/ s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
           rm -f Cargo.toml.bak
