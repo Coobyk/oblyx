@@ -1,5 +1,6 @@
 # Desktop binaries (CLI + GUI) for Linux / macOS / Windows, plus Pages deploy.
-# - push to main: auto-versioned release (v<base>.r<commit-count>) + AUR publish
+# - push to main: semver release (latest tag + patch bump, floor = Cargo.toml
+#   version); the version job commits the bump to main before tagging
 # - tag v*: release that version + AUR publish
 # - workflow_dispatch: Pages deploy only
 name: CI
@@ -19,10 +20,11 @@ jobs:
     name: resolve version
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
     outputs:
       version: ${{ steps.v.outputs.version }}
       needed: ${{ steps.v.outputs.needed }}
+      sha: ${{ steps.v.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,11 +36,41 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          bump_patch() {
+            local IFS=.
+            read -r a b c <<< "$1"
+            echo "$a.$b.$((c + 1))"
+          }
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             ver="${GITHUB_REF_NAME#v}"
+            echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           else
             base="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
-            ver="${base}.r$(git rev-list --count HEAD)"
+            # Latest strict semver tag (excludes the old .rN scheme).
+            latest="$(git tag -l | grep -xE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)"
+            latest="${latest#v}"
+            if [[ -n "$latest" && "$(printf '%s\n%s\n' "$base" "$latest" | sort -V | head -1)" == "$base" ]]; then
+              ver="$(bump_patch "$latest")"
+            else
+              ver="$base"
+            fi
+            # Skip ahead if the computed tag/release already exists (re-runs,
+            # racing pushes).
+            while [[ -n "$(git ls-remote --tags origin "v$ver")" ]] || \
+                  gh release view "v$ver" --json tagName >/dev/null 2>&1; do
+              ver="$(bump_patch "$ver")"
+            done
+            if [[ "$ver" != "$base" ]]; then
+              # Tag must point at a commit whose Cargo.toml/Cargo.lock agree —
+              # the AUR source package builds with cargo --frozen.
+              sed -i "/^\[package\]/,/^\[/ s/^version = \".*\"/version = \"$ver\"/" Cargo.toml
+              sed -i "/^name = \"oblyx\"$/{n;s/^version = \".*\"$/version = \"$ver\"/}" Cargo.lock
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git commit -qam "chore(release): v$ver [skip ci]"
+              git push -q origin HEAD:main
+            fi
+            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           fi
           echo "version=$ver" >> "$GITHUB_OUTPUT"
           # A release that already has assets means this is a re-run (e.g. a
@@ -75,6 +107,11 @@ jobs:
             name: windows-x64
     steps:
       - uses: actions/checkout@v4
+
+      - name: Stamp release version into the crate
+        # Checkouts see the pre-bump commit; the tag itself lands on the bump
+        # commit, so source archives stay consistent.
+        run: sed -i "/^\[package\]/,/^\[/ s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -213,6 +250,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.version.outputs.version }}
+          target_commitish: ${{ needs.version.outputs.sha }}
           files: dist/*
           generate_release_notes: true
           fail_on_unmatched_files: true
