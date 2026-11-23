@@ -537,9 +537,17 @@ fn write_create_ink(
     width: f32,
     rgba: &[f32; 4],
     smooth: bool,
+    highlighter: bool,
 ) -> usize {
-    // Colour struct (inline Gf, 4 bytes).
-    let color = gf_color(rgba);
+    // Marker strokes get the native highlighter treatment: tool=2 +
+    // alpha 0x6B (verified on E1/P1 exports). Emitting the native alpha
+    // keeps the stroke inside the values the native reader accepts and
+    // makes it behave like a real marker (blend mode, under-ink
+    // layering) instead of a transparent pen.
+    let mut color = gf_color(rgba);
+    if highlighter {
+        color[3] = 0x6B;
+    }
     let origin = points.first().copied().unwrap_or([0.0, 0.0]);
     let width = if width.is_finite() && width > 0.0 {
         width
@@ -555,15 +563,20 @@ fn write_create_ink(
     let op = write_op_table(fb, entity, ts_us, PT_CREATE_INK);
 
     // CreateInk payload (native): f0 page (df inline), f1 origin (Sf inline),
-    // f5 style, f7 colour (packed RGBA), f8 width, f9 encodedCenterPath blob.
-    let payload = fb.write_table(&[
+    // f4 tool enum (2 = Highlighter; pens omit it), f5 style, f7 colour
+    // (packed RGBA), f8 width, f9 encodedCenterPath blob.
+    let mut fields = vec![
         (0, FieldVal::Inline(df_inline(page.0, page.1, page.2))),
         (1, FieldVal::Inline(sf_xy(origin[0], origin[1]))),
         (5, FieldVal::Inline(vec![1])),
         (7, FieldVal::Inline(color)),
         (8, FieldVal::Inline(width.to_le_bytes().to_vec())),
         (9, FieldVal::Inline(vec![0; 4])), // placeholder
-    ]);
+    ];
+    if highlighter {
+        fields.push((4, FieldVal::Inline(vec![2])));
+    }
+    let payload = fb.write_table(&fields);
 
     let path_pos = fb.write_byte_vector(&build_path_stream(points, smooth));
     fb.patch_uoffset(payload, 9, path_pos);
@@ -938,6 +951,7 @@ enum OpSpec<'a> {
         width: f32,
         rgba: [f32; 4],
         smooth: bool,
+        marker: bool,
     },
     Block {
         entity: (u16, u32),
@@ -1002,6 +1016,7 @@ fn serialize_op(spec: &OpSpec, ts_us: u64) -> (usize, Vec<u8>) {
             width,
             rgba,
             smooth,
+            marker,
         } => write_create_ink(
             &mut fb,
             *entity,
@@ -1011,6 +1026,7 @@ fn serialize_op(spec: &OpSpec, ts_us: u64) -> (usize, Vec<u8>) {
             *width,
             rgba,
             *smooth,
+            *marker,
         ),
         OpSpec::Block {
             entity,
@@ -1136,7 +1152,7 @@ fn build_note_bundle(
     let mut ids = EntityGen::new();
     let mut specs: Vec<OpSpec> = Vec::new();
     macro_rules! ink {
-        ($page:expr, $pts:expr, $width:expr, $rgba:expr, $xf:expr, $smooth:expr) => {{
+        ($page:expr, $pts:expr, $width:expr, $rgba:expr, $xf:expr, $smooth:expr, $marker:expr) => {{
             let xf: Xf = $xf;
             let pts = match $pts {
                 InkPts::Ref(r) if xf.is_identity() => InkPts::Ref(r),
@@ -1155,6 +1171,7 @@ fn build_note_bundle(
                 width: $width / xf.s,
                 rgba: $rgba,
                 smooth: $smooth,
+                marker: $marker,
             });
         }};
     }
@@ -1302,7 +1319,11 @@ fn build_note_bundle(
             match item {
                 Item::Stroke(s) => {
                     if s.points.len() >= 2 {
-                        ink!(page_id, InkPts::Ref(&s.points), s.width, s.rgba, xf, true);
+                        // Translucent pen strokes are markers (GoodNotes
+                        // encodes them as alpha 0.5; native highlighters
+                        // round-trip here at 0x6B/255 ≈ 0.42).
+                        let marker = s.rgba[3].is_finite() && s.rgba[3] < 0.99;
+                        ink!(page_id, InkPts::Ref(&s.points), s.width, s.rgba, xf, true, marker);
                     }
                 }
                 Item::Shape(sh) => {
@@ -1324,18 +1345,18 @@ fn build_note_bundle(
                         }
                     };
                     if pts.len() >= 2 {
-                        ink!(page_id, InkPts::Owned(pts), sh.width, sh.stroke, xf, smooth);
+                        ink!(page_id, InkPts::Owned(pts), sh.width, sh.stroke, xf, smooth, false);
                     }
                 }
                 Item::Path(p) => {
                     if p.points.len() >= 2 {
-                        ink!(page_id, InkPts::Ref(&p.points), p.width, p.rgba, xf, true);
+                        ink!(page_id, InkPts::Ref(&p.points), p.width, p.rgba, xf, true, false);
                     }
                 }
                 Item::FillPath(fp) => {
                     for contour in &fp.contours {
                         if contour.len() >= 2 {
-                            ink!(page_id, InkPts::Ref(contour), 1.0, fp.rgba, xf, true);
+                            ink!(page_id, InkPts::Ref(contour), 1.0, fp.rgba, xf, true, false);
                         }
                     }
                 }
@@ -1349,6 +1370,7 @@ fn build_note_bundle(
                         c.width,
                         c.rgba,
                         xf,
+                        false,
                         false
                     );
                 }

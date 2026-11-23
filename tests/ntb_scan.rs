@@ -124,3 +124,92 @@ fn walkdir(dir: &str) -> Vec<String> {
     }
     out
 }
+
+#[test]
+fn dump_translucent_strokes() {
+    let Ok(dir) = std::env::var("GN_DUMP") else { return };
+    let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "goodnotes").unwrap_or(false))
+        .collect();
+    files.sort();
+    for p in files {
+        let data = std::fs::read(&p).unwrap();
+        let Ok(doc) = oblyx::doc::Document::from_bytes(data) else { continue };
+        let mut n = 0usize; let mut tot = 0usize;
+        for src in &doc.pages {
+            let Ok(page) = doc.decode_page(src, false) else { continue };
+            for it in &page.items {
+                if let oblyx::doc::Item::Stroke(s) = it { tot += 1;
+                    if s.rgba[3] < 0.995 { n += 1;
+                        if n <= 5 { println!("{}: a={:.3} rgb=({:.2},{:.2},{:.2}) w={:.1} pts={}", p.file_name().unwrap().to_string_lossy(), s.rgba[3], s.rgba[0], s.rgba[1], s.rgba[2], s.width, s.points.len()); }
+                    } } }
+        }
+        if n > 0 { println!("{}: {}/{} translucent", p.file_name().unwrap().to_string_lossy(), n, tot); }
+    }
+}
+
+#[test]
+fn dump_translucent_items() {
+    let Ok(f) = std::env::var("GN_FILE") else { return };
+    let data = std::fs::read(&f).unwrap();
+    let doc = oblyx::doc::Document::from_bytes(data).unwrap();
+    for src in &doc.pages {
+        let Ok(page) = doc.decode_page(src, false) else { continue };
+        for it in &page.items {
+            let (k, a) = match it {
+                oblyx::doc::Item::Stroke(s) => ("stroke", s.rgba[3]),
+                oblyx::doc::Item::Shape(s) => ("shape", s.stroke[3].min(s.fill[3])),
+                oblyx::doc::Item::Path(p) => ("path", p.rgba[3]),
+                oblyx::doc::Item::FillPath(p) => ("fillpath", p.rgba[3]),
+                oblyx::doc::Item::Connector(c) => ("conn", c.rgba[3]),
+                _ => continue,
+            };
+            if a < 0.995 { println!("{k} a={a:.3}"); }
+        }
+    }
+}
+
+#[test]
+fn count_emitted_alpha() {
+    let Ok(f) = std::env::var("GN_FILE") else { return };
+    let data = std::fs::read(&f).unwrap();
+    let doc = oblyx::doc::Document::from_bytes(data).unwrap();
+    let mut c = std::collections::HashMap::new();
+    for src in &doc.pages {
+        let Ok(page) = doc.decode_page(src, false) else { continue };
+        for it in &page.items {
+            let (k, a) = match it {
+                oblyx::doc::Item::Stroke(s) => ("stroke", s.rgba[3]),
+                oblyx::doc::Item::Shape(s) => ("shape_stroke", s.stroke[3]),
+                oblyx::doc::Item::Path(p) => ("path", p.rgba[3]),
+                oblyx::doc::Item::FillPath(p) => ("fillpath", p.rgba[3]),
+                oblyx::doc::Item::Connector(c) => ("conn", c.rgba[3]),
+                _ => continue,
+            };
+            *c.entry((k, a < 0.99)).or_insert(0usize) += 1;
+        }
+    }
+    let mut v: Vec<_> = c.into_iter().collect();
+    v.sort();
+    for ((k, lo), n) in v { println!("{k} translucent={lo}: {n}"); }
+}
+
+#[test]
+fn count_fillpath_contours() {
+    let Ok(f) = std::env::var("GN_FILE") else { return };
+    let data = std::fs::read(&f).unwrap();
+    let doc = oblyx::doc::Document::from_bytes(data).unwrap();
+    let mut tot = 0usize; let mut lo = 0usize;
+    for src in &doc.pages {
+        let Ok(page) = doc.decode_page(src, false) else { continue };
+        for it in &page.items {
+            if let oblyx::doc::Item::FillPath(p) = it {
+                let n = p.contours.iter().filter(|c| c.len() >= 2).count();
+                tot += n;
+                if p.rgba[3] < 0.99 { lo += n; println!("fillpath a={:.3} contours={}", p.rgba[3], n); }
+            }
+        }
+    }
+    println!("total contour-inks={tot} translucent={lo}");
+}
