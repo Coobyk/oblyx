@@ -315,6 +315,27 @@ fn simplify_stroke_points(points: &[[f32; 2]], eps: f32) -> Vec<[f32; 2]> {
 /// (matching native Notability's cubic-Bézier ink paths) with corner radii
 /// capped on long straight segments.
 fn build_path_stream(points: &[[f32; 2]], smooth: bool) -> Vec<u8> {
+    // Collapse consecutive coincident points and drop non-finite ones: a path
+    // made of a single unique point would otherwise encode only zero-length
+    // segments (0x0 bounding box — degenerate geometry native code can divide
+    // by). A lone point becomes a sub-pixel segment instead.
+    let mut pts: Vec<[f32; 2]> = Vec::with_capacity(points.len());
+    for &p in points {
+        if !p[0].is_finite() || !p[1].is_finite() {
+            continue;
+        }
+        if let Some(&l) = pts.last()
+            && (p[0] - l[0]).abs() < 1e-4
+            && (p[1] - l[1]).abs() < 1e-4
+        {
+            continue;
+        }
+        pts.push(p);
+    }
+    if pts.len() == 1 {
+        pts.push([pts[0][0] + 0.05, pts[0][1]]);
+    }
+    let points = pts.as_slice();
     if points.is_empty() {
         return Vec::new();
     }
@@ -340,16 +361,20 @@ fn build_path_stream(points: &[[f32; 2]], smooth: bool) -> Vec<u8> {
 
     let pts = simplify_stroke_points(points, 0.05);
     if pts.len() <= 2 {
-        let count = pts.len().max(1);
-        let mut stream = Vec::with_capacity(3 + count * 9);
+        // `pts` is never empty here (points is non-empty), but simplify can
+        // still collapse everything to one point — emit a sub-pixel segment
+        // rather than a moveto-only (zero-extent) path.
+        let end = pts
+            .get(1)
+            .copied()
+            .unwrap_or([anchor[0] + 0.05, anchor[1]]);
+        let mut stream = Vec::with_capacity(3 + 2 * 9);
         stream.push(1);
-        stream.extend_from_slice(&(count as u16).to_le_bytes());
+        stream.extend_from_slice(&2u16.to_le_bytes());
         stream.push(PATH_MOVETO);
         push_pt(&mut stream, anchor);
-        if pts.len() == 2 {
-            stream.push(PATH_LINE);
-            push_pt(&mut stream, pts[1]);
-        }
+        stream.push(PATH_LINE);
+        push_pt(&mut stream, end);
         return stream;
     }
 
@@ -1293,10 +1318,80 @@ fn referenced_attachments(pages: &[Page], doc: &Document) -> Vec<(String, Arc<Ve
             continue;
         }
         if let Some(bytes) = doc.attachments.get(&cfg.attachment) {
-            out.push((cfg.attachment.clone(), Arc::clone(bytes)));
+            let bytes = if sniff_asset(bytes).0 == "pdf" {
+                repair_pdf_boxes(bytes)
+                    .map(Arc::new)
+                    .unwrap_or_else(|| Arc::clone(bytes))
+            } else {
+                Arc::clone(bytes)
+            };
+            out.push((cfg.attachment.clone(), bytes));
         }
     }
     out
+}
+
+/// Rename degenerate page-level `/MediaBox`/`/CropBox` entries in a PDF so
+/// readers inherit the `/Pages` box instead of rasterising a literal
+/// zero-size box. iOS Quartz emits `/MediaBox [0 0 0 0]` on pages of some
+/// paper/stub PDFs; PDFTron divides by the box dims and Notability then
+/// crashes on `roundToInt(NaN)` while rendering page previews on import.
+/// The key is overwritten with an equal-length ignored name, so the file
+/// keeps its byte length and stays xref-valid without a rebuild.
+fn repair_pdf_boxes(pdf: &[u8]) -> Option<Vec<u8>> {
+    const KEYS: &[(&[u8], &[u8])] = &[(b"/MediaBox", b"/OblyxMBx"), (b"/CropBox", b"/OblyxCB")];
+    let mut out = pdf.to_vec();
+    let mut patched = false;
+    for (key, replacement) in KEYS {
+        let mut from = 0usize;
+        while let Some(pos) = find_bytes(&out, from, key) {
+            from = pos + 1;
+            let mut j = pos + key.len();
+            while j < out.len() && out[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if out.get(j) != Some(&b'[') {
+                continue;
+            }
+            let mut k = j + 1;
+            let mut vals = [0f64; 4];
+            let mut ok = true;
+            for v in vals.iter_mut() {
+                while k < out.len() && out[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                let start = k;
+                while k < out.len()
+                    && matches!(out[k], b'0'..=b'9' | b'.' | b'-' | b'+' | b'e' | b'E')
+                {
+                    k += 1;
+                }
+                match std::str::from_utf8(&out[start..k])
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                {
+                    Some(x) => *v = x,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            // Same validity test as pdfinput::page_bbox_of.
+            if ok && !(vals[2] - vals[0] > 1.0 && vals[3] - vals[1] > 1.0) {
+                out[pos..pos + key.len()].copy_from_slice(replacement);
+                patched = true;
+            }
+        }
+    }
+    patched.then_some(out)
+}
+
+fn find_bytes(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    (from..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
 }
 
 /// Write a `.ntb` archive to `w`.
