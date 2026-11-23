@@ -1615,7 +1615,7 @@ pub fn paginate(doc: &NtbDocument, page_h: f32) -> Vec<NtbPage> {
         asset_hash: None,
         pdf_page: 1,
     };
-    if doc.strokes.is_empty() && doc.shapes.is_empty() {
+    if doc.strokes.is_empty() && doc.shapes.is_empty() && doc.pages.is_empty() {
         return vec![NtbPage {
             strokes: Vec::new(),
             shapes: Vec::new(),
@@ -1764,6 +1764,7 @@ fn paginate_by_page_id(doc: &NtbDocument, fallback_h: f32) -> Vec<NtbPage> {
             let p = groups.remove(&id)?;
             let keep = !p.strokes.is_empty()
                 || !p.shapes.is_empty()
+                || p.asset_hash.is_some()
                 || id_entity
                     .get(&id)
                     .map(|e| ink_entities.contains(e))

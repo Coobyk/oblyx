@@ -1864,5 +1864,64 @@ mod tests {
         };
         assert!(page_xform(&ntb_page, Some((842.0, 595.0))).is_identity());
     }
+
+    #[test]
+    fn repair_pdf_boxes_renames_degenerate_page_boxes() {
+        // Minimal PDF: /Pages parent carries a real box, the /Page object
+        // overrides it with a literal zero-size box (iOS Quartz stub style).
+        let pdf = b"%PDF-1.4\n\
+            1 0 obj\n<< /Type /Pages /MediaBox [0 0 612 792] /Kids [3 0 R] >>\nendobj\n\
+            3 0 obj\n<< /Type /Page /Parent 1 0 R /MediaBox [0 0 0 0] >>\nendobj\n\
+            trailer\n<< /Root 1 0 R >>\n%%EOF\n";
+        let fixed = repair_pdf_boxes(pdf).expect("degenerate box must be repaired");
+        assert_eq!(fixed.len(), pdf.len(), "in-place rename must preserve length");
+        let s = String::from_utf8_lossy(&fixed);
+        assert!(s.contains("/OblyxMBx [0 0 0 0]"));
+        assert!(!s.contains("/MediaBox [0 0 0 0]"));
+        // Parent box untouched.
+        assert!(s.contains("/MediaBox [0 0 612 792]"));
+
+        // A valid file is returned unchanged.
+        let ok = b"%PDF-1.4\n<< /Type /Page /MediaBox [0 0 595.28 841.89] >>\n";
+        assert!(repair_pdf_boxes(ok).is_none());
+    }
+
+    #[test]
+    fn repair_pdf_boxes_handles_cropbox_and_whitespace() {
+        let pdf = b"<< /Type /Page /CropBox  [ 0 0 0.5 841 ] >>";
+        let fixed = repair_pdf_boxes(pdf).expect("degenerate CropBox");
+        assert_eq!(fixed.len(), pdf.len());
+        assert!(String::from_utf8_lossy(&fixed).contains("/OblyxCB"));
+    }
+
+    #[test]
+    fn build_path_stream_drops_nonfinite_and_duplicates() {
+        let points = vec![
+            [10.0, 20.0],
+            [f32::NAN, 0.0],
+            [f32::INFINITY, 0.0],
+            [10.0, 20.0],
+            [10.0, 20.0],
+            [30.0, 40.0],
+        ];
+        let stream = build_path_stream(&points, false);
+        assert_eq!(stream[0], 1);
+        let count = u16::from_le_bytes(stream[1..3].try_into().unwrap());
+        // moveto + one line: dup/non-finite points collapsed away.
+        assert_eq!(count, 2);
+        assert_eq!(stream[3], PATH_MOVETO);
+    }
+
+    #[test]
+    fn build_path_stream_single_point_emits_segment() {
+        // A lone point must not produce a moveto-only (zero-extent) path:
+        // native Notability divides by path extents and 0x0 boxes can NaN.
+        for smooth in [false, true] {
+            let stream = build_path_stream(&[[5.0, 5.0]], smooth);
+            assert!(stream.len() > 3);
+            let count = u16::from_le_bytes(stream[1..3].try_into().unwrap());
+            assert!(count >= 2, "single point must gain a segment");
+            assert_eq!(stream[3], PATH_MOVETO);
+        }
+    }
 }
-// appended debug test
