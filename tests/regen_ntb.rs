@@ -48,7 +48,7 @@ fn regen() {
             .iter()
             .filter_map(|p| doc.decode_page(p, false).ok())
             .collect();
-        match oblyx::ntb_write::write_ntb_to_vec(&pages, &doc) {
+        match oblyx::ntb_write::write_ntb_to_vec(&pages, &doc, &name) {
             Ok(ntb) => {
                 std::fs::File::create(&out).unwrap().write_all(&ntb).unwrap();
             }

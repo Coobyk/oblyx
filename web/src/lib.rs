@@ -559,8 +559,13 @@ pub extern "C" fn oblyx_convert(fmt: u32) -> i32 {
                 }
             }
             3 => {
-                // Notability (.ntb) format.
-                let bytes = match write_ntb_to_vec(&pages, doc) {
+                // Notability (.ntb) format. The archive entry's stem (or the
+                // member name set via `oblyx_set_member`) becomes the note
+                // title shown in Notability's library.
+                let title = CURRENT
+                    .with(|c| c.borrow().as_ref().map(|e| e.stem.clone()))
+                    .unwrap_or_default();
+                let bytes = match write_ntb_to_vec(&pages, doc, &title) {
                     Ok(b) => b,
                     Err(e) => return fail(format!("write ntb: {e:#}")),
                 };

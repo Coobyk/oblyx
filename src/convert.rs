@@ -640,7 +640,11 @@ pub fn convert_job_sink(
             }
             Fmt::Ntb => {
                 progress(JobProgress::Writing("Writing Notability notebook…"));
-                let bytes = crate::ntb_write::write_ntb_to_vec(&pages, &doc)?;
+                let title = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default();
+                let bytes = crate::ntb_write::write_ntb_to_vec(&pages, &doc, title)?;
                 sink.write(&job.root, path, bytes)?;
                 crate::vlog!(1, "{label}: wrote {}", path.display());
                 written += 1;

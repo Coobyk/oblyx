@@ -1301,6 +1301,7 @@ fn build_note_bundle(
     pages: &[Page],
     doc: &Document,
     hashes: &HashMap<String, [u8; 64]>,
+    title: &str,
 ) -> (Vec<u8>, String, [u8; 16], u64, [u8; 16]) {
     let mut ids = EntityGen::new();
     let mut specs: Vec<OpSpec> = Vec::new();
@@ -1329,8 +1330,12 @@ fn build_note_bundle(
         }};
     }
 
-    // First op: DocumentSetup (pt=1). Required by Notability.
-    let title = format!("Note {}", chrono_like_timestamp());
+    // First op: DocumentSetup (pt=1). Required by Notability. The title is
+    // what the Notability library shows; callers pass the source file stem.
+    let title = match title.trim() {
+        "" => format!("Note {}", chrono_like_timestamp()),
+        t => t.to_string(),
+    };
     let setup_entity = ids.next();
     specs.push(OpSpec::Setup {
         entity: setup_entity,
@@ -2029,8 +2034,9 @@ fn find_bytes(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
     (from..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
 }
 
-/// Write a `.ntb` archive to `w`.
-pub fn write_ntb(pages: &[Page], doc: &Document, mut w: impl Write) -> Result<()> {
+/// Write a `.ntb` archive to `w`. `title` becomes the note's display name in
+/// Notability; empty falls back to `Note <timestamp>`.
+pub fn write_ntb(pages: &[Page], doc: &Document, title: &str, mut w: impl Write) -> Result<()> {
     // SHA-512 each unique background attachment once — hashing per page is
     // quadratic on PDF-imported notebooks where every page shares one
     // multi-hundred-MB asset. Aliased keys share one hash via their byte
@@ -2060,7 +2066,7 @@ pub fn write_ntb(pages: &[Page], doc: &Document, mut w: impl Write) -> Result<()
         .collect();
 
     let (bundle, title, _note_guid, _ts_ms, subject_id) =
-        build_note_bundle(pages, doc, &hashes);
+        build_note_bundle(pages, doc, &hashes, title);
     if bundle.len() as u64 > MOBILE_MAX_ENTRY {
         eprintln!(
             "warning: noteBundle is {} MiB; Notability's Android importer rejects entries over 64 MiB",
@@ -2130,9 +2136,9 @@ pub fn write_ntb(pages: &[Page], doc: &Document, mut w: impl Write) -> Result<()
 }
 
 /// Convenience wrapper: write a `.ntb` archive and return the bytes.
-pub fn write_ntb_to_vec(pages: &[Page], doc: &Document) -> Result<Vec<u8>> {
+pub fn write_ntb_to_vec(pages: &[Page], doc: &Document, title: &str) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    write_ntb(pages, doc, &mut out)?;
+    write_ntb(pages, doc, title, &mut out)?;
     Ok(out)
 }
 
@@ -2308,7 +2314,7 @@ mod tests {
             height: 841.89,
         }];
         let mut out = Vec::new();
-        write_ntb(&pages, &doc, &mut out).unwrap();
+        write_ntb(&pages, &doc, "Test", &mut out).unwrap();
         assert!(out.len() > 50);
         let mut z = zip::ZipArchive::new(std::io::Cursor::new(out)).unwrap();
         assert!(z.by_name("noteBundle").is_ok());
@@ -2330,7 +2336,7 @@ mod tests {
             height: 841.89,
         }];
         let mut out = Vec::new();
-        write_ntb(&pages, &doc, &mut out).unwrap();
+        write_ntb(&pages, &doc, "Test", &mut out).unwrap();
 
         let mut z = zip::ZipArchive::new(std::io::Cursor::new(&out)).unwrap();
         assert_eq!(z.by_name("version").unwrap().size(), 1);
@@ -2373,7 +2379,7 @@ mod tests {
         ];
 
         let mut out = Vec::new();
-        write_ntb(&pages, &doc, &mut out).unwrap();
+        write_ntb(&pages, &doc, "Test", &mut out).unwrap();
         let mut z = zip::ZipArchive::new(std::io::Cursor::new(out)).unwrap();
         let assets: Vec<String> = (0..z.len())
             .filter_map(|i| z.by_index(i).ok().map(|e| e.name().to_string()))
@@ -2400,7 +2406,7 @@ mod tests {
             height: 841.89,
         }];
         let mut out = Vec::new();
-        write_ntb(&pages, &doc, &mut out).unwrap();
+        write_ntb(&pages, &doc, "Test", &mut out).unwrap();
 
         // Extract noteBundle and parse with the reader.
         let mut z = zip::ZipArchive::new(std::io::Cursor::new(out)).unwrap();
@@ -2462,7 +2468,7 @@ mod tests {
             height: 841.89,
         }];
         let mut out = Vec::new();
-        write_ntb(&pages, &doc, &mut out).unwrap();
+        write_ntb(&pages, &doc, "Test", &mut out).unwrap();
 
         // The image asset must be zipped under its content hash.
         let mut z = zip::ZipArchive::new(std::io::Cursor::new(&out)).unwrap();
@@ -2506,7 +2512,7 @@ mod tests {
             width: PAGE_W,
             height: PAGE_H,
         }];
-        let out = write_ntb_to_vec(&pages, &doc).unwrap();
+        let out = write_ntb_to_vec(&pages, &doc, "Test").unwrap();
         let mut z = zip::ZipArchive::new(std::io::Cursor::new(out)).unwrap();
         let mut b = Vec::new();
         z.by_name("noteBundle").unwrap().read_to_end(&mut b).unwrap();
