@@ -497,6 +497,25 @@ pub extern "C" fn oblyx_convert(fmt: u32) -> i32 {
             Ok(p) => p,
             Err(e) => return fail(e),
         };
+        // Bit 8 of `fmt` is the true-black flag: near-black pen ink (the
+        // GoodNotes dark warm brown) snaps to pure black before writing.
+        let true_black = fmt & 0x100 != 0;
+        let fmt = fmt & 0xff;
+        let transformed = if true_black {
+            Some(
+                pages
+                    .iter()
+                    .cloned()
+                    .map(oblyx::convert::true_black_page)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+        let pages: &[oblyx::doc::Page] = match &transformed {
+            Some(t) => t,
+            None => &pages,
+        };
         let total = pages.len() as u32;
         let archived = SINK.with(|s| s.borrow().is_some());
         match fmt {

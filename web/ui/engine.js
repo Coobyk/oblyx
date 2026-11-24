@@ -230,7 +230,9 @@ function bufferOf(bytes) {
     }
     return bytes.slice().buffer;
 }
-export async function convertFile(name, blob, preloaded, fmt, packZip, onProgress) {
+export async function convertFile(name, blob, preloaded, fmt, packZip, onProgress, trueBlack = false) {
+    // Bit 8 of fmt is the true-black flag understood by the wasm module.
+    if (trueBlack) fmt |= 0x100;
     const show = (label) => onProgress({ label, pct: 0 });
     const set = (label, done, total) => {
         const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 100;

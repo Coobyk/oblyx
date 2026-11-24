@@ -148,6 +148,9 @@ button, input, select { font: inherit; }
 
 .options { display: flex; flex-direction: column; gap: 12px; padding-top: 16px; }
 .option { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--foreground); font-size: 13px; }
+.option-toggle { flex-wrap: wrap; cursor: pointer; }
+.option-toggle input { accent-color: var(--accent, #4f8cff); width: 16px; height: 16px; cursor: pointer; }
+.option-hint { flex-basis: 100%; font-size: 11px; opacity: 0.55; margin-top: -6px; }
 .segmented {
   display: inline-flex;
   flex: 0 0 auto;

@@ -9,6 +9,7 @@ const options = document.querySelector("#options")
 const packageOption = document.querySelector("#package-option")
 const formatOptions = document.querySelector("#format-options")
 const packageOptions = document.querySelector("#package-options")
+const trueBlackToggle = document.querySelector("#true-black-toggle")
 const convertButton = document.querySelector("#convert")
 const changeButton = document.querySelector("#change-file")
 const progressArea = document.querySelector("#progress-area")
@@ -189,6 +190,7 @@ async function convert() {
       fmtCode,
       outputPackaging === "zip",
       progress,
+      trueBlackToggle?.checked ?? false,
     )
     outputFiles = files
     savedMeta = meta

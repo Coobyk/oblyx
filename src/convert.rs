@@ -403,7 +403,7 @@ fn snap_true_black(rgba: &mut [f32; 4]) {
 
 /// Apply [`snap_true_black`] to every pen stroke on a page (freehand ink,
 /// pen paths and connectors — shapes and fills keep their exact colours).
-fn true_black_page(mut page: crate::doc::Page) -> crate::doc::Page {
+pub fn true_black_page(mut page: crate::doc::Page) -> crate::doc::Page {
     for item in &mut page.items {
         match item {
             crate::doc::Item::Stroke(s) => snap_true_black(&mut s.rgba),
