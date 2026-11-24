@@ -94,6 +94,7 @@ pub struct ConverterView {
     dpi: Entity<InputState>,
     page: Entity<InputState>,
     include_deleted: bool,
+    true_black: bool,
 
     entries: Vec<Entry>,
     running: bool,
@@ -125,6 +126,7 @@ impl ConverterView {
             dpi,
             page,
             include_deleted: false,
+            true_black: false,
             entries: Vec::new(),
             running: false,
             cancelling: false,
@@ -330,6 +332,7 @@ impl ConverterView {
             dpi,
             page,
             include_deleted: self.include_deleted,
+            true_black: self.true_black,
         };
         if let Err(err) = options.validate() {
             Self::toast(window, cx, format!("{err:#}"));
@@ -871,6 +874,17 @@ impl ConverterView {
                         .checked(self.include_deleted)
                         .on_change(cx.listener(|view, value, _, cx| {
                             view.include_deleted = *value;
+                            cx.notify();
+                        })),
+                ),
+            )
+            .child(
+                Field::new().label_indent(false).child(
+                    Switch::new("true-black")
+                        .label("Pure black ink (GoodNotes' dark brown pen)")
+                        .checked(self.true_black)
+                        .on_change(cx.listener(|view, value, _, cx| {
+                            view.true_black = *value;
                             cx.notify();
                         })),
                 ),
