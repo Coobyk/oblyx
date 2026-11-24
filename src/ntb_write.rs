@@ -55,10 +55,19 @@ const NOTE_H: f32 = 841.89105;
 const MOBILE_MAX_ENTRY: u64 = 64 * 1024 * 1024;
 const MOBILE_MAX_ARCHIVE: u64 = 500 * 1024 * 1024;
 
-// Path element types (non-attributed, to avoid the 6-byte attribute tail).
-const PATH_CUBIC: u8 = 4;
-const PATH_LINE: u8 = 6;
-const PATH_MOVETO: u8 = 7;
+// Path element types. Native ink — every stroke in fresh Android exports —
+// uses the attributed variants (0/2/3), each carrying a 6-byte tail of
+// f16 width multiplier, f16 force, u8 altitude, u8 azimuth. Highlighter
+// rendering (multiply blend, variable width) keys off this encoding, so
+// the writer matches it exactly with unit width/force tails.
+const PATH_CUBIC: u8 = 0;
+const PATH_LINE: u8 = 2;
+const PATH_MOVETO: u8 = 3;
+
+/// Attribute tail appended after each element's points: width ×1.0
+/// (0x3C00 f16 LE), force 1.0, altitude 0xFF, azimuth 0 — the values
+/// finger-drawn native strokes carry.
+const ATTR_TAIL: [u8; 6] = [0x00, 0x3C, 0x00, 0x3C, 0xFF, 0x00];
 
 /// A field value for table writing.
 #[derive(Clone)]
@@ -351,14 +360,16 @@ fn build_path_stream(points: &[[f32; 2]], smooth: bool) -> Vec<u8> {
 
     if !smooth || points.len() <= 2 {
         let count = points.len().min(u16::MAX as usize);
-        let mut stream = Vec::with_capacity(3 + count * 9);
+        let mut stream = Vec::with_capacity(3 + count * 15);
         stream.push(1); // version 0 << 3 | precision 1 (f32)
         stream.extend_from_slice(&(count as u16).to_le_bytes());
         stream.push(PATH_MOVETO);
         push_pt(&mut stream, anchor);
+        stream.extend_from_slice(&ATTR_TAIL);
         for &p in &points[1..count] {
             stream.push(PATH_LINE);
             push_pt(&mut stream, p);
+            stream.extend_from_slice(&ATTR_TAIL);
         }
         return stream;
     }
@@ -372,17 +383,19 @@ fn build_path_stream(points: &[[f32; 2]], smooth: bool) -> Vec<u8> {
             .get(1)
             .copied()
             .unwrap_or([anchor[0] + 0.05, anchor[1]]);
-        let mut stream = Vec::with_capacity(3 + 2 * 9);
+        let mut stream = Vec::with_capacity(3 + 2 * 15);
         stream.push(1);
         stream.extend_from_slice(&2u16.to_le_bytes());
         stream.push(PATH_MOVETO);
         push_pt(&mut stream, anchor);
+        stream.extend_from_slice(&ATTR_TAIL);
         stream.push(PATH_LINE);
         push_pt(&mut stream, end);
+        stream.extend_from_slice(&ATTR_TAIL);
         return stream;
     }
 
-    let mut stream = Vec::with_capacity(3 + pts.len() * 25);
+    let mut stream = Vec::with_capacity(3 + pts.len() * 31);
     stream.push(1); // version 0 << 3 | precision 1 (f32)
     stream.extend_from_slice(&0u16.to_le_bytes()); // element count placeholder
     let mut elems: u16 = 0;
@@ -390,6 +403,7 @@ fn build_path_stream(points: &[[f32; 2]], smooth: bool) -> Vec<u8> {
     // Start at anchor (0, 0).
     stream.push(PATH_MOVETO);
     push_pt(&mut stream, anchor);
+    stream.extend_from_slice(&ATTR_TAIL);
     elems += 1;
 
     let mut cur = pts[0];
@@ -427,6 +441,7 @@ fn build_path_stream(points: &[[f32; 2]], smooth: bool) -> Vec<u8> {
         if (a[0] - cur[0]).hypot(a[1] - cur[1]) > 1e-3 {
             stream.push(PATH_LINE);
             push_pt(&mut stream, a);
+            stream.extend_from_slice(&ATTR_TAIL);
             elems += 1;
         }
         // Degree-elevate quadratic Bézier (a, curr, b) to exact cubic Bézier.
@@ -442,6 +457,7 @@ fn build_path_stream(points: &[[f32; 2]], smooth: bool) -> Vec<u8> {
         push_pt(&mut stream, c1);
         push_pt(&mut stream, c2);
         push_pt(&mut stream, b);
+        stream.extend_from_slice(&ATTR_TAIL);
         elems += 1;
         cur = b;
     }
@@ -450,6 +466,7 @@ fn build_path_stream(points: &[[f32; 2]], smooth: bool) -> Vec<u8> {
     if (last[0] - cur[0]).hypot(last[1] - cur[1]) > 1e-3 && elems < u16::MAX {
         stream.push(PATH_LINE);
         push_pt(&mut stream, last);
+        stream.extend_from_slice(&ATTR_TAIL);
         elems += 1;
     }
     stream[1..3].copy_from_slice(&elems.to_le_bytes());
@@ -2292,10 +2309,10 @@ mod tests {
             let t = cstream[off];
             off += 1;
             match t {
-                PATH_MOVETO | PATH_LINE => off += 8,
+                PATH_MOVETO | PATH_LINE => off += 14,
                 PATH_CUBIC => {
                     cubics += 1;
-                    off += 24;
+                    off += 30;
                 }
                 other => panic!("unexpected element type {other}"),
             }

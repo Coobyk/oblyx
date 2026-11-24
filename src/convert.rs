@@ -353,6 +353,10 @@ pub struct ConvertOptions {
     pub dpi: f32,
     pub page: Option<String>,
     pub include_deleted: bool,
+    /// Snap near-black pen colours (GoodNotes "black" is a warm dark brown,
+    /// `#1e1b1b`) to pure black. Only near-neutral dark opaque ink is
+    /// affected — navy, dark red and friends keep their hue.
+    pub true_black: bool,
 }
 
 impl Default for ConvertOptions {
@@ -363,6 +367,7 @@ impl Default for ConvertOptions {
             dpi: 144.0,
             page: None,
             include_deleted: false,
+            true_black: false,
         }
     }
 }
@@ -377,6 +382,37 @@ impl ConvertOptions {
         }
         Ok(())
     }
+}
+
+
+/// Snap a colour to pure black when it is a near-neutral dark shade. The
+/// GoodNotes "black" pen is a warm dark brown (`#1e1b1b`); the small
+/// channel spread distinguishes it from saturated darks like navy.
+fn snap_true_black(rgba: &mut [f32; 4]) {
+    if rgba[3] < 0.99 {
+        return;
+    }
+    let max = rgba[0].max(rgba[1]).max(rgba[2]);
+    let min = rgba[0].min(rgba[1]).min(rgba[2]);
+    if max < 0.25 && max - min < 0.08 {
+        rgba[0] = 0.0;
+        rgba[1] = 0.0;
+        rgba[2] = 0.0;
+    }
+}
+
+/// Apply [`snap_true_black`] to every pen stroke on a page (freehand ink,
+/// pen paths and connectors — shapes and fills keep their exact colours).
+fn true_black_page(mut page: crate::doc::Page) -> crate::doc::Page {
+    for item in &mut page.items {
+        match item {
+            crate::doc::Item::Stroke(s) => snap_true_black(&mut s.rgba),
+            crate::doc::Item::Path(p) => snap_true_black(&mut p.rgba),
+            crate::doc::Item::Connector(c) => snap_true_black(&mut c.rgba),
+            _ => {}
+        }
+    }
+    page
 }
 
 /// Per-page progress while one file converts.
@@ -570,6 +606,12 @@ pub fn convert_job_sink(
         load_ntb_pages(job)?
     } else {
         load_goodnotes_pages(job, options, &progress)?
+    };
+
+    let pages = if options.true_black {
+        pages.into_iter().map(true_black_page).collect()
+    } else {
+        pages
     };
 
     let scale = (options.dpi / 72.0).max(0.1);

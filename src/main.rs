@@ -54,6 +54,10 @@ struct Args {
     #[arg(long)]
     include_deleted: bool,
 
+    /// Convert near-black pen ink (GoodNotes dark brown) to pure black
+    #[arg(long)]
+    true_black: bool,
+
     /// Pack all outputs into one zip archive instead of a folder tree.
     /// Optional path: --archive or --archive=out.zip (auto-named otherwise).
     /// Archive jobs convert sequentially.
@@ -76,6 +80,7 @@ fn run(args: &Args) -> Result<()> {
         dpi: args.dpi,
         page: args.page.clone(),
         include_deleted: args.include_deleted,
+        true_black: args.true_black,
     };
     options.validate()?;
     let files = collect_inputs(&args.inputs)?;
